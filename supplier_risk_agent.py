@@ -3,6 +3,9 @@ from openai import OpenAI
 
 # Set your API key in the environment:
 # export OPENAI_API_KEY="your_key_here"
+from dotenv import load_dotenv, find_dotenv
+_ = load_dotenv(find_dotenv()) # read local .env file
+openai.api_key = os.environ['OPENAI_API_KEY']
 
 client = OpenAI()
 
