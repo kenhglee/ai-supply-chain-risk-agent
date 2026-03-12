@@ -1,6 +1,6 @@
 # AI Supplier Risk Monitoring Agent
 
-An AI agent that monitors global news signals and identifies potential supply chain disruptions affecting key suppliers.
+An AI agent that monitors global news signals and identifies potential supply chain disruptions affecting key suppliers. Python agent that scans news signals and identifies potential supplier disruptions using OpenAI.
 
 ## Features
 
