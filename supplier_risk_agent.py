@@ -1,13 +1,12 @@
 import json
+import os
 from openai import OpenAI
-
-# Set your API key in the environment:
-# export OPENAI_API_KEY="your_key_here"
 from dotenv import load_dotenv, find_dotenv
-_ = load_dotenv(find_dotenv()) # read local .env file
-openai.api_key = os.environ['OPENAI_API_KEY']
+import os
 
-client = OpenAI()
+_ = load_dotenv(find_dotenv())  # loads OPENAI_API_KEY from .env
+client = OpenAI()  # uses OPENAI_API_KEY from env
+
 
 suppliers = ["TSMC", "Samsung Electronics", "Murata", "Foxconn"]
 
@@ -22,7 +21,6 @@ You are a supply chain risk analyst.
 Given the supplier list and news headlines, identify relevant risks.
 
 Suppliers: {suppliers}
-Headlines: {headlines}
 
 Return ONLY valid JSON as a list of objects with:
 - supplier
