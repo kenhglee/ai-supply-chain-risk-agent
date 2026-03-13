@@ -1,22 +1,26 @@
-import json
-import os
-from openai import OpenAI
+import feedparser
 from dotenv import load_dotenv, find_dotenv
-import os
+
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 
 _ = load_dotenv(find_dotenv())  # loads OPENAI_API_KEY from .env
-client = OpenAI()  # uses OPENAI_API_KEY from env
 
 
 suppliers = ["TSMC", "Samsung Electronics", "Murata", "Foxconn"]
 
-import feedparser
-
 rss_url = "https://news.google.com/rss/search?q=TSMC+OR+Foxconn+OR+Murata"
 
 feed = feedparser.parse(rss_url)
+headlines = [entry.title for entry in feed.entries]
 
-prompt = f"""
+model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+
+parser = JsonOutputParser()
+
+prompt = ChatPromptTemplate.from_template(
+  """
 You are a supply chain risk analyst.
 Given the supplier list and news headlines, identify relevant risks.
 
@@ -30,32 +34,15 @@ Return ONLY valid JSON as a list of objects with:
 - recommended_action
 Do not include explanations, comments, or text before or after the JSON.
 """
-
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": prompt}],
-    temperature=0.2,
 )
 
-content = response.choices[0].message.content
-
-if not content:
-    raise ValueError("Model returned empty content")
-
-clean = content.strip()
-
-# Remove markdown code fences if present
-if clean.startswith("```"):
-    clean = clean.removeprefix("```json").removeprefix("```").strip()
-    if clean.endswith("```"):
-        clean = clean[:-3].strip()
-
-try:
-  items = json.loads(clean)
-except json.JSONDecodeError as e:
-  print("Failed to parse JSON.")
-  print("repr(content) =", repr(clean))
-  raise e
+chain = prompt | model | parser
+items = chain.invoke(
+    {
+        "suppliers": suppliers,
+        "headlines": headlines,
+    }
+)
 
 print("\nDaily Supply Chain Risk Summary\n" + "-" * 35)
 for item in items:
