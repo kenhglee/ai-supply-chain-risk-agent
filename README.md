@@ -6,15 +6,15 @@ An AI agent that monitors global news signals and identifies potential supply ch
 Supply chain teams often learn about disruptions too late. This prototype monitors external signals and turns them into structured risk alerts with recommended actions.
 
 ## Architecture
-Google News RSS
-    ↓
-Headline ingestion
-    ↓
-LLM-based risk analysis
-    ↓
-Structured JSON alerts
-    ↓
-Daily supply risk summary
+```mermaid
+flowchart TD
+    A[Google News RSS]
+    B[Headline ingestion]
+    C[LLM risk analysis]
+    D[Structured JSON alerts]
+    E[Daily risk summary]
+
+    A --> B --> C --> D --> E
 
 ## Features
 - Google News RSS ingestion
