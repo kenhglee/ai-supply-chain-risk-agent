@@ -13,9 +13,9 @@ suppliers = ["TSMC", "Samsung Electronics", "Murata", "Foxconn"]
 rss_url = "https://news.google.com/rss/search?q=TSMC+OR+Foxconn+OR+Murata&hl=en-US&gl=US&ceid=US:en"
 
 feed = feedparser.parse(rss_url)
-headlines = [entry.title.rsplit(" - ", 1)[0] for entry in feed.entries[:30]]
+headlines = [entry.title.rsplit(" - ", 1)[0] for entry in feed.entries]
 risk_keywords = [
-    "shutdown", "delay", "shortage", "strike", "sanction",
+    "shutdown", "delay", "shortage", "strike", "sanction"
     "export", "cyber", "earthquake", "flood", "fire",
     "capacity", "bankruptcy", "disruption"
 ]
@@ -24,6 +24,7 @@ headlines = [
     h for h in headlines
     if any(k in h.lower() for k in risk_keywords)
 ]
+
 # Fallback if RSS returns empty (common with Google News)
 if not headlines:
     headlines = [
