@@ -9,13 +9,13 @@ Supply chain teams often learn about disruptions too late. This prototype monito
 ```mermaid
 flowchart TD
     A[Google News RSS]
-    B[Headline ingestion]
-    C[LLM risk analysis]
+    B[Headline ingestion (feedparser)]
+    C[LLM-based risk analysis (OpenAI)]
     D[Structured JSON alerts]
-    E[Daily risk summary]
+    E[Daily supply risk summary]
 
     A --> B --> C --> D --> E
-
+```
 ## Features
 - Google News RSS ingestion
 - AI risk classification
