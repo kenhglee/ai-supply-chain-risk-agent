@@ -1,20 +1,34 @@
 # AI Supplier Risk Monitoring Agent
 
-An AI agent that monitors global news signals and identifies potential supply chain disruptions affecting key suppliers. Python agent that scans news signals and identifies potential supplier disruptions using OpenAI.
+An AI agent that monitors global news signals and identifies potential supply chain disruptions affecting key suppliers.
+
+## Why this project matters
+Supply chain teams often learn about disruptions too late. This prototype monitors external signals and turns them into structured risk alerts with recommended actions.
+
+## Architecture
+Google News RSS
+    ↓
+Headline ingestion
+    ↓
+LLM-based risk analysis
+    ↓
+Structured JSON alerts
+    ↓
+Daily supply risk summary
 
 ## Features
-
 - Google News RSS ingestion
 - AI risk classification
 - Supply chain impact analysis
 - Recommended mitigation actions
 
 ## Tech Stack
-
 - Python
 - OpenAI API
 - Feedparser
+- python-dotenv
+- LangChain
 
-## Example Output
-
-Daily Supply Chain Risk Summary identifying supplier disruptions and recommended actions.
+## Setup
+```bash
+pip install -r requirements.txt
