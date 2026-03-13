@@ -20,29 +20,53 @@ model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 parser = JsonOutputParser()
 
 prompt = ChatPromptTemplate.from_template(
-  """
+"""
 You are a supply chain risk analyst.
-Given the supplier list and news headlines, identify relevant risks.
+
+Given the supplier list and news headlines, identify only meaningful supply-chain risks.
+
+A meaningful risk includes:
+- factory shutdown
+- logistics disruption
+- port congestion
+- labor strike
+- sanctions
+- export controls
+- cyberattack
+- natural disaster
+- capacity constraints
+- financial distress
+
+Do not treat normal hiring, investor commentary, stock movement, or general expansion as high risk unless there is a clear operational threat.
 
 Suppliers: {suppliers}
+Headlines: {headlines}
 
-Return ONLY valid JSON as a list of objects with:
-- supplier
-- headline
-- risk_level (Low, Medium, High)
-- impact
-- recommended_action
-Do not include explanations, comments, or text before or after the JSON.
+{format_instructions}
 """
 )
 
 chain = prompt | model | parser
-items = chain.invoke(
+raw = chain.invoke(
     {
         "suppliers": suppliers,
         "headlines": headlines,
+        "format_instructions": parser.get_format_instructions(),
     }
 )
+
+# Normalize: LLM may return a list, a single dict, or a dict with a list inside
+if isinstance(raw, list):
+    items = raw
+elif isinstance(raw, dict):
+    for key in ("items", "risks", "results"):
+        if key in raw and isinstance(raw[key], list):
+            items = raw[key]
+            break
+    else:
+        items = [raw]  # single risk object
+else:
+    items = []
 
 print("\nDaily Supply Chain Risk Summary\n" + "-" * 35)
 for item in items:
