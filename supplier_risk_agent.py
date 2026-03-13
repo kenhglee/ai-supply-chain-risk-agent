@@ -13,8 +13,17 @@ suppliers = ["TSMC", "Samsung Electronics", "Murata", "Foxconn"]
 rss_url = "https://news.google.com/rss/search?q=TSMC+OR+Foxconn+OR+Murata&hl=en-US&gl=US&ceid=US:en"
 
 feed = feedparser.parse(rss_url)
-headlines = [entry.title for entry in feed.entries]
+headlines = [entry.title.rsplit(" - ", 1)[0] for entry in feed.entries[:30]]
+risk_keywords = [
+    "shutdown", "delay", "shortage", "strike", "sanction",
+    "export", "cyber", "earthquake", "flood", "fire",
+    "capacity", "bankruptcy", "disruption"
+]
 
+headlines = [
+    h for h in headlines
+    if any(k in h.lower() for k in risk_keywords)
+]
 # Fallback if RSS returns empty (common with Google News)
 if not headlines:
     headlines = [
@@ -35,7 +44,7 @@ prompt = ChatPromptTemplate.from_template(
 """
 You are a supply chain risk analyst.
 
-Given the supplier list and news headlines, identify supply-chain risks. Include any headline that could affect supply (even Low risk).
+Given the supplier list and news headlines, identify supply-chain risks. Include only headlines with a plausible operational, logistics, regulatory, financial, or capacity impact on supply continuity, lead time, or cost. Use Low risk when the signal is weak but still relevant.
 
 Meaningful risks: factory shutdown, logistics disruption, port congestion, labor strike, sanctions, export controls, cyberattack, natural disaster, capacity constraints, financial distress.
 
@@ -47,13 +56,17 @@ Headlines: {headlines}
 )
 
 chain = prompt | model | parser
-raw = chain.invoke(
-    {
-        "suppliers": suppliers,
-        "headlines": headlines,
-        "format_spec": format_spec,
-    }
-)
+try:
+    raw = chain.invoke(
+        {
+            "suppliers": suppliers,
+            "headlines": headlines,
+            "format_spec": format_spec,
+        }
+    )
+except Exception as e:
+    print(f"Model call failed: {e}")
+    raw = []
 
 # Normalize: LLM may return a list, a single dict, or a dict with a list inside
 if isinstance(raw, list):
