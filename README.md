@@ -1,3 +1,7 @@
+![Python](https://img.shields.io/badge/python-3.10-blue)
+![OpenAI](https://img.shields.io/badge/OpenAI-API-green)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
 # AI Supplier Risk Monitoring Agent
 
 An AI agent that monitors global news signals and identifies potential supply chain disruptions affecting key suppliers.
@@ -6,6 +10,7 @@ An AI agent that monitors global news signals and identifies potential supply ch
 Supply chain teams often learn about disruptions too late. This prototype monitors external signals and turns them into structured risk alerts with recommended actions.
 
 ## Architecture
+The agent monitors supplier-related news signals and converts them into structured supply-chain risk alerts.
 ```mermaid
 flowchart TD
     A["Google News RSS"]
@@ -50,8 +55,8 @@ Run the agent:
 ```bash
 python supplier_risk_agent.py
 ```
-Example Output
-```bash
+# Example Output
+```text
 Daily Supply Chain Risk Summary
 -----------------------------------
 Supplier: Murata
@@ -87,4 +92,10 @@ RSS → ingestion → LLM reasoning → structured alerts
 
 This keeps the prototype easy to understand while demonstrating the core concept of AI-assisted supply risk monitoring.
 
-Future versions could extend this into a continuous monitoring service, add supplier metadata, and integrate with planning or procurement systems.
+## Future Improvements
+
+- Persistent alert storage (CSV or database)
+- Keyword filtering before LLM analysis
+- Email or Slack notifications
+- Supplier metadata enrichment
+- Dashboard for monitoring supplier risk trends
