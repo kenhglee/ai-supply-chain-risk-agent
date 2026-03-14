@@ -29,6 +29,12 @@ flowchart TD
 - AI risk classification
 - Supply chain impact analysis
 - Recommended mitigation actions
+- Persistent memory to suppress duplicate alerts across runs
+
+## Agent Memory
+The agent maintains lightweight memory of previously processed headlines to avoid generating duplicate alerts across runs.
+A local file (`seen_headlines.json`) is automatically created on the first run to store previously analyzed headlines.
+This file is excluded from version control and will be generated automatically.
 
 ## Tech Stack
 - Python
