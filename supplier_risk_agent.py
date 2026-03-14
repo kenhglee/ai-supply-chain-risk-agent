@@ -1,4 +1,5 @@
 import feedparser
+import json
 from dotenv import load_dotenv, find_dotenv
 
 from langchain_openai import ChatOpenAI
@@ -7,6 +8,7 @@ from langchain_core.output_parsers import JsonOutputParser
 
 _ = load_dotenv(find_dotenv())  # loads OPENAI_API_KEY from .env
 
+from pathlib import Path
 
 suppliers = ["TSMC", "Samsung Electronics", "Murata", "Foxconn"]
 
@@ -24,6 +26,29 @@ headlines = [
     h for h in headlines
     if any(k in h.lower() for k in risk_keywords)
 ]
+
+MEMORY_FILE = Path("seen_headlines.json")
+
+def load_seen_headlines():
+    if MEMORY_FILE.exists():
+        with open(MEMORY_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_seen_headlines(seen):
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(sorted(seen), f, indent=2)
+
+seen_headlines = load_seen_headlines()
+
+new_headlines = [h for h in headlines if h not in seen_headlines]
+
+if not new_headlines:
+    print("No new headlines to analyze.")
+    exit()
+
+headlines = new_headlines
+
 
 # Fallback if RSS returns empty (common with Google News)
 if not headlines:
@@ -112,3 +137,6 @@ else:
         print(f"Impact: {get_field(item, 'impact', 'Impact')}")
         print(f"Recommended Action: {get_field(item, 'recommended_action', 'recommendedAction', 'Recommended Action')}")
         print("-" * 35)
+
+seen_headlines.update(headlines)
+save_seen_headlines(seen_headlines)
