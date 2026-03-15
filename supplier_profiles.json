@@ -1,0 +1,14 @@
+[
+  {
+    "supplier": "TSMC",
+    "profile": "TSMC is a Taiwan-based semiconductor foundry with heavy manufacturing concentration in Taiwan. Key risks include earthquakes, drought, water shortages, power outages, export controls, and geopolitical tension affecting semiconductor supply."
+  },
+  {
+    "supplier": "Murata",
+    "profile": "Murata is a major supplier of passive electronic components such as capacitors and sensors. Key risks include factory disruptions, natural disasters in Japan, raw material shortages, and capacity constraints affecting electronics supply chains."
+  },
+  {
+    "supplier": "Foxconn",
+    "profile": "Foxconn is a global electronics manufacturing services company with large operations in China, Vietnam, and India. Key risks include labor unrest, regulatory shifts, geopolitical tensions, manufacturing disruption, and logistics delays."
+  }
+]
