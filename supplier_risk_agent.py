@@ -13,8 +13,6 @@ _ = load_dotenv(find_dotenv())  # loads OPENAI_API_KEY from .env
 
 with open("supplier_profiles.json", "r") as f:
     supplier_profiles = json.load(f)
-    print("Loaded supplier profiles:", len(supplier_profiles))
-    print("Vector store ready.")
 
 docs = [
     Document(
@@ -112,7 +110,7 @@ You must set "supplier" to exactly one of: {suppliers} — the supplier most rel
 
 chain = prompt | model | parser
 alerts = []
-print(headlines)
+
 for headline in headlines:
 
     # skip if we've already seen it
