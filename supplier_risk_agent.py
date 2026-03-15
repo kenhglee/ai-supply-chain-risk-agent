@@ -13,6 +13,8 @@ _ = load_dotenv(find_dotenv())  # loads OPENAI_API_KEY from .env
 
 with open("supplier_profiles.json", "r") as f:
     supplier_profiles = json.load(f)
+    print("Loaded supplier profiles:", len(supplier_profiles))
+    print("Vector store ready.")
 
 docs = [
     Document(
@@ -92,6 +94,15 @@ Suppliers: {suppliers}
 Headline: {headline}
 Relevant supplier context:
 {context}
+
+Return ONLY a valid JSON array of objects.
+Each object must have:
+- supplier
+- headline
+- risk_level
+- impact
+- recommended_action
+- relevant_supplier_context
 
 Identify potential supply-chain risks and return JSON.
 You must set "supplier" to exactly one of: {suppliers} — the supplier most relevant to this headline and context. Use the supplier name exactly as listed.
@@ -180,12 +191,12 @@ else:
         if not isinstance(item, dict):
             print(f"Skipping non-dict item: {type(item).__name__} = {repr(item)[:80]}")
             continue
-        print(f"Supplier: {get_field(item, 'supplier', 'Supplier', 'supplier_name')}")
-        print(f"Headline: {get_field(item, 'headline', 'Headline')}")
-        print(f"Relevant supplier context: {get_field(item, 'context', 'Context')}")
-        print(f"Risk Level: {get_field(item, 'risk_level', 'riskLevel', 'Risk Level')}")
-        print(f"Impact: {get_field(item, 'impact', 'Impact')}")
-        print(f"Recommended Action: {get_field(item, 'recommended_action', 'recommendedAction', 'Recommended Action')}")
+        print(f"Supplier: {get_field(item, 'supplier')}")
+        print(f"Headline: {get_field(item, 'headline')}")
+        print(f"Risk Level: {get_field(item, 'risk_level')}")
+        print(f"Impact: {get_field(item, 'impact')}")
+        print(f"Recommended Action: {get_field(item, 'recommended_action')}")
+        print(f"Relevant Supplier Context: {get_field(item, 'relevant_supplier_context')}")
         print("-" * 35)
 
 seen_headlines.update(headlines)
