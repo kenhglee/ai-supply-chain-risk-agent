@@ -1,14 +1,29 @@
 import feedparser
 import json
 from dotenv import load_dotenv, find_dotenv
+from pathlib import Path
 
-from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 
 _ = load_dotenv(find_dotenv())  # loads OPENAI_API_KEY from .env
 
-from pathlib import Path
+with open("supplier_profiles.json", "r") as f:
+    supplier_profiles = json.load(f)
+
+docs = [
+    Document(
+        page_content=item["profile"],
+        metadata={"supplier": item["supplier"]}
+    )
+    for item in supplier_profiles
+]
+
+embeddings = OpenAIEmbeddings()
+vectorstore = FAISS.from_documents(docs, embeddings)
 
 suppliers = ["TSMC", "Samsung Electronics", "Murata", "Foxconn"]
 
@@ -26,6 +41,15 @@ headlines = [
     h for h in headlines
     if any(k in h.lower() for k in risk_keywords)
 ]
+
+# Fallback if RSS returns empty (common with Google News)
+if not headlines:
+    headlines = [
+        "TSMC reports strong Q4 earnings amid chip demand",
+        "Foxconn expands Vietnam factory amid supply chain diversification",
+        "Murata faces component shortage due to earthquake in Japan",
+    ]
+    print("(Using sample headlines - RSS feed returned empty)\n")
 
 MEMORY_FILE = Path("seen_headlines.json")
 
@@ -49,16 +73,6 @@ if not new_headlines:
 
 headlines = new_headlines
 
-
-# Fallback if RSS returns empty (common with Google News)
-if not headlines:
-    headlines = [
-        "TSMC reports strong Q4 earnings amid chip demand",
-        "Foxconn expands Vietnam factory amid supply chain diversification",
-        "Murata faces component shortage due to earthquake in Japan",
-    ]
-    print("(Using sample headlines - RSS feed returned empty)\n")
-
 model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 
 parser = JsonOutputParser()
@@ -75,44 +89,79 @@ Given the supplier list and news headlines, identify supply-chain risks. Include
 Meaningful risks: factory shutdown, logistics disruption, port congestion, labor strike, sanctions, export controls, cyberattack, natural disaster, capacity constraints, financial distress.
 
 Suppliers: {suppliers}
-Headlines: {headlines}
+Headline: {headline}
+Relevant supplier context:
+{context}
 
+Identify potential supply-chain risks and return JSON.
+You must set "supplier" to exactly one of: {suppliers} — the supplier most relevant to this headline and context. Use the supplier name exactly as listed.
 {format_spec}
 """
 )
 
 chain = prompt | model | parser
-try:
-    raw = chain.invoke(
-        {
+alerts = []
+print(headlines)
+for headline in headlines:
+
+    # skip if we've already seen it
+    if headline in seen_headlines:
+        continue
+
+    # retrieve supplier context from vector store
+    relevant_docs = vectorstore.similarity_search(headline, k=2)
+    context = "\n\n".join([doc.page_content for doc in relevant_docs])
+    # which suppliers the context is about (for fallback if LLM omits supplier)
+    context_suppliers = [doc.metadata.get("supplier") for doc in relevant_docs if doc.metadata.get("supplier")]
+
+    # send to LLM
+    try:
+        raw = chain.invoke({
             "suppliers": suppliers,
-            "headlines": headlines,
-            "format_spec": format_spec,
-        }
-    )
-except Exception as e:
-    print(f"Model call failed: {e}")
-    raw = []
+            "headline": headline,
+            "context": context,
+            "format_spec": format_spec
+        })
+    except Exception as e:
+        print(f"Model call failed: {e}")
+        raw = []
+        
 
-# Normalize: LLM may return a list, a single dict, or a dict with a list inside
-if isinstance(raw, list):
-    items = raw
-elif isinstance(raw, dict):
-    for key in ("items", "risks", "results"):
-        if key in raw and isinstance(raw[key], list):
-            items = raw[key]
-            break
+    #normalized = normalize(raw)
+    # Normalize: LLM may return a list, a single dict, or a dict with a list inside
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        for key in ("items", "risks", "results"):
+            if key in raw and isinstance(raw[key], list):
+                items = raw[key]
+                break
+        else:
+            items = [raw]  # single risk object
     else:
-        items = [raw]  # single risk object
-else:
-    items = []
+        items = []
+    if not items:
+        import json
+        print("(No items - raw output below for debugging)\n")
+        print("Type:", type(raw).__name__)
+        print("Raw:", json.dumps(raw, indent=2, default=str)[:800])
+        print()
+    # fill in supplier when LLM leaves it missing or wrong
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        s = item.get("supplier") or item.get("Supplier") or item.get("supplier_name")
+        if not s or str(s).strip() == "" or s not in suppliers:
+            # try headline first (e.g. "Murata faces shortage" -> Murata)
+            for sup in suppliers:
+                if sup.lower() in headline.lower():
+                    item["supplier"] = sup
+                    break
+            if item.get("supplier") is None and context_suppliers:
+                item["supplier"] = context_suppliers[0]
+    alerts.extend(items)
+    seen_headlines.add(headline)
 
-if not items:
-    import json
-    print("(No items - raw output below for debugging)\n")
-    print("Type:", type(raw).__name__)
-    print("Raw:", json.dumps(raw, indent=2, default=str)[:800])
-    print()
 
 def get_field(obj, *keys):
     """Get field from dict, trying multiple key names."""
@@ -124,15 +173,16 @@ def get_field(obj, *keys):
     return "N/A"
 
 print("\nDaily Supply Chain Risk Summary\n" + "-" * 35)
-if not items:
+if not alerts:
     print("No risks identified from the current headlines.")
 else:
-    for item in items:
+    for item in alerts:
         if not isinstance(item, dict):
             print(f"Skipping non-dict item: {type(item).__name__} = {repr(item)[:80]}")
             continue
-        print(f"Supplier: {get_field(item, 'supplier', 'Supplier')}")
+        print(f"Supplier: {get_field(item, 'supplier', 'Supplier', 'supplier_name')}")
         print(f"Headline: {get_field(item, 'headline', 'Headline')}")
+        print(f"Relevant supplier context: {get_field(item, 'context', 'Context')}")
         print(f"Risk Level: {get_field(item, 'risk_level', 'riskLevel', 'Risk Level')}")
         print(f"Impact: {get_field(item, 'impact', 'Impact')}")
         print(f"Recommended Action: {get_field(item, 'recommended_action', 'recommendedAction', 'Recommended Action')}")
