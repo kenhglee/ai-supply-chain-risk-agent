@@ -125,7 +125,10 @@ for headline in headlines:
 
     # retrieve supplier context from vector store
     relevant_docs = vectorstore.similarity_search(headline, k=1)
-    context = "\n\n".join([doc.page_content for doc in relevant_docs])
+    context = "\n\n".join(
+        f"Supplier: {doc.metadata['supplier']}\nContext: {doc.page_content}"
+        for doc in relevant_docs
+    )
     # which suppliers the context is about (for fallback if LLM omits supplier)
     context_suppliers = [doc.metadata.get("supplier") for doc in relevant_docs if doc.metadata.get("supplier")]
 
