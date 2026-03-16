@@ -3,26 +3,27 @@
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 # AI Supplier Risk Monitoring Agent
-
-An AI agent that monitors global news signals and identifies potential supply chain disruptions affecting key suppliers.
+An AI agent that monitors global news signals and identifies potential supply chain disruptions using supplier-aware context retrieval and LLM-based risk analysis. affeting key suppliers.
 
 ## Why this project matters
 Supply chain teams often learn about disruptions too late. This prototype monitors external signals and turns them into structured risk alerts with recommended actions.
 
 ## Architecture
-The agent monitors supplier-related news signals and converts them into structured supply-chain risk alerts.
+The agent monitors supplier-related news signals and converts them into structured supply-chain risk alerts. Further, it enriches incoming news headlines with supplier-specific context retrieved from a vector store before performing risk analysis with an LLM.
 ```mermaid
 flowchart TD
     A["Google News RSS"]
     B["Headline ingestion"]
-    C["LLM risk analysis"]
-    D["Structured JSON alerts"]
-    E["Daily supply risk summary"]
+    C["Vector retrieval of supplier context"]
+    D["LLM risk analysis"]
+    E["Structured JSON alerts"]
+    F["Daily supply risk summary"]
 
     A --> B
     B --> C
     C --> D
     D --> E
+    E --> F
 ```
 ## Features
 - Google News RSS ingestion
@@ -30,11 +31,18 @@ flowchart TD
 - Supply chain impact analysis
 - Recommended mitigation actions
 - Persistent memory to suppress duplicate alerts across runs
+- Retrieval-augmented risk analysis using supplier context embeddings
 
 ## Agent Memory
 The agent maintains lightweight memory of previously processed headlines to avoid generating duplicate alerts across runs.
 A local file (`seen_headlines.json`) is automatically created on the first run to store previously analyzed headlines.
 This file is excluded from version control and will be generated automatically.
+
+## Supplier Context Retrieval
+Supplier profiles are stored in `supplier_profiles.json`.  
+At runtime, these profiles are embedded and indexed using FAISS to enable
+semantic retrieval of relevant supplier context for each headline.
+The retrieved context is included in the LLM prompt to improve risk analysis.
 
 ## Tech Stack
 - Python
@@ -70,6 +78,7 @@ Headline: Murata faces component shortage due to earthquake in Japan
 Risk Level: High
 Impact: Potential passive component supply disruption
 Recommended Action: Validate alternate suppliers and assess inventory coverage
+Relevant Supplier Context: Foxconn is a global electronics manufacturing services company with large operations in China, Vietnam, and India. Key risks include labor unrest, regulatory shifts, geopolitical tensions, manufacturing disruption, and logistics delays.
 ```
 
 ## Design Decisions
