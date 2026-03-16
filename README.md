@@ -78,7 +78,7 @@ Headline: Murata faces component shortage due to earthquake in Japan
 Risk Level: High
 Impact: Potential passive component supply disruption
 Recommended Action: Validate alternate suppliers and assess inventory coverage
-Relevant Supplier Context: Foxconn is a global electronics manufacturing services company with large operations in China, Vietnam, and India. Key risks include labor unrest, regulatory shifts, geopolitical tensions, manufacturing disruption, and logistics delays.
+Relevant Supplier Context: Murata is a major supplier of passive electronic components such as capacitors and sensors. Key risks include factory disruptions, natural disasters in Japan, raw material shortages, and capacity constraints affecting electronics supply chains.
 ```
 
 ## Design Decisions
