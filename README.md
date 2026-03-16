@@ -93,7 +93,7 @@ Google News RSS is used as the initial signal source because it provides a light
 
 **LLM-based risk interpretation**
 
-Instead of rule-based classification, an LLM analyzes headlines and determines potential supply-chain impact. This allows the system to detect a broader range of disruptions such as natural disasters, labor strikes, or regulatory changes.
+Instead of relying only on rule-based classification, an LLM analyzes each headline together with retrieved supplier context to determine potential supply-chain impact. This allows the system to detect a broader range of disruptions such as natural disasters, labor strikes, regulatory changes, or capacity constraints.
 
 **Structured JSON output**
 
@@ -103,9 +103,9 @@ The LLM output is normalized into structured JSON so that the alerts could easil
 
 The system uses a simple pipeline:
 
-RSS → ingestion → LLM reasoning → structured alerts
+RSS → ingestion → supplier-context retrieval → LLM reasoning → structured alerts
 
-This keeps the prototype easy to understand while demonstrating the core concept of AI-assisted supply risk monitoring.
+This keeps the prototype easy to understand while still demonstrating how retrieval-augmented reasoning can improve supply-risk monitoring.
 
 ## Future Improvements
 
