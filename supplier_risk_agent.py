@@ -78,23 +78,8 @@ model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 parser = JsonOutputParser()
 
 # Explicit format: we want a JSON array, not generic instructions
-format_spec = """Return ONLY a valid JSON array of objects. Each object must have: supplier, headline, risk_level, impact, recommended_action. If no risks, return []. No other text."""
-
-prompt = ChatPromptTemplate.from_template(
-"""
-You are a supply chain risk analyst.
-
-Given the supplier list and news headlines, identify supply-chain risks. Include only headlines with a plausible operational, logistics, regulatory, financial, or capacity impact on supply continuity, lead time, or cost. Use Low risk when the signal is weak but still relevant.
-
-Meaningful risks: factory shutdown, logistics disruption, port congestion, labor strike, sanctions, export controls, cyberattack, natural disaster, capacity constraints, financial distress.
-
-Suppliers: {suppliers}
-Headline: {headline}
-Relevant supplier context:
-{context}
-
-Return ONLY a valid JSON array of objects.
-Each object must have:
+format_spec = """
+Return ONLY one valid JSON object with these fields:
 - supplier
 - headline
 - risk_level
@@ -102,8 +87,29 @@ Each object must have:
 - recommended_action
 - relevant_supplier_context
 
-Identify potential supply-chain risks and return JSON.
-You must set "supplier" to exactly one of: {suppliers} — the supplier most relevant to this headline and context. Use the supplier name exactly as listed.
+If the headline does not indicate a meaningful supply-chain risk, return:
+{"skip": true}
+
+Do not include explanations or any text outside the JSON.
+"""
+prompt = ChatPromptTemplate.from_template(
+"""
+You are a supply chain risk analyst.
+
+Given the supplier list, one news headline, and relevant supplier context, identify whether the headline indicates a meaningful supply-chain risk.
+
+Include only risks with a plausible operational, logistics, regulatory, financial, or capacity impact on supply continuity, lead time, or cost. Use Low risk when the signal is weak but still relevant.
+
+Meaningful risks include: factory shutdown, logistics disruption, port congestion, labor strike, sanctions, export controls, cyberattack, natural disaster, capacity constraints, and financial distress.
+
+You must set "supplier" to exactly one of: {suppliers}. Choose the single supplier most relevant to the headline and context, and use the supplier name exactly as listed.
+
+Supplier list: {suppliers}
+Headline: {headline}
+
+Relevant supplier context:
+{context}
+
 {format_spec}
 """
 )
