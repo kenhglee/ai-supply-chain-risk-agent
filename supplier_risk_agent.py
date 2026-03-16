@@ -16,7 +16,7 @@ with open("supplier_profiles.json", "r") as f:
 
 docs = [
     Document(
-        page_content=item["profile"],
+        page_content=f"{item['supplier']} - {item['profile']}",
         metadata={"supplier": item["supplier"]}
     )
     for item in supplier_profiles
@@ -118,7 +118,7 @@ for headline in headlines:
         continue
 
     # retrieve supplier context from vector store
-    relevant_docs = vectorstore.similarity_search(headline, k=2)
+    relevant_docs = vectorstore.similarity_search(headline, k=1)
     context = "\n\n".join([doc.page_content for doc in relevant_docs])
     # which suppliers the context is about (for fallback if LLM omits supplier)
     context_suppliers = [doc.metadata.get("supplier") for doc in relevant_docs if doc.metadata.get("supplier")]
