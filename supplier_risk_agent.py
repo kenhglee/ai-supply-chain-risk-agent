@@ -9,7 +9,17 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
+
+# ============================================================
+# Environment initialization
+# ============================================================
+
 _ = load_dotenv(find_dotenv())
+
+
+# ============================================================
+# Configuration
+# ============================================================
 
 MEMORY_FILE = Path("seen_headlines.json")
 RSS_URL = "https://news.google.com/rss/search?q=TSMC+OR+Foxconn+OR+Murata&hl=en-US&gl=US&ceid=US:en"
@@ -39,6 +49,60 @@ If the headline does not indicate a meaningful supply-chain risk, return:
 Do not include explanations or any text outside the JSON.
 """
 
+# ============================================================
+# Utility helpers
+# ============================================================
+
+
+def get_field(obj, *keys):
+    """Get field from dict, trying multiple key names."""
+    if not isinstance(obj, dict):
+        return "N/A"
+    for k in keys:
+        if k in obj:
+            return obj[k]
+    return "N/A"
+
+
+def fill_supplier_fallback(
+    items: list[dict],
+    headline: str,
+    context_suppliers: list,
+    suppliers: list[str],
+) -> None:
+    """Fill in missing or invalid supplier on each item using headline and context."""
+    for item in items:
+        s = item.get("supplier") or item.get("Supplier") or item.get("supplier_name")
+        if not s or str(s).strip() == "" or s not in suppliers:
+            for sup in suppliers:
+                if sup.lower() in headline.lower():
+                    item["supplier"] = sup
+                    break
+            if item.get("supplier") is None and context_suppliers:
+                item["supplier"] = context_suppliers[0]
+
+
+def normalize_raw_response(raw) -> list:
+    """Turn raw LLM/parser output into a list of risk item dicts. Filters out skip=True."""
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        if raw.get("skip") is True:
+            return []
+        for key in ("items", "risks", "results"):
+            if key in raw and isinstance(raw[key], list):
+                items = raw[key]
+                break
+        else:
+            items = [raw]
+    else:
+        items = []
+    return [i for i in items if isinstance(i, dict) and i.get("skip") is not True]
+
+
+# ============================================================
+# Data loading / input functions
+# ============================================================
 
 def load_supplier_profiles(path: str = "supplier_profiles.json") -> list:
     """Load supplier profiles from JSON file."""
@@ -86,11 +150,9 @@ def load_seen_headlines(memory_file: Path = MEMORY_FILE) -> set:
     return set()
 
 
-def save_seen_headlines(seen: set, memory_file: Path = MEMORY_FILE) -> None:
-    """Persist set of seen headlines to JSON."""
-    with open(memory_file, "w") as f:
-        json.dump(sorted(seen), f, indent=2)
-
+# ============================================================
+# LLM analysis helpers
+# ============================================================
 
 def build_risk_chain():
     """Build the LangChain prompt | model | parser chain for risk analysis."""
@@ -119,72 +181,6 @@ Relevant supplier context:
     )
     return prompt | model | parser
 
-
-def normalize_raw_response(raw) -> list:
-    """Turn raw LLM/parser output into a list of risk item dicts. Filters out skip=True."""
-    if isinstance(raw, list):
-        items = raw
-    elif isinstance(raw, dict):
-        if raw.get("skip") is True:
-            return []
-        for key in ("items", "risks", "results"):
-            if key in raw and isinstance(raw[key], list):
-                items = raw[key]
-                break
-        else:
-            items = [raw]
-    else:
-        items = []
-    return [i for i in items if isinstance(i, dict) and i.get("skip") is not True]
-
-
-def fill_supplier_fallback(
-    items: list[dict],
-    headline: str,
-    context_suppliers: list,
-    suppliers: list[str],
-) -> None:
-    """Fill in missing or invalid supplier on each item using headline and context."""
-    for item in items:
-        s = item.get("supplier") or item.get("Supplier") or item.get("supplier_name")
-        if not s or str(s).strip() == "" or s not in suppliers:
-            for sup in suppliers:
-                if sup.lower() in headline.lower():
-                    item["supplier"] = sup
-                    break
-            if item.get("supplier") is None and context_suppliers:
-                item["supplier"] = context_suppliers[0]
-
-
-def get_field(obj, *keys):
-    """Get field from dict, trying multiple key names."""
-    if not isinstance(obj, dict):
-        return "N/A"
-    for k in keys:
-        if k in obj:
-            return obj[k]
-    return "N/A"
-
-
-def print_summary(alerts: list) -> None:
-    """Print the daily supply chain risk summary to stdout."""
-    print("\nDaily Supply Chain Risk Summary\n" + "-" * 35)
-    if not alerts:
-        print("No risks identified from the current headlines.")
-        return
-    for item in alerts:
-        if not isinstance(item, dict):
-            print(f"Skipping non-dict item: {type(item).__name__} = {repr(item)[:80]}")
-            continue
-        print(f"Supplier: {get_field(item, 'supplier')}")
-        print(f"Headline: {get_field(item, 'headline')}")
-        print(f"Risk Level: {get_field(item, 'risk_level')}")
-        print(f"Impact: {get_field(item, 'impact')}")
-        print(f"Recommended Action: {get_field(item, 'recommended_action')}")
-        print(f"Relevant Supplier Context: {get_field(item, 'relevant_supplier_context')}")
-        print("-" * 35)
-
-
 def analyze_headline(chain, vectorstore, headline: str, suppliers: list[str]) -> list[dict]:
     """Run risk analysis for one headline. Returns list of risk item dicts (may be empty)."""
     relevant_docs = vectorstore.similarity_search(headline, k=1)
@@ -209,9 +205,41 @@ def analyze_headline(chain, vectorstore, headline: str, suppliers: list[str]) ->
     fill_supplier_fallback(items, headline, context_suppliers, suppliers)
     return items
 
+# ============================================================
+# Reporting / output functions
+# ============================================================
+
+def save_seen_headlines(seen: set, memory_file: Path = MEMORY_FILE) -> None:
+    """Persist set of seen headlines to JSON."""
+    with open(memory_file, "w") as f:
+        json.dump(sorted(seen), f, indent=2)
+
+
+def print_summary(alerts: list) -> None:
+    """Print the daily supply chain risk summary to stdout."""
+    print("\nDaily Supply Chain Risk Summary\n" + "-" * 35)
+    if not alerts:
+        print("No risks identified from the current headlines.")
+        return
+    for item in alerts:
+        if not isinstance(item, dict):
+            print(f"Skipping non-dict item: {type(item).__name__} = {repr(item)[:80]}")
+            continue
+        print(f"Supplier: {get_field(item, 'supplier')}")
+        print(f"Headline: {get_field(item, 'headline')}")
+        print(f"Risk Level: {get_field(item, 'risk_level')}")
+        print(f"Impact: {get_field(item, 'impact')}")
+        print(f"Recommended Action: {get_field(item, 'recommended_action')}")
+        print(f"Relevant Supplier Context: {get_field(item, 'relevant_supplier_context')}")
+        print("-" * 35)
+
+# ============================================================
+# Main pipeline
+# ============================================================
 
 def run_pipeline() -> None:
     """Load data, fetch headlines, analyze risks, print summary, and persist seen headlines."""
+
     profiles = load_supplier_profiles()
     vectorstore, suppliers = build_vectorstore(profiles)
     headlines = fetch_headlines()
@@ -221,12 +249,12 @@ def run_pipeline() -> None:
         print("No new headlines to analyze.")
         return
     chain = build_risk_chain()
-    alerts = []
+    results = []
     for headline in new_headlines:
         items = analyze_headline(chain, vectorstore, headline, suppliers)
-        alerts.extend(items)
+        results.extend(items)
         seen_headlines.add(headline)
-    print_summary(alerts)
+    print_summary(results)
     save_seen_headlines(seen_headlines)
 
 
