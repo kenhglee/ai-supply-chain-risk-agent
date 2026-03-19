@@ -255,7 +255,7 @@ Headline: {headline}
 Graph-inferred candidate suppliers:
 {candidate_suppliers}
 Relevant supplier context:
-{context}
+{relevant_supplier_context}
 
 {format_spec}
 """
@@ -281,7 +281,7 @@ def analyze_headline(chain, vectorstore, headline: str, suppliers: list[str]) ->
             "suppliers": suppliers,
             "headline": headline,
             "candidate_suppliers": ", ".join(candidate_suppliers) if candidate_suppliers else "None",
-            "context": context,
+            "relevant_supplier_context": context,
             "format_spec": FORMAT_SPEC,
         })
     except Exception as e:

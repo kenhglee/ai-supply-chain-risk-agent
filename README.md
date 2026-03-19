@@ -3,53 +3,86 @@
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 # AI Supplier Risk Monitoring Agent
-An AI agent that monitors global news signals and identifies potential supply chain disruptions using supplier-aware context retrieval and LLM-based risk analysis. affeting key suppliers.
+An AI-powered agent that monitors global news signals and identifies potential supply chain risks affecting key suppliers using graph-assisted retrieval and LLM reasoning.
 
-## Why this project matters
-Supply chain teams often learn about disruptions too late. This prototype monitors external signals and turns them into structured risk alerts with recommended actions.
+## Overview
+Supply chain disruptions often originate from external events such as natural disasters, geopolitical shifts, or logistics bottlenecks.
+
+This project explores how these signals can be transformed into actionable intelligence by combining:
+
+- external signal ingestion (news)
+- dependency-aware supplier inference (graph)
+- retrieval-augmented context (vector search)
+- LLM-based risk evaluation
 
 ## Architecture
-The agent monitors supplier-related news signals and converts them into structured supply-chain risk alerts. Further, it enriches incoming news headlines with supplier-specific context retrieved from a vector store before performing risk analysis with an LLM.
 ```mermaid
 flowchart TD
     A["Google News RSS"]
-    B["Headline ingestion"]
-    C["Vector retrieval of supplier context"]
-    D["LLM risk analysis"]
-    E["Structured JSON alerts"]
-    F["Daily supply risk summary"]
+    B["Headline ingestion & filtering"]
+    C["Graph-based supplier inference"]
+    D["Vector retrieval of supplier context"]
+    E["LLM risk analysis"]
+    F["Structured JSON alerts"]
+    G["Daily supply risk summary"]
 
     A --> B
     B --> C
     C --> D
     D --> E
     E --> F
+    F --> G
 ```
+
+## How It Works
+For each headline:
+
+**1. Signal ingestion**
+Headlines are fetched from Google News RSS based on supplier-related queries.
+
+**2. Risk filtering**
+Only disruption-relevant signals (e.g., earthquake, strike, congestion) are processed.
+
+**3. Graph-based inference**
+A lightweight dependency graph links:
+- suppliers → regions / dependencies
+- regions / dependencies → risk events
+
+This step identifies candidate suppliers exposed to the event.
+
+**4. Vector retrieval (FAISS)**
+Supplier profiles are embedded and stored in a vector index.
+The system retrieves the most relevant supplier context using:
+- headline + graph-inferred suppliers
+
+**5. LLM risk analysis**
+The model evaluates:
+- likelihood of disruption
+- operational impact
+- recommended mitigation actions
+
+**6. Structured output**
+Results are returned as structured alerts.
+
+
 ## Features
 - Google News RSS ingestion
-- AI risk classification
-- Supply chain impact analysis
-- Recommended mitigation actions
-- Persistent memory to suppress duplicate alerts across runs
-- Retrieval-augmented risk analysis using supplier context embeddings
+- Keyword-based disruption filtering
+- Graph-assisted supplier exposure inference
+- Retrieval-augmented reasoning (FAISS + embeddings)
+- Supplier-specific contextual grounding
+- Structured JSON alerts (risk, impact, action)
+- Lightweight memory to avoid duplicate processing
 
-## Agent Memory
-The agent maintains lightweight memory of previously processed headlines to avoid generating duplicate alerts across runs.
-A local file (`seen_headlines.json`) is automatically created on the first run to store previously analyzed headlines.
-This file is excluded from version control and will be generated automatically.
-
-## Supplier Context Retrieval
-Supplier profiles are stored in `supplier_profiles.json`.  
-At runtime, these profiles are embedded and indexed using FAISS to enable
-semantic retrieval of relevant supplier context for each headline.
-The retrieved context is included in the LLM prompt to improve risk analysis.
 
 ## Tech Stack
 - Python
 - OpenAI API
+- LangChain
+- FAISS (vector store)
 - Feedparser
 - python-dotenv
-- LangChain
+
 
 ## Setup
 Clone the repository:
@@ -69,48 +102,73 @@ Run the agent:
 ```bash
 python supplier_risk_agent.py
 ```
-# Example Output
+## Example Output
 ```text
 Daily Supply Chain Risk Summary
 -----------------------------------
-Supplier: Murata
-Headline: Murata faces component shortage due to earthquake in Japan
-Risk Level: High
-Impact: Potential passive component supply disruption
-Recommended Action: Validate alternate suppliers and assess inventory coverage
-Relevant Supplier Context: Murata is a major supplier of passive electronic components such as capacitors and sensors. Key risks include factory disruptions, natural disasters in Japan, raw material shortages, and capacity constraints affecting electronics supply chains.
+New alerts: 1
+High risk: 0
+Medium risk: 1
+Low risk: 0
+Affected suppliers: Foxconn
+
+Detailed Alerts
+-----------------------------------
+Supplier: Foxconn
+Headline: Foxconn's investor briefing could signal major shifts in AI server supply, capacity and data center infrastructure
+Risk Level: Medium risk
+Impact: Potential capacity constraints and supply continuity issues
+Recommended Action: Monitor developments closely and assess potential impacts on supply chain operations
+Relevant Supplier Context: Foxconn - Foxconn is a global electronics manufacturing services company with large operations in China, Vietnam, and India. Key risks include labor unrest, regulatory shifts, geopolitical tensions, manufacturing disruption, and logistics delays.
+-----------------------------------
 ```
 
 ## Design Decisions
 
-This prototype intentionally keeps the architecture simple to demonstrate how external signals can be converted into actionable supply-chain intelligence.
+This project intentionally balances simplicity with meaningful system behavior.
 
-Key design choices include:
+**Graph + Retrieval (Hybrid Reasoning)**
+- The graph layer identifies who might be affected
+- The vector layer provides context on why and how
+This combination enables more realistic supply-chain reasoning than either approach alone.
 
-**RSS-based signal ingestion**
+**Lightweight Knowledge Representation**
+- Supplier relationships are modeled using a simple JSON-based graph
+- No external graph database is required
+- Designed for clarity and extensibility
 
-Google News RSS is used as the initial signal source because it provides a lightweight way to monitor global supplier-related events without requiring paid data APIs.
-
-**LLM-based risk interpretation**
-
-Instead of relying only on rule-based classification, an LLM analyzes each headline together with retrieved supplier context to determine potential supply-chain impact. This allows the system to detect a broader range of disruptions such as natural disasters, labor strikes, regulatory changes, or capacity constraints.
+**Deterministic Pipeline**
+The workflow is explicitly orchestrated:
+```text
+signals → graph inference → retrieval → LLM → alerts
+```
+This avoids the complexity of autonomous agent loops while remaining transparent and debuggable.
 
 **Structured JSON output**
-
 The LLM output is normalized into structured JSON so that the alerts could easily be consumed by downstream systems such as dashboards, notification services, or planning tools.
 
-**Minimal pipeline architecture**
+**Lightweight Momery**
+The agent tracks previously processed headlines using a local `seen_headlines.json` file to avoid duplicate analysis across runs. This provides simple persistence without requiring external storage.
 
-The system uses a simple pipeline:
+**Retrieval-Based Context Grounding**
+The agent tracks previously processed headlines using a local `seen_headlines.json` file to avoid duplicate analysis across runs. This provides simple persistence without requiring external storage.
 
-RSS → ingestion → supplier-context retrieval → LLM reasoning → structured alerts
-
-This keeps the prototype easy to understand while still demonstrating how retrieval-augmented reasoning can improve supply-risk monitoring.
 
 ## Future Improvements
 
 - Persistent alert storage (CSV or database)
-- Keyword filtering before LLM analysis
-- Email or Slack notifications
-- Supplier metadata enrichment
-- Dashboard for monitoring supplier risk trends
+- Expanded supplier and dependency graph
+- Multi-hop dependency reasoning (tier-2 / tier-3 suppliers)
+- Additional data sources (e.g., shipping, financial signals)
+- Lightweight monitoring dashboard
+
+
+## Summary
+
+This project demonstrates a practical pattern for AI-driven operational intelligence:
+```text
+external signals
+→ dependency-aware inference
+→ retrieval-augmented reasoning
+→ structured decision support
+```
