@@ -38,12 +38,15 @@ flowchart TD
 For each headline:
 
 **1. Signal ingestion**
+
 Headlines are fetched from Google News RSS based on supplier-related queries.
 
 **2. Risk filtering**
+
 Only disruption-relevant signals (e.g., earthquake, strike, congestion) are processed.
 
 **3. Graph-based inference**
+
 A lightweight dependency graph links:
 - suppliers → regions / dependencies
 - regions / dependencies → risk events
@@ -51,17 +54,20 @@ A lightweight dependency graph links:
 This step identifies candidate suppliers exposed to the event.
 
 **4. Vector retrieval (FAISS)**
+
 Supplier profiles are embedded and stored in a vector index.
 The system retrieves the most relevant supplier context using:
 - headline + graph-inferred suppliers
 
 **5. LLM risk analysis**
+
 The model evaluates:
 - likelihood of disruption
 - operational impact
 - recommended mitigation actions
 
 **6. Structured output**
+
 Results are returned as structured alerts.
 
 
@@ -128,30 +134,40 @@ Relevant Supplier Context: Foxconn - Foxconn is a global electronics manufacturi
 This project intentionally balances simplicity with meaningful system behavior.
 
 **Graph + Retrieval (Hybrid Reasoning)**
+
 - The graph layer identifies who might be affected
 - The vector layer provides context on why and how
+
 This combination enables more realistic supply-chain reasoning than either approach alone.
 
 **Lightweight Knowledge Representation**
-- Supplier relationships are modeled using a simple JSON-based graph
-- No external graph database is required
-- Designed for clarity and extensibility
+
+Supplier relationships are modeled using a simple JSON-based graph (`supplier_graph.json`), capturing links between suppliers, regions, dependencies, and risk events.
+
+This enables dependency-aware reasoning (e.g., earthquake → region → supplier) before retrieval and LLM analysis.
+
+The approach is intentionally lightweight, avoiding the need for a dedicated graph database while remaining easy to extend.
 
 **Deterministic Pipeline**
+
 The workflow is explicitly orchestrated:
 ```text
 signals → graph inference → retrieval → LLM → alerts
 ```
+
 This avoids the complexity of autonomous agent loops while remaining transparent and debuggable.
 
 **Structured JSON output**
+
 The LLM output is normalized into structured JSON so that the alerts could easily be consumed by downstream systems such as dashboards, notification services, or planning tools.
 
 **Lightweight Momery**
+
 The agent tracks previously processed headlines using a local `seen_headlines.json` file to avoid duplicate analysis across runs. This provides simple persistence without requiring external storage.
 
 **Retrieval-Based Context Grounding**
-The agent tracks previously processed headlines using a local `seen_headlines.json` file to avoid duplicate analysis across runs. This provides simple persistence without requiring external storage.
+
+Supplier profiles are stored in `supplier_profiles.json` and indexed using FAISS at runtime. Relevant supplier context is retrieved and injected into the LLM prompt to ground risk evaluation.
 
 
 ## Future Improvements
