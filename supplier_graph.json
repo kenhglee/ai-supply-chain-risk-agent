@@ -1,0 +1,22 @@
+[
+  ["Murata", "operates_in", "Japan"],
+  ["Murata", "operates_in", "Malaysia"],
+  ["Murata", "supplies", "capacitors"],
+
+  ["Foxconn", "operates_in", "China"],
+  ["Foxconn", "operates_in", "Vietnam"],
+  ["Foxconn", "operates_in", "India"],
+  ["Foxconn", "depends_on", "ports"],
+
+  ["TSMC", "operates_in", "Taiwan"],
+  ["TSMC", "depends_on", "water"],
+  ["TSMC", "depends_on", "power"],
+
+  ["Japan", "has_risk", "earthquake"],
+  ["Malaysia", "has_risk", "flooding"],
+  ["Taiwan", "has_risk", "earthquake"],
+  ["Taiwan", "has_risk", "typhoon"],
+  ["ports", "has_risk", "congestion"],
+  ["water", "has_risk", "drought"],
+  ["power", "has_risk", "outage"]
+]

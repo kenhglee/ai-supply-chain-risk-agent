@@ -1,6 +1,7 @@
 import feedparser
 import json
 from pathlib import Path
+import re
 
 from dotenv import load_dotenv, find_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -8,6 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from collections import Counter
 
 
 # ============================================================
@@ -23,7 +25,7 @@ _ = load_dotenv(find_dotenv())
 
 MEMORY_FILE = Path("seen_headlines.json")
 RSS_URL = "https://news.google.com/rss/search?q=TSMC+OR+Foxconn+OR+Murata&hl=en-US&gl=US&ceid=US:en"
-RISK_KEYWORDS = [
+RISK_TERMS = [
     "shutdown", "delay", "shortage", "strike", "sanction",
     "export", "cyber", "earthquake", "flood", "fire",
     "capacity", "bankruptcy", "disruption",
@@ -52,6 +54,11 @@ Do not include explanations or any text outside the JSON.
 # ============================================================
 # Utility helpers
 # ============================================================
+
+
+def detect_risk_terms(headline):
+    h = headline.lower()
+    return [term for term in RISK_TERMS if term in h]
 
 
 def get_field(obj, *keys):
@@ -100,6 +107,54 @@ def normalize_raw_response(raw) -> list:
     return [i for i in items if isinstance(i, dict) and i.get("skip") is not True]
 
 
+def normalize_risk_level(value):
+    """Normalize LLM risk_level values into one of: High/Medium/Low/Unknown.
+
+    The LLM may return variants like "High risk", "medium", or even nested dicts.
+    """
+    if value is None:
+        return "Unknown"
+
+    # Handle common nested shapes (e.g., {"risk_level": "High"}).
+    if isinstance(value, dict):
+        for k in ("risk_level", "level", "value", "severity"):
+            if k in value:
+                value = value[k]
+                break
+        else:
+            return "Unknown"
+
+    # If the model accidentally returns a list, use the first element.
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+        if value is None:
+            return "Unknown"
+
+    s = str(value).strip().lower()
+    if not s:
+        return "Unknown"
+
+    mapping = {
+        "high": "High",
+        "medium": "Medium",
+        "low": "Low",
+    }
+
+    # Fast path for exact matches.
+    if s in mapping:
+        return mapping[s]
+
+    # Handle variants like "high risk" / "medium severity" etc.
+    if re.search(r"\bhigh\b", s) or s.startswith("high"):
+        return "High"
+    if re.search(r"\bmedium\b", s) or s.startswith("medium"):
+        return "Medium"
+    if re.search(r"\blow\b", s) or s.startswith("low"):
+        return "Low"
+
+    return "Unknown"
+
+
 # ============================================================
 # Data loading / input functions
 # ============================================================
@@ -127,15 +182,15 @@ def build_vectorstore(profiles: list) -> tuple:
 
 def fetch_headlines(
     rss_url: str = RSS_URL,
-    risk_keywords: list[str] | None = None,
+    risk_terms: list[str] | None = None,
     fallback: list[str] | None = None,
 ) -> list[str]:
     """Fetch headlines from RSS and filter by risk keywords. Use fallback if feed is empty."""
-    risk_keywords = risk_keywords or RISK_KEYWORDS
+    risk_terms = risk_terms or RISK_TERMS
     fallback = fallback or FALLBACK_HEADLINES
     feed = feedparser.parse(rss_url)
     headlines = [entry.title.rsplit(" - ", 1)[0] for entry in feed.entries]
-    headlines = [h for h in headlines if any(k in h.lower() for k in risk_keywords)]
+    headlines = [h for h in headlines if any(k in h.lower() for k in risk_terms)]
     if not headlines:
         print("(Using sample headlines - RSS feed returned empty)\n")
         return fallback
@@ -148,6 +203,31 @@ def load_seen_headlines(memory_file: Path = MEMORY_FILE) -> set:
         with open(memory_file, "r") as f:
             return set(json.load(f))
     return set()
+
+
+# ============================================================
+# Graph Traversal helpers
+# ============================================================
+
+
+def load_graph(path="supplier_graph.json"):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def find_suppliers_exposed_to_risk(graph_edges, risk_term):
+    """Return suppliers linked to a risk through simple graph relationships."""
+    exposed_entities = {
+        source for source, rel, target in graph_edges
+        if rel == "has_risk" and target.lower() == risk_term.lower()
+    }
+
+    suppliers = {
+        source for source, rel, target in graph_edges
+        if target in exposed_entities and rel in {"operates_in", "depends_on"}
+    }
+
+    return list(suppliers)
 
 
 # ============================================================
@@ -172,7 +252,8 @@ You must set "supplier" to exactly one of: {suppliers}. Choose the single suppli
 
 Supplier list: {suppliers}
 Headline: {headline}
-
+Graph-inferred candidate suppliers:
+{candidate_suppliers}
 Relevant supplier context:
 {context}
 
@@ -183,18 +264,23 @@ Relevant supplier context:
 
 def analyze_headline(chain, vectorstore, headline: str, suppliers: list[str]) -> list[dict]:
     """Run risk analysis for one headline. Returns list of risk item dicts (may be empty)."""
-    relevant_docs = vectorstore.similarity_search(headline, k=1)
-    context = "\n\n".join(
-        f"Supplier: {doc.metadata['supplier']}\nContext: {doc.page_content}"
-        for doc in relevant_docs
+    risk_terms = detect_risk_terms(headline)
+    graph_edges = load_graph()
+    candidate_suppliers = set()
+    for term in risk_terms:
+        candidate_suppliers.update(find_suppliers_exposed_to_risk(graph_edges, term))
+
+    relevant_docs = vectorstore.similarity_search(
+        " ".join(list(candidate_suppliers) + [headline]), 
+        k=1
     )
-    context_suppliers = [
-        doc.metadata.get("supplier") for doc in relevant_docs if doc.metadata.get("supplier")
-    ]
+    context = "\n\n".join(doc.page_content for doc in relevant_docs)
+    
     try:
         raw = chain.invoke({
             "suppliers": suppliers,
             "headline": headline,
+            "candidate_suppliers": ", ".join(candidate_suppliers) if candidate_suppliers else "None",
             "context": context,
             "format_spec": FORMAT_SPEC,
         })
@@ -202,7 +288,7 @@ def analyze_headline(chain, vectorstore, headline: str, suppliers: list[str]) ->
         print(f"Model call failed: {e}")
         return []
     items = normalize_raw_response(raw)
-    fill_supplier_fallback(items, headline, context_suppliers, suppliers)
+    fill_supplier_fallback(items, headline, context, suppliers)
     return items
 
 # ============================================================
@@ -221,13 +307,29 @@ def print_summary(alerts: list) -> None:
     if not alerts:
         print("No risks identified from the current headlines.")
         return
+    risk_counts = Counter(
+        normalize_risk_level(
+            get_field(alert, "risk_level", "riskLevel", "severity", "level", "risk")
+        )
+        for alert in alerts
+    )
+    supplier_counts = Counter(alert.get("supplier", "Unknown") for alert in alerts)
+
+    print(f"New alerts: {len(alerts)}")
+    print(f"High risk: {risk_counts.get('High', 0)}")
+    print(f"Medium risk: {risk_counts.get('Medium', 0)}")
+    print(f"Low risk: {risk_counts.get('Low', 0)}")
+    print(f"Affected suppliers: {', '.join(supplier_counts.keys())}")
+
+    print("\nDetailed Alerts")
+    print("-" * 35)
+
     for item in alerts:
-        if not isinstance(item, dict):
-            print(f"Skipping non-dict item: {type(item).__name__} = {repr(item)[:80]}")
-            continue
         print(f"Supplier: {get_field(item, 'supplier')}")
         print(f"Headline: {get_field(item, 'headline')}")
-        print(f"Risk Level: {get_field(item, 'risk_level')}")
+        print(
+            f"Risk Level: {get_field(item, 'risk_level', 'riskLevel', 'severity', 'level', 'risk')}"
+        )
         print(f"Impact: {get_field(item, 'impact')}")
         print(f"Recommended Action: {get_field(item, 'recommended_action')}")
         print(f"Relevant Supplier Context: {get_field(item, 'relevant_supplier_context')}")
