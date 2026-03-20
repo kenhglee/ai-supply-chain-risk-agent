@@ -4,4 +4,6 @@ __pycache__/
 .env.*
 .venv/
 venv/
+venv-langgraph/
 seen_headlines.json
+*.lock.txt
