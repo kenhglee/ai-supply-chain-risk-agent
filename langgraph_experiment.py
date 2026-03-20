@@ -1,4 +1,4 @@
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List, Optional, Literal
 from langgraph.graph import StateGraph, END
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -14,10 +14,11 @@ class RiskState(TypedDict):
     headline: str
     candidate_suppliers: List[str]
     context: str
+    tool_decision: Optional[Literal["retrieve", "skip"]]
     alert: Optional[str]
 
 
-# ---- Nodes ----
+# ---- Node 1: infer suppliers (your existing graph/rule logic placeholder) ----
 def infer_suppliers(state: RiskState) -> RiskState:
     headline = state["headline"].lower()
     suppliers = []
@@ -27,24 +28,51 @@ def infer_suppliers(state: RiskState) -> RiskState:
     if "taiwan" in headline:
         suppliers.append("TSMC")
 
-    print("DEBUG infer_suppliers ->", suppliers)
-
     return {**state, "candidate_suppliers": suppliers}
 
 
+# ---- Node 2: controlled "reason" step ----
+def decide_tool_use(state: RiskState) -> RiskState:
+    headline = state["headline"]
+    suppliers = state["candidate_suppliers"]
+
+    prompt = f"""
+    You are a supply chain risk analyst.
+
+    Headline:
+    {headline}
+
+    Candidate suppliers:
+    {", ".join(suppliers) if suppliers else "None"}
+
+    Decide whether supplier-context retrieval is needed before risk analysis.
+
+    Return exactly one word:
+    - retrieve
+    - skip
+    """
+
+    response = model.invoke(prompt)
+    decision = response.content.strip().lower()
+
+    if decision not in {"retrieve", "skip"}:
+        decision = "skip"
+
+    return {**state, "tool_decision": decision}
+
+
+# ---- Node 3: retrieval tool step (mock for now) ----
 def retrieve_context(state: RiskState) -> RiskState:
-    print("DEBUG retrieve_context input ->", state["candidate_suppliers"])
     suppliers = state["candidate_suppliers"]
     context = f"Context for: {', '.join(suppliers)}" if suppliers else "No context found"
     return {**state, "context": context}
 
 
+# ---- Node 4: final analysis ----
 def analyze_risk(state: RiskState) -> RiskState:
-    print("DEBUG analyze_risk suppliers ->", state["candidate_suppliers"])
-    print("DEBUG analyze_risk context ->", state["context"])
     headline = state["headline"]
     candidate_suppliers = state["candidate_suppliers"]
-    context = state["context"]
+    context = state["context"] or "No additional context retrieved."
 
     prompt = f"""
     You are a supply chain risk analyst.
@@ -69,24 +97,26 @@ def analyze_risk(state: RiskState) -> RiskState:
 
     return {**state, "alert": alert}
 
-# ---- Conditional Routing ----
-def route_after_infer(state: RiskState) -> str:
-    if state["candidate_suppliers"]:
-        return "retrieve"
-    return "analyze"
+
+# ---- Conditional router ----
+def route_after_decision(state: RiskState) -> str:
+    return "retrieve" if state["tool_decision"] == "retrieve" else "analyze"
 
 
 # ---- Graph ----
 graph = StateGraph(RiskState)
 
 graph.add_node("infer", infer_suppliers)
+graph.add_node("decide", decide_tool_use)
 graph.add_node("retrieve", retrieve_context)
 graph.add_node("analyze", analyze_risk)
 
 graph.set_entry_point("infer")
+graph.add_edge("infer", "decide")
+
 graph.add_conditional_edges(
-    "infer",
-    route_after_infer,
+    "decide",
+    route_after_decision,
     {
         "retrieve": "retrieve",
         "analyze": "analyze",
@@ -110,12 +140,15 @@ if __name__ == "__main__":
             "headline": h,
             "candidate_suppliers": [],
             "context": "",
+            "tool_decision": None,
             "alert": None,
         })
 
         print("\nHeadline:")
         print(h)
+        print("\nTool decision:")
+        print(result["tool_decision"])
         print("\nFinal Alert:")
-        #print(result["alert"])
-        print(result)
-        print("-" * 40)
+        print(result["alert"])
+        #print(result)
+        print("-" * 50)
