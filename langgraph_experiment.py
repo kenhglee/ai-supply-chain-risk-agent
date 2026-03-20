@@ -3,11 +3,20 @@ from langgraph.graph import StateGraph, END
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+import json
+
 load_dotenv()
 
 # ---- Model ----
 model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 
+# ---- Alert Dictionary ----
+class AlertDict(TypedDict, total=False):
+    status: Literal["ok", "inconclusive"]
+    supplier: Optional[str]
+    risk_level: Optional[str]
+    impact: str
+    recommended_action: str
 
 # ---- State ----
 class RiskState(TypedDict):
@@ -86,15 +95,41 @@ def analyze_risk(state: RiskState) -> RiskState:
     Relevant supplier context:
     {context}
 
-    WWrite a short risk assessment in 2-4 sentences.
+    Return ONLY valid JSON with this exact schema:
 
-    If no supplier is clearly relevant, do not speculate about impact.
-    Explicitly state that the signal is inconclusive because no clearly relevant supplier was identified.
+    {{
+    "status": "ok" or "inconclusive",
+    "supplier": string or null,
+    "risk_level": "High" or "Medium" or "Low" or null,
+    "impact": string,
+    "recommended_action": string
+    }}
+
+    Rules:
+    - If at least one candidate supplier is provided and the retrieved context is relevant, do not return "inconclusive".
+    - Use the single most relevant supplier from the candidate suppliers.
+    - Only return "inconclusive" if no candidate supplier is identified or the signal cannot reasonably be connected to any supplier.
+    - Do not include any text outside the JSON.
     """
 
     response = model.invoke(prompt)
-    alert = response.content
+    content = response.content.strip()
 
+    #print("\nDEBUG type(content):", type(content))
+    #print("DEBUG raw content:", repr(content))
+    print("-" * 50)
+
+    try:
+        alert = json.loads(content)
+    except Exception as e:
+        print("DEBUG parse error:", e)
+        alert = {
+            "status": "inconclusive",
+            "supplier": None,
+            "risk_level": None,
+            "impact": "Model output could not be parsed reliably.",
+            "recommended_action": "Review the headline and prompt logic."
+        }
     return {**state, "alert": alert}
 
 
@@ -148,7 +183,12 @@ if __name__ == "__main__":
         print(h)
         print("\nTool decision:")
         print(result["tool_decision"])
-        print("\nFinal Alert:")
-        print(result["alert"])
-        #print(result)
+        print("\nStructured Alert:")
+        alert = result["alert"]
+
+        print(f"Status: {alert.get('status')}")
+        print(f"Supplier: {alert.get('supplier')}")
+        print(f"Risk Level: {alert.get('risk_level')}")
+        print(f"Impact: {alert.get('impact')}")
+        print(f"Recommended Action: {alert.get('recommended_action')}")
         print("-" * 50)
