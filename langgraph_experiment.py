@@ -41,6 +41,7 @@ class RiskState(TypedDict):
     context: str
     tool_decision: Optional[Literal["retrieve", "skip"]]
     alert: Optional[str]
+    is_valid: Optional[bool]
 
 
 # ---- Node 1: infer suppliers (your existing graph/rule logic placeholder) ----
@@ -110,7 +111,7 @@ def retrieve_context(state: RiskState) -> RiskState:
     return {**state, "context": context}
 
 
-# ---- Node 4: final analysis ----
+# ---- Node 4: Analysis ----
 def analyze_risk(state: RiskState) -> RiskState:
     headline = state["headline"]
     candidate_suppliers = state["candidate_suppliers"]
@@ -131,11 +132,11 @@ def analyze_risk(state: RiskState) -> RiskState:
     Return ONLY valid JSON with this exact schema:
 
     {{
-    "status": "ok" or "inconclusive",
-    "supplier": string or null,
-    "risk_level": "High" or "Medium" or "Low" or null,
-    "impact": string,
-    "recommended_action": string
+        "status": "ok" or "inconclusive",
+        "supplier": string or null,
+        "risk_level": "High" or "Medium" or "Low" or null,
+        "impact": string,
+        "recommended_action": string
     }}
 
     Rules:
@@ -165,11 +166,44 @@ def analyze_risk(state: RiskState) -> RiskState:
         }
     return {**state, "alert": alert}
 
+# ---- Node 5: Validation ----
+def validate_alert(state: RiskState) -> RiskState:
+    alert = state.get("alert")
 
-# ---- Conditional router ----
+    is_valid = False
+
+    if isinstance(alert, dict):
+        status = alert.get("status")
+
+        if status == "inconclusive":
+            is_valid = True
+
+        elif status == "ok":
+            required = ["supplier", "risk_level", "impact", "recommended_action"]
+            is_valid = all(alert.get(k) for k in required)
+
+    return {**state, "is_valid": is_valid}
+
+
+# ---- Node 6: Fallback ----
+def fallback_alert(state: RiskState) -> RiskState:
+    fallback = {
+        "status": "inconclusive",
+        "supplier": None,
+        "risk_level": None,
+        "impact": "Alert could not be validated reliably.",
+        "recommended_action": "Review the model output and upstream prompt or retrieval logic."
+    }
+    return {**state, "alert": fallback}
+
+
+# ---- Conditional router for tool decision ----
 def route_after_decision(state: RiskState) -> str:
     return "retrieve" if state["tool_decision"] == "retrieve" else "analyze"
 
+# ---- Conditional router for validation ----
+def route_after_validation(state: RiskState) -> str:
+    return "end" if state.get("is_valid") else "fallback"
 
 # ---- Graph ----
 graph = StateGraph(RiskState)
@@ -178,6 +212,8 @@ graph.add_node("infer", infer_suppliers)
 graph.add_node("decide", decide_tool_use)
 graph.add_node("retrieve", retrieve_context)
 graph.add_node("analyze", analyze_risk)
+graph.add_node("validate", validate_alert)
+graph.add_node("fallback", fallback_alert)
 
 graph.set_entry_point("infer")
 graph.add_edge("infer", "decide")
@@ -191,7 +227,18 @@ graph.add_conditional_edges(
     },
 )
 graph.add_edge("retrieve", "analyze")
-graph.add_edge("analyze", END)
+graph.add_edge("analyze", "validate")
+
+graph.add_conditional_edges(
+    "validate",
+    route_after_validation,
+    {
+        "end": END,
+        "fallback": "fallback",
+    },
+)
+
+graph.add_edge("fallback", END)
 
 app = graph.compile()
 
