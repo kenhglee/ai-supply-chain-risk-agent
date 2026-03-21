@@ -2,10 +2,26 @@ from typing import TypedDict, List, Optional, Literal
 from langgraph.graph import StateGraph, END
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
 
 import json
 
 load_dotenv()
+
+def load_vectorstore():
+    with open("supplier_profiles.json") as f:
+        data = json.load(f)
+
+    texts = [item["profile"] for item in data]
+
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_texts(texts, embeddings)
+
+    return vectorstore
+
+# ---- Vectorstore ----
+vectorstore = load_vectorstore()
 
 # ---- Model ----
 model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
@@ -72,8 +88,25 @@ def decide_tool_use(state: RiskState) -> RiskState:
 
 # ---- Node 3: retrieval tool step (mock for now) ----
 def retrieve_context(state: RiskState) -> RiskState:
+    headline = state["headline"]
     suppliers = state["candidate_suppliers"]
-    context = f"Context for: {', '.join(suppliers)}" if suppliers else "No context found"
+    
+    # Build query (simple but effective)
+    query = headline
+    if suppliers:
+        query += " " + " ".join(suppliers)
+
+    docs = vectorstore.similarity_search(query, k=4)
+
+    filtered = [
+        d for d in docs
+        if any(s.lower() in d.page_content.lower() for s in suppliers)
+    ]
+
+    docs = filtered[:2] if filtered else docs[:2]
+
+    context = "\n\n".join([doc.page_content for doc in docs]) if docs else "No context found"
+
     return {**state, "context": context}
 
 
