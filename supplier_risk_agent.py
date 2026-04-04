@@ -1,5 +1,7 @@
+import csv
 import json
 import feedparser
+import re
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
 
@@ -13,6 +15,8 @@ from langchain_core.documents import Document
 load_dotenv()
 
 SEEN_FILE = Path("seen_headlines.json")
+ALERT_FILE = Path("alerts.csv")
+ENRICHED_ALERT_FILE = Path("enriched_alerts.csv")
 
 RISK_TERMS = [
     "earthquake",
@@ -34,19 +38,66 @@ SUPPLIER_ALIASES = {
     "Samsung Electronics": ["samsung electronics", "samsung"],
 }
 
+GRAPH_FILE = Path("supplier_graph.json")
+PROFILES_FILE = Path("supplier_profiles.json")
+
+
+# ---- Alert Dictionary ----
+class AlertDict(TypedDict, total=False):
+    status: Literal["ok", "inconclusive"]
+    supplier: Optional[str]
+    risk_level: Optional[str]
+    impact: str
+    recommended_action: str
+    relevant_supplier_context: str
+
+
+# ---- State ----
+class RiskState(TypedDict):
+    headline: str
+    candidate_suppliers: List[str]
+    context: str
+    tool_decision: Optional[Literal["retrieve", "skip"]]
+    alert: Optional[dict]
+    is_valid: Optional[bool]
+
+
+def normalize_headline(h: str) -> str:
+    return h.rsplit(" - ", 1)[0].strip()
+
+
 def load_seen_headlines() -> set:
     if not SEEN_FILE.exists():
         return set()
-    with open(SEEN_FILE, "r") as f:
+    with open(SEEN_FILE, "r", encoding="utf-8") as f:
         return set(json.load(f))
 
 
 def save_seen_headlines(seen: set):
-    with open(SEEN_FILE, "w") as f:
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(list(seen), f, indent=2)
 
-def normalize_headline(h: str) -> str:
-    return h.rsplit(" - ", 1)[0].strip()
+
+def load_graph_edges(path: Path = GRAPH_FILE):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_vectorstore(path: Path = PROFILES_FILE):
+    with open(path, "r", encoding="utf-8") as f:
+        profiles = json.load(f)
+
+    docs = [
+        Document(
+            page_content=item["profile"],
+            metadata={"supplier": item["supplier"]}
+        )
+        for item in profiles
+    ]
+
+    embeddings = OpenAIEmbeddings()
+    return FAISS.from_documents(docs, embeddings)
+
 
 def load_headlines_from_rss() -> list[str]:
     rss_url = "https://news.google.com/rss/search?q=TSMC+OR+Foxconn+OR+Murata&hl=en-US&gl=US&ceid=US:en"
@@ -63,6 +114,114 @@ def load_headlines_from_rss() -> list[str]:
         print("(Using sample headlines - RSS feed returned empty)\n")
 
     return headlines
+
+
+def bootstrap_alerts_csv_from_rss(alerts_file: Path = ALERT_FILE) -> int:
+    """
+    Writes new, unseen RSS headlines into alerts.csv as raw alerts.
+    Returns the number of rows appended.
+    """
+    seen = load_seen_headlines()
+    headlines = load_headlines_from_rss()
+
+    file_exists = alerts_file.exists()
+    rows_written = 0
+    next_id = get_next_alert_number(alerts_file)
+
+    with open(alerts_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["alert_id", "headline", "source", "status"]
+        )
+
+        if not file_exists:
+            writer.writeheader()
+
+        for headline in headlines:
+            norm = normalize_headline(headline)
+            if norm in seen:
+                continue
+
+            writer.writerow({
+                "alert_id": f"rss-{next_id}",
+                "headline": headline,
+                "source": "google_news_rss",
+                "status": "new",
+            })
+            seen.add(norm)
+            rows_written += 1
+            next_id += 1
+
+    save_seen_headlines(seen)
+    return rows_written
+
+
+def load_alerts_csv(alerts_file: Path = ALERT_FILE) -> list[dict]:
+    if not alerts_file.exists():
+        return []
+
+    with open(alerts_file, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader)   
+
+
+def is_actionable_alert(headline: str) -> bool:
+    h = headline.lower()
+
+    has_risk_term = any(term in h for term in RISK_TERMS)
+    has_supplier_alias = any(
+        alias in h
+        for aliases in SUPPLIER_ALIASES.values()
+        for alias in aliases
+    )
+
+    # For now, require at least one concrete signal
+    return has_risk_term or has_supplier_alias
+
+
+def get_next_alert_number(alerts_file: Path = ALERT_FILE) -> int:
+    """
+    Scan existing alerts.csv and return the next available numeric suffix
+    for IDs like rss-1, rss-2, ...
+    """
+    if not alerts_file.exists():
+        return 1
+
+    max_n = 0
+    with open(alerts_file, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            alert_id = (row.get("alert_id") or "").strip()
+            m = re.fullmatch(r"rss-(\d+)", alert_id)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+
+    return max_n + 1
+
+
+def write_enriched_alerts(rows: list[dict], path: Path = ENRICHED_ALERT_FILE) -> None:
+    if not rows:
+        return
+
+    fieldnames = [
+        "alert_id",
+        "headline",
+        "source",
+        "status",
+        "tool_decision",
+        "candidate_suppliers",
+        "final_status",
+        "supplier",
+        "risk_level",
+        "impact",
+        "recommended_action",
+        "relevant_supplier_context",
+    ]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def detect_risk_terms(headline: str) -> List[str]:
@@ -108,55 +267,13 @@ def infer_candidate_suppliers_from_graph(headline: str, graph_edges, supplier_al
 
     return list(candidate_suppliers)
 
-GRAPH_FILE = Path("supplier_graph.json")
-PROFILES_FILE = Path("supplier_profiles.json")
 
-
-def load_graph_edges(path: Path = GRAPH_FILE):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
+# ---- Graph ----
 graph_edges = load_graph_edges()
-
-def load_vectorstore(path: Path = PROFILES_FILE):
-    with open(path, "r", encoding="utf-8") as f:
-        profiles = json.load(f)
-
-    docs = [
-        Document(
-            page_content=item["profile"],
-            metadata={"supplier": item["supplier"]}
-        )
-        for item in profiles
-    ]
-
-    embeddings = OpenAIEmbeddings()
-    return FAISS.from_documents(docs, embeddings)
-
 # ---- Vectorstore ----
 vectorstore = load_vectorstore()
-
 # ---- Model ----
 model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-
-# ---- Alert Dictionary ----
-class AlertDict(TypedDict, total=False):
-    status: Literal["ok", "inconclusive"]
-    supplier: Optional[str]
-    risk_level: Optional[str]
-    impact: str
-    recommended_action: str
-    relevant_supplier_context: str
-
-# ---- State ----
-class RiskState(TypedDict):
-    headline: str
-    candidate_suppliers: List[str]
-    context: str
-    tool_decision: Optional[Literal["retrieve", "skip"]]
-    alert: Optional[str]
-    is_valid: Optional[bool]
 
 
 # ---- Node 1: infer suppliers (your existing graph/rule logic placeholder) ----
@@ -173,12 +290,6 @@ def infer_suppliers(state: RiskState) -> RiskState:
 
 # ---- Node 2: controlled "reason" step ----
 def decide_tool_use(state: RiskState) -> RiskState:
-    '''
-    suppliers = state["candidate_suppliers"]
-    decision = "retrieve" if suppliers else "skip"
-    print("DEBUG decide_tool_use ->", decision)
-    return {**state, "tool_decision": decision}
-    '''
     headline = state["headline"]
     suppliers = state["candidate_suppliers"]
 
@@ -205,6 +316,8 @@ def decide_tool_use(state: RiskState) -> RiskState:
         decision = "skip"
 
     return {**state, "tool_decision": decision}
+
+
 # ---- Node 3: retrieval tool step (mock for now) ----
 def retrieve_context(state: RiskState) -> RiskState:
     #print("\nDEBUG retrieve_context reached")
@@ -217,7 +330,6 @@ def retrieve_context(state: RiskState) -> RiskState:
         query_parts.extend(suppliers)
 
     query = " ".join(query_parts)
-
     docs = vectorstore.similarity_search(query, k=4)
 
     # Prefer docs whose metadata supplier matches inferred suppliers
@@ -312,15 +424,12 @@ def analyze_risk(state: RiskState) -> RiskState:
 # ---- Node 5: Validation ----
 def validate_alert(state: RiskState) -> RiskState:
     alert = state.get("alert")
-
     is_valid = False
 
     if isinstance(alert, dict):
         status = alert.get("status")
-
         if status == "inconclusive":
             is_valid = True
-
         elif status == "ok":
             required = ["supplier", "risk_level", "impact", "recommended_action", "relevant_supplier_context"]
             is_valid = all(alert.get(k) for k in required)
@@ -363,7 +472,6 @@ graph.add_node("fallback", fallback_alert)
 
 graph.set_entry_point("infer")
 graph.add_edge("infer", "decide")
-
 graph.add_conditional_edges(
     "decide",
     route_after_decision,
@@ -374,7 +482,6 @@ graph.add_conditional_edges(
 )
 graph.add_edge("retrieve", "analyze")
 graph.add_edge("analyze", "validate")
-
 graph.add_conditional_edges(
     "validate",
     route_after_validation,
@@ -389,45 +496,49 @@ graph.add_edge("fallback", END)
 app = graph.compile()
 
 
+def process_alert_row(row: dict) -> dict:
+    headline = row["headline"]
+
+    result = app.invoke({
+        "headline": headline,
+        "candidate_suppliers": [],
+        "context": "",
+        "tool_decision": None,
+        "alert": None,
+        "is_valid": None,
+    })
+
+    alert = result["alert"]
+
+    if not is_actionable_alert(headline):
+        return {
+            "alert_id": row.get("alert_id", ""),
+            "headline": headline,
+            "source": row.get("source", ""),
+            "status": row.get("status", ""),
+            "tool_decision": result.get("tool_decision"),
+            "candidate_suppliers": ", ".join(result.get("candidate_suppliers", [])),
+            "final_status": alert.get("status"),
+            "supplier": alert.get("supplier"),
+            "risk_level": alert.get("risk_level"),
+            "impact": alert.get("impact"),
+            "recommended_action": alert.get("recommended_action"),
+            "relevant_supplier_context": alert.get("relevant_supplier_context"),
+        }
+
+
 # ---- Run ----
 if __name__ == "__main__":
-    headlines = load_headlines_from_rss()
-    seen = load_seen_headlines()
+     # optional bootstrap step
+    bootstrap_alerts_csv_from_rss()
 
-    new_headlines = []
-    for h in headlines:
-        norm = normalize_headline(h)
-        if norm not in seen:
-            new_headlines.append(h)
+    alerts = load_alerts_csv()
+    new_alerts = [row for row in alerts if row.get("status") == "new"]
 
-    print(f"Total headlines: {len(headlines)}")
-    print(f"New headlines: {len(new_headlines)}")
+    print(f"Alerts loaded: {len(alerts)}")
+    print(f"Alerts to process: {len(new_alerts)}")
 
-    for h in new_headlines:
-        result = app.invoke({
-            "headline": h,
-            "candidate_suppliers": [],
-            "context": "",
-            "tool_decision": None,
-            "alert": None,
-            "is_valid": None,
-        })
-        alert = result["alert"]
-        
-        print("\nHeadline:")
-        print(h)
-        print("\nTool decision:")
-        print(result["tool_decision"])
-        print("\nStructured Alert:")
-        print(f"Status: {alert.get('status')}")
-        print(f"Supplier: {alert.get('supplier')}")
-        print(f"Risk Level: {alert.get('risk_level')}")
-        print(f"Impact: {alert.get('impact')}")
-        print(f"Recommended Action: {alert.get('recommended_action')}")
-        print(f"Relevant Supplier Context: {alert.get('relevant_supplier_context')}")
-        print("-" * 50)
+    enriched_rows = [process_alert_row(row) for row in new_alerts]
+    write_enriched_alerts(enriched_rows)
 
-        seen.add(normalize_headline(h))
-
-    # Save after processing
-    save_seen_headlines(seen)
+    print(f"Enriched alerts written: {len(enriched_rows)}")
