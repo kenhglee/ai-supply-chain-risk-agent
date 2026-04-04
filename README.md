@@ -7,14 +7,15 @@
 An AI-powered supply chain risk agent that ingests live news signals, maps disruption events to suppliers using a lightweight knowledge graph, retrieves supplier context with FAISS, and generates structured risk assessments through a LangGraph-orchestrated workflow.
 
 ## Overview
-Supply chain disruptions often originate from external events such as natural disasters, geopolitical shifts, or logistics bottlenecks.
 
-This project explores how these signals can be transformed into actionable intelligence by combining:
+Supply chain disruptions often originate from external events such as natural disasters, geopolitical shifts, logistics bottlenecks, or supplier-specific issues.
 
-- external signal ingestion (news)
-- dependency-aware supplier inference (graph)
-- retrieval-augmented context (vector search)
-- LLM-based risk evaluation
+This project demonstrates how those signals can be transformed into actionable intelligence by combining:
+
+- external signal ingestion from live news feeds
+- graph-based supplier inference
+- FAISS-based retrieval of supplier context
+- LLM-driven risk evaluation and structured alerts
 
 ## Architecture
 ```mermaid
