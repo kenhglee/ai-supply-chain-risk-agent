@@ -3,7 +3,8 @@
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 # AI Supplier Risk Monitoring Agent
-An AI-powered agent that monitors global news signals and identifies potential supply chain risks affecting key suppliers using graph-assisted retrieval and LLM reasoning.
+
+An AI-powered supply chain risk agent that ingests live news signals, maps disruption events to suppliers using a lightweight knowledge graph, retrieves supplier context with FAISS, and generates structured risk assessments through a LangGraph-orchestrated workflow.
 
 ## Overview
 Supply chain disruptions often originate from external events such as natural disasters, geopolitical shifts, or logistics bottlenecks.
@@ -18,13 +19,15 @@ This project explores how these signals can be transformed into actionable intel
 ## Architecture
 ```mermaid
 flowchart TD
-    A["Google News RSS"]
-    B["Headline ingestion & filtering"]
-    C["Graph-based supplier inference"]
-    D["Vector retrieval of supplier context"]
-    E["LLM risk analysis"]
-    F["Structured JSON alerts"]
-    G["Daily supply risk summary"]
+    A["Signal Ingestion"]
+    B["Headline memory / deduplication"]
+    C["Risk filtering"]
+    D["Graph-based supplier inference"]
+    E["Vector retrieval of (FAISS)"]
+    F["LangGraph workflow orchestration"]
+    G["LLM risk analysis"]
+    H["Validation and fallback handling"]
+    I["Structured output"]
 
     A --> B
     B --> C
@@ -32,6 +35,8 @@ flowchart TD
     D --> E
     E --> F
     F --> G
+    G --> H
+    H --> I
 ```
 
 ## How It Works
@@ -41,49 +46,75 @@ For each headline:
 
 Headlines are fetched from Google News RSS based on supplier-related queries.
 
-**2. Risk filtering**
+**2. Headline memory / deduplication**
+
+Previously processed headlines are stored locally in `seen_headlines.json`.
+
+Only new headlines are processed to avoid duplicate alerts across runs.
+
+**3. Risk filtering**
 
 Only disruption-relevant signals (e.g., earthquake, strike, congestion) are processed.
 
-**3. Graph-based inference**
+**4. Graph-based supplier inference**
 
 A lightweight dependency graph links:
 - suppliers → regions / dependencies
 - regions / dependencies → risk events
 
-This step identifies candidate suppliers exposed to the event.
+This step identifies candidate suppliers potentially exposed to the event.
 
-**4. Vector retrieval (FAISS)**
+**5. Vector retrieval (FAISS)**
 
 Supplier profiles are embedded and stored in a vector index.
-The system retrieves the most relevant supplier context using:
-- headline + graph-inferred suppliers
 
-**5. LLM risk analysis**
+Using the headline and graph-inferred supplier candidates, the system retrieves the most relevant supplier context to ground the analysis.
 
-The model evaluates:
-- likelihood of disruption
-- operational impact
-- recommended mitigation actions
+**6. LangGraph workflow orchestration**
 
-**6. Structured output**
+LangGraph manages the workflow as an explicit state machine.
 
-Results are returned as structured alerts.
+It controls:
+- whether supplier context should be retrieved
+- how analysis is routed
+- how invalid or weak outputs are handled
+
+**7. LLM risk analysis**
+
+The model generates a structured risk assessment including:
+- supplier
+- risk level
+- impact
+- recommended action
+- relevant supplier context
+
+**8. Validation and fallback handling**
+
+Outputs are validated before being accepted.
+
+If the signal is too weak or no supplier can be confidently identified, the system returns an explicit `inconclusive` result rather than producing unsupported recommendations.
+
+**9. Structured output**
+
+Final results are returned as structured alerts suitable for downstream dashboards, notifications, or planning workflows.
 
 
 ## Features
 - Google News RSS ingestion
+- Headline deduplication across runs
 - Keyword-based disruption filtering
-- Graph-assisted supplier exposure inference
-- Retrieval-augmented reasoning (FAISS + embeddings)
-- Supplier-specific contextual grounding
-- Structured JSON alerts (risk, impact, action)
-- Lightweight memory to avoid duplicate processing
+- Graph-based supplier exposure inference
+- FAISS-based vector retrieval of supplier context
+- Supplier-specific grounding for risk analysis
+- LangGraph workflow orchestration with conditional routing
+- Structured JSON risk alerts (supplier, risk level, impact, action)
+- Validation and fallback handling for weak or ambiguous signals
 
 
 ## Tech Stack
 - Python
 - OpenAI API
+- LangGraph
 - LangChain
 - FAISS (vector store)
 - Feedparser
@@ -133,42 +164,63 @@ Relevant Supplier Context: Foxconn - Foxconn is a global electronics manufacturi
 
 This project intentionally balances simplicity with meaningful system behavior.
 
-**Graph + Retrieval (Hybrid Reasoning)**
+**Graph + Vector Retrieval (Hybrid Reasoning)**
 
-- The graph layer identifies who might be affected
-- The vector layer provides context on why and how
+The system combines two complementary forms of retrieval:
 
-This combination enables more realistic supply-chain reasoning than either approach alone.
+- A lightweight graph identifies which suppliers may be affected by a disruption signal
+- FAISS-based vector retrieval provides supplier-specific context for the identified candidates
+
+In practice:
+
+```text
+earthquake in Japan → Murata candidate → Murata supplier context
+```
 
 **Lightweight Knowledge Representation**
 
-Supplier relationships are modeled using a simple JSON-based graph (`supplier_graph.json`), capturing links between suppliers, regions, dependencies, and risk events.
+Supplier relationships are modeled using a simple JSON-based graph (supplier_graph.json) linking:
 
-This enables dependency-aware reasoning (e.g., earthquake → region → supplier) before retrieval and LLM analysis.
+- suppliers
+- regions
+- dependencies
+- disruption types
 
-The approach is intentionally lightweight, avoiding the need for a dedicated graph database while remaining easy to extend.
+This enables dependency-aware reasoning without requiring a dedicated graph database, keeping the system lightweight and easy to extend.
 
-**Deterministic Pipeline**
+**LangGraph-Based Workflow Orchestration**
 
-The workflow is explicitly orchestrated:
+The workflow is modeled explicitly using LangGraph.
+
 ```text
-signals → graph inference → retrieval → LLM → alerts
+signals → graph inference → retrieval → analysis → validation → alerts
 ```
 
-This avoids the complexity of autonomous agent loops while remaining transparent and debuggable.
+LangGraph makes conditional behavior easier to express and debug, including:
 
-**Structured JSON output**
+- whether supplier context should be retrieved
+- how candidate suppliers flow through the system
+- how invalid or weak model outputs are handled
 
-The LLM output is normalized into structured JSON so that the alerts could easily be consumed by downstream systems such as dashboards, notification services, or planning tools.
+This provides more control and transparency than a single prompt or free-form agent loop.
 
-**Lightweight Momery**
+**Structured and Validated Outputs**
 
-The agent tracks previously processed headlines using a local `seen_headlines.json` file to avoid duplicate analysis across runs. This provides simple persistence without requiring external storage.
+The LLM produces structured JSON alerts containing:
 
-**Retrieval-Based Context Grounding**
+supplier
+risk level
+impact
+recommended action
+relevant supplier context
 
-Supplier profiles are stored in `supplier_profiles.json` and indexed using FAISS at runtime. Relevant supplier context is retrieved and injected into the LLM prompt to ground risk evaluation.
+Outputs are validated before use. If no supplier can be identified or the signal is too weak, the system returns an explicit inconclusive result rather than generating unsupported recommendations.
 
+**Lightweight Operational Momery**
+
+Previously processed headlines are stored in seen_headlines.json.
+
+This prevents duplicate processing across runs while keeping the system self-contained and free of external infrastructure.
 
 ## Future Improvements
 
@@ -184,7 +236,7 @@ Supplier profiles are stored in `supplier_profiles.json` and indexed using FAISS
 This project demonstrates a practical pattern for AI-driven operational intelligence:
 ```text
 external signals
-→ dependency-aware inference
-→ retrieval-augmented reasoning
+→ graph-based supplier inference
+→ vector-grounded reasoning
 → structured decision support
 ```
