@@ -2,6 +2,7 @@ import csv
 import json
 import feedparser
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
 
@@ -14,9 +15,20 @@ from langchain_core.documents import Document
 
 load_dotenv()
 
-SEEN_FILE = Path("seen_headlines.json")
-ALERT_FILE = Path("alerts.csv")
-ENRICHED_ALERT_FILE = Path("enriched_alerts.csv")
+BASE_DIR = Path(__file__).resolve().parent
+
+SEEN_FILE = BASE_DIR / "seen_headlines.json"
+ALERT_FILE = BASE_DIR / "alerts.csv"
+ENRICHED_ALERT_FILE = BASE_DIR / "enriched_alerts.csv"
+RISK_STATE_FILE = BASE_DIR / "risk_state.csv"
+GRAPH_FILE = BASE_DIR / "supplier_graph.json"
+PROFILES_FILE = BASE_DIR / "supplier_profiles.json"
+
+RISK_RANK = {
+    "Low": 1,
+    "Medium": 2,
+    "High": 3,
+}
 
 RISK_TERMS = [
     "earthquake",
@@ -38,14 +50,11 @@ SUPPLIER_ALIASES = {
     "Samsung Electronics": ["samsung electronics", "samsung"],
 }
 
-GRAPH_FILE = Path("supplier_graph.json")
-PROFILES_FILE = Path("supplier_profiles.json")
-
-
 # ---- Alert Dictionary ----
 class AlertDict(TypedDict, total=False):
     status: Literal["ok", "inconclusive"]
     supplier: Optional[str]
+    risk_type: Optional[str]
     risk_level: Optional[str]
     impact: str
     recommended_action: str
@@ -60,6 +69,66 @@ class RiskState(TypedDict):
     tool_decision: Optional[Literal["retrieve", "skip"]]
     alert: Optional[dict]
     is_valid: Optional[bool]
+
+
+def load_risk_state(path: Path = RISK_STATE_FILE) -> dict[tuple[str, str], dict]:
+    if not path.exists():
+        return {}
+
+    state = {}
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            supplier = (row.get("supplier") or "").strip()
+            risk_type = (row.get("risk_type") or "").strip()
+            if supplier and risk_type:
+                state[(supplier, risk_type)] = row
+    return state
+
+
+def save_risk_state(state: dict[tuple[str, str], dict], path: Path = RISK_STATE_FILE) -> None:
+    fieldnames = [
+        "supplier",
+        "risk_type",
+        "current_risk_level",
+        "last_headline",
+        "last_seen_at",
+    ]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in state.values():
+            writer.writerow(row)
+
+
+def normalize_risk_type(risk_type: str | None) -> str | None:
+    if not risk_type:
+        return None
+
+    value = risk_type.strip().lower().replace(" ", "_")
+
+    aliases = {
+        "earthquake": "earthquake",
+        "flood": "flood",
+        "flooding": "flood",
+        "strike": "strike",
+        "labor_strike": "strike",
+        "outage": "outage",
+        "power_outage": "outage",
+        "sanction": "sanctions",
+        "sanctions": "sanctions",
+        "export_control": "export_controls",
+        "export_controls": "export_controls",
+        "typhoon": "typhoon",
+        "drought": "drought",
+        "congestion": "congestion",
+        "geopolitics": "geopolitical_tension",
+        "geopolitical_tensions": "geopolitical_tension",
+        "geopolitical_risk": "geopolitical_tension",
+    }
+
+    return aliases.get(value, value)
 
 
 def normalize_headline(h: str) -> str:
@@ -199,11 +268,24 @@ def get_next_alert_number(alerts_file: Path = ALERT_FILE) -> int:
     return max_n + 1
 
 
+def write_alerts_csv(rows: list[dict], alerts_file: Path = ALERT_FILE) -> None:
+    if not rows:
+        return
+
+    fieldnames = ["alert_id", "headline", "source", "status"]
+
+    with open(alerts_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def write_enriched_alerts(rows: list[dict], path: Path = ENRICHED_ALERT_FILE) -> None:
     if not rows:
         return
 
     fieldnames = [
+        "processed_at",
         "alert_id",
         "headline",
         "source",
@@ -212,16 +294,27 @@ def write_enriched_alerts(rows: list[dict], path: Path = ENRICHED_ALERT_FILE) ->
         "candidate_suppliers",
         "final_status",
         "supplier",
+        "risk_type",
         "risk_level",
+        "change_type",
+        "change_message",
         "impact",
         "recommended_action",
         "relevant_supplier_context",
     ]
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    file_exists = path.exists()
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+
+        if not file_exists:
+            writer.writeheader()
+
+        for row in rows:
+            row = dict(row)
+            row["processed_at"] = datetime.utcnow().isoformat(timespec="seconds")
+            writer.writerow(row)
 
 
 def detect_risk_terms(headline: str) -> List[str]:
@@ -231,6 +324,58 @@ def detect_risk_terms(headline: str) -> List[str]:
 
 def headline_mentions(text: str, term: str) -> bool:
     return term.lower() in text.lower()
+
+
+def compare_and_update_risk_state(alert: dict, headline: str, state: dict[tuple[str, str], dict]) -> tuple[str, str]:
+    """
+    Returns:
+        change_type: new_alert | suppressed | escalated | downgraded
+        change_message: human-friendly explanation
+    """
+    if alert.get("status") != "ok":
+        return "inconclusive", "No supplier-specific alert state change could be determined."
+
+    supplier = alert.get("supplier")
+    risk_type = normalize_risk_type(alert.get("risk_type"))
+    risk_level = alert.get("risk_level")
+
+    if not supplier or not risk_type or not risk_level:
+        return "inconclusive", "Missing supplier, risk type, or risk level for state comparison."
+
+    key = (supplier, risk_type)
+    prior = state.get(key)
+
+    now_ts = datetime.utcnow().isoformat(timespec="seconds")
+
+    if prior is None:
+        state[key] = {
+            "supplier": supplier,
+            "risk_type": risk_type,
+            "current_risk_level": risk_level,
+            "last_headline": headline,
+            "last_seen_at": now_ts,
+        }
+        return "new_alert", f"New disruption detected for {supplier} ({risk_type}) at {risk_level} risk."
+
+    old_level = prior.get("current_risk_level")
+    old_rank = RISK_RANK.get(old_level, 0)
+    new_rank = RISK_RANK.get(risk_level, 0)
+
+    if new_rank > old_rank:
+        prior["current_risk_level"] = risk_level
+        prior["last_headline"] = headline
+        prior["last_seen_at"] = now_ts
+        return "escalated", f"Risk escalation detected for {supplier}: {old_level} → {risk_level} ({risk_type})."
+
+    if new_rank == old_rank:
+        prior["last_headline"] = headline
+        prior["last_seen_at"] = now_ts
+        return "suppressed", f"Same supplier and risk level as prior alert for {supplier} ({risk_type}); suppressing duplicate."
+
+    prior["current_risk_level"] = risk_level
+    prior["last_headline"] = headline
+    prior["last_seen_at"] = now_ts
+    return "downgraded", f"Risk level decreased for {supplier}: {old_level} → {risk_level} ({risk_type})."
 
 
 def find_suppliers_exposed_to_risk(graph_edges, risk_term: str, headline: str) -> List[str]:
@@ -280,11 +425,6 @@ model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 def infer_suppliers(state: RiskState) -> RiskState:
     headline = state["headline"]
     suppliers = infer_candidate_suppliers_from_graph(headline, graph_edges, SUPPLIER_ALIASES)
-
-    #print("\nDEBUG infer_suppliers")
-    #print("headline:", headline)
-    #print("suppliers:", suppliers)
-
     return {**state, "candidate_suppliers": suppliers}
 
 
@@ -320,8 +460,6 @@ def decide_tool_use(state: RiskState) -> RiskState:
 
 # ---- Node 3: retrieval tool step (mock for now) ----
 def retrieve_context(state: RiskState) -> RiskState:
-    #print("\nDEBUG retrieve_context reached")
-    #print("candidate_suppliers:", state["candidate_suppliers"])
     headline = state["headline"]
     suppliers = state["candidate_suppliers"]
     
@@ -343,9 +481,6 @@ def retrieve_context(state: RiskState) -> RiskState:
         docs = docs[:2]
 
     context = "\n\n".join(doc.page_content for doc in docs) if docs else "No context found"
-    
-    #print("\nDEBUG retrieved context:")
-    #print(context)
     print("-" * 50)
 
     return {**state, "context": context}
@@ -374,6 +509,7 @@ def analyze_risk(state: RiskState) -> RiskState:
     {{
         "status": "ok" or "inconclusive",
         "supplier": string or null,
+        "risk_type": string or null,
         "risk_level": "High" or "Medium" or "Low" or null,
         "impact": string,
         "recommended_action": string,
@@ -381,6 +517,7 @@ def analyze_risk(state: RiskState) -> RiskState:
     }}
 
     Rules:
+    - Risk_type should be a short normalized label such as earthquake, flood, strike, sanctions, outage, export_controls
     - If at least one candidate supplier is provided and the retrieved context is relevant, use status = "ok".
     - If no supplier is clearly relevant, use status = "inconclusive".
     - If status = "inconclusive":
@@ -395,22 +532,28 @@ def analyze_risk(state: RiskState) -> RiskState:
     response = model.invoke(prompt)
     content = response.content.strip()
 
-    #print("\nDEBUG type(content):", type(content))
-    #print("DEBUG raw content:", repr(content))
     print("-" * 50)
 
     try:
         alert = json.loads(content)
 
+        # normalize model output before downstream comparison
+        alert["risk_type"] = normalize_risk_type(alert.get("risk_type"))
+
+        # normalize risk level capitalization too, for safety
+        if alert.get("risk_level"):
+            alert["risk_level"] = alert["risk_level"].strip().title()
+
         # Enforce consistent output for inconclusive alerts in case the model still produces speculative fields.
         if alert.get("status") == "inconclusive":
             alert["supplier"] = None
+            alert["risk_type"] = None
             alert["risk_level"] = None
             alert["impact"] = "No clearly relevant supplier could be identified from the current signal."
             alert["recommended_action"] = "Monitor for more supplier-specific information before taking action."
             alert["relevant_supplier_context"] = ""
     except Exception as e:
-        print("DEBUG parse error:", e)
+
         alert = {
             "status": "inconclusive",
             "supplier": None,
@@ -431,7 +574,13 @@ def validate_alert(state: RiskState) -> RiskState:
         if status == "inconclusive":
             is_valid = True
         elif status == "ok":
-            required = ["supplier", "risk_level", "impact", "recommended_action", "relevant_supplier_context"]
+            required = [
+                "supplier", 
+                "risk_type",
+                "risk_level", 
+                "impact", 
+                "recommended_action", 
+                "relevant_supplier_context"]
             is_valid = all(alert.get(k) for k in required)
 
     return {**state, "is_valid": is_valid}
@@ -452,8 +601,6 @@ def fallback_alert(state: RiskState) -> RiskState:
 
 # ---- Conditional router for tool decision ----
 def route_after_decision(state: RiskState) -> str:
-    #print("\nDEBUG route_after_decision")
-    #print("tool_decision:", state["tool_decision"])
     return "retrieve" if state["tool_decision"] == "retrieve" else "analyze"
 
 # ---- Conditional router for validation ----
@@ -496,8 +643,27 @@ graph.add_edge("fallback", END)
 app = graph.compile()
 
 
-def process_alert_row(row: dict) -> dict:
+def process_alert_row(row: dict, risk_state: dict[tuple[str, str], dict]) -> dict:
     headline = row["headline"]
+
+    if not is_actionable_alert(headline):
+        return {
+            "alert_id": row.get("alert_id", ""),
+            "headline": headline,
+            "source": row.get("source", ""),
+            "status": row.get("status", ""),
+            "tool_decision": "skip",
+            "candidate_suppliers": "",
+            "final_status": "inconclusive",
+            "supplier": "",
+            "risk_type": "",
+            "risk_level": "",
+            "change_type": "ignored",
+            "change_message": "Headline appears informational rather than a concrete disruption signal.",
+            "impact": "No actionable supply disruption signal detected from the headline.",
+            "recommended_action": "Ignore for now or monitor for more specific operational disruption news.",
+            "relevant_supplier_context": "",
+        }
 
     result = app.invoke({
         "headline": headline,
@@ -510,21 +676,30 @@ def process_alert_row(row: dict) -> dict:
 
     alert = result["alert"]
 
-    if not is_actionable_alert(headline):
-        return {
-            "alert_id": row.get("alert_id", ""),
-            "headline": headline,
-            "source": row.get("source", ""),
-            "status": row.get("status", ""),
-            "tool_decision": result.get("tool_decision"),
-            "candidate_suppliers": ", ".join(result.get("candidate_suppliers", [])),
-            "final_status": alert.get("status"),
-            "supplier": alert.get("supplier"),
-            "risk_level": alert.get("risk_level"),
-            "impact": alert.get("impact"),
-            "recommended_action": alert.get("recommended_action"),
-            "relevant_supplier_context": alert.get("relevant_supplier_context"),
-        }
+    change_type, change_message = compare_and_update_risk_state(
+        alert=alert,
+        headline=headline,
+        state=risk_state,
+    )
+
+    
+    return {
+        "alert_id": row.get("alert_id", ""),
+        "headline": headline,
+        "source": row.get("source", ""),
+        "status": row.get("status", ""),
+        "tool_decision": result.get("tool_decision"),
+        "candidate_suppliers": ", ".join(result.get("candidate_suppliers", [])),
+        "final_status": alert.get("status"),
+        "supplier": alert.get("supplier") or "",
+        "risk_type": alert.get("risk_type") or "",
+        "risk_level": alert.get("risk_level") or "",
+        "change_type": change_type,
+        "change_message": change_message,
+        "impact": alert.get("impact"),
+        "recommended_action": alert.get("recommended_action", ""),
+        "relevant_supplier_context": alert.get("relevant_supplier_context", ""),
+    }
 
 
 # ---- Run ----
@@ -533,12 +708,33 @@ if __name__ == "__main__":
     bootstrap_alerts_csv_from_rss()
 
     alerts = load_alerts_csv()
-    new_alerts = [row for row in alerts if row.get("status") == "new"]
-
     print(f"Alerts loaded: {len(alerts)}")
-    print(f"Alerts to process: {len(new_alerts)}")
+    risk_state = load_risk_state()
+    
+    enriched_rows = []
+    for row in alerts:
+        row_status = (row.get("status") or "").strip().lower()
 
-    enriched_rows = [process_alert_row(row) for row in new_alerts]
+        if row.get("status") != "new":
+            continue
+
+        processed = process_alert_row(row, risk_state)
+        print("processed:", type(processed), processed)
+        enriched_rows.append(processed)
+
+        # mark as processed so this row is not reprocessed next run
+        row["status"] = "processed"
+
+    '''
+    print("----- enriched_rows debug -----")
+    for i, row in enumerate(enriched_rows):
+        print(i, type(row), row)
+    print("-------------------------------")
+    '''
+    print(f"Alerts processed this run: {len(enriched_rows)}")
+
     write_enriched_alerts(enriched_rows)
+    save_risk_state(risk_state)
+    write_alerts_csv(alerts)
 
     print(f"Enriched alerts written: {len(enriched_rows)}")
