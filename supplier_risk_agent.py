@@ -2,18 +2,21 @@ import csv
 import json
 import feedparser
 import re
+import os
+import boto3
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
-
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
+from langchain_aws import ChatBedrockConverse
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
-
-load_dotenv()
+dotenv_path = find_dotenv()
+print("dotenv_path:", dotenv_path)
+load_dotenv(dotenv_path)
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -413,12 +416,31 @@ def infer_candidate_suppliers_from_graph(headline: str, graph_edges, supplier_al
     return list(candidate_suppliers)
 
 
+def get_llm():
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+
+    if provider == "openai":
+        return ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0.2,
+        )
+
+    elif provider == "bedrock":
+        return ChatBedrockConverse(
+            model=os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+            temperature=0.2,
+        )
+
+    raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+
+
 # ---- Graph ----
 graph_edges = load_graph_edges()
 # ---- Vectorstore ----
 vectorstore = load_vectorstore()
 # ---- Model ----
-model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+model = get_llm()
 
 
 # ---- Node 1: infer suppliers (your existing graph/rule logic placeholder) ----
