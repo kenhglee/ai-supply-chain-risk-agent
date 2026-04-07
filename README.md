@@ -1,6 +1,6 @@
-![Python](https://img.shields.io/badge/python-3.10-blue)
-![OpenAI](https://img.shields.io/badge/OpenAI-API-green)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
+Python
+OpenAI
+License
 
 # AI Supplier Risk Monitoring Agent
 
@@ -18,6 +18,7 @@ This project demonstrates how those signals can be transformed into actionable i
 - LLM-driven risk evaluation and structured alerts
 
 ## Architecture
+
 ```mermaid
 flowchart TD
     A["Signal Ingestion"]
@@ -40,7 +41,10 @@ flowchart TD
     H --> I
 ```
 
+
+
 ## How It Works
+
 For each headline:
 
 **1. Signal ingestion**
@@ -51,7 +55,12 @@ Headlines are fetched from Google News RSS based on supplier-related queries.
 
 Previously processed headlines are stored locally in `seen_headlines.json`.
 
-Only new headlines are processed to avoid duplicate alerts across runs.
+Supplier risk state is also persisted across runs using either:
+
+- `risk_state.csv` (default)
+- DynamoDB (`supplier_risk_state`)
+
+This allows the agent to suppress duplicate alerts and detect risk escalations over time.
 
 **3. Risk filtering**
 
@@ -60,6 +69,7 @@ Only disruption-relevant signals (e.g., earthquake, strike, congestion) are proc
 **4. Graph-based supplier inference**
 
 A lightweight dependency graph links:
+
 - suppliers → regions / dependencies
 - regions / dependencies → risk events
 
@@ -76,6 +86,7 @@ Using the headline and graph-inferred supplier candidates, the system retrieves 
 LangGraph manages the workflow as an explicit state machine.
 
 It controls:
+
 - whether supplier context should be retrieved
 - how analysis is routed
 - how invalid or weak outputs are handled
@@ -83,6 +94,7 @@ It controls:
 **7. LLM risk analysis**
 
 The model generates a structured risk assessment including:
+
 - supplier
 - risk level
 - impact
@@ -99,8 +111,16 @@ If the signal is too weak or no supplier can be confidently identified, the syst
 
 Final results are returned as structured alerts suitable for downstream dashboards, notifications, or planning workflows.
 
+Each alert is compared with previously stored supplier risk state and labeled as one of:
+
+- `new_alert`
+- `suppressed`
+- `escalated`
+- `downgraded`
+- `inconclusive`
 
 ## Features
+
 - Google News RSS ingestion
 - Headline deduplication across runs
 - Keyword-based disruption filtering
@@ -110,9 +130,10 @@ Final results are returned as structured alerts suitable for downstream dashboar
 - LangGraph workflow orchestration with conditional routing
 - Structured JSON risk alerts (supplier, risk level, impact, action)
 - Validation and fallback handling for weak or ambiguous signals
-
+- Persistent supplier risk state with duplicate suppression and escalation tracking
 
 ## Tech Stack
+
 - Python
 - OpenAI API
 - LangGraph
@@ -121,24 +142,31 @@ Final results are returned as structured alerts suitable for downstream dashboar
 - Feedparser
 - python-dotenv
 
-
 ## Setup
+
 Clone the repository:
+
 ```bash
 git clone https://github.com/kenhglee/ai-supply-chain-risk-agent.git
 cd ai-supply-chain-risk-agent
 ```
+
 Install dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
+
 Create a .env file:
+
 ```bash
 OPENAI_API_KEY=your_key_here
 LLM_PROVIDER=openai
 RISK_STATE_BACKEND=csv
 ```
+
 Run the agent:
+
 ```bash
 python supplier_risk_agent.py
 ```
@@ -160,8 +188,8 @@ RISK_STATE_BACKEND=dynamodb
 RISK_STATE_TABLE=supplier_risk_state
 ```
 
-
 ## Example Output
+
 ```text
 Daily Supply Chain Risk Summary
 -----------------------------------
@@ -246,19 +274,23 @@ This prevents duplicate processing across runs while keeping the system self-con
 
 ## Future Improvements
 
-- Persistent alert storage (CSV or database)
 - Expanded supplier and dependency graph
 - Multi-hop dependency reasoning (tier-2 / tier-3 suppliers)
 - Additional data sources (e.g., shipping, financial signals)
 - Lightweight monitoring dashboard
+- Confidence scoring for supplier-risk matches and model outputs
+- Human-in-the-loop review workflow for high-severity alerts
 
+Longer term, the architecture could evolve toward multi-agent coordination and deeper integration with ERP and planning systems.
 
 ## Summary
 
 This project demonstrates a practical pattern for AI-driven operational intelligence:
+
 ```text
 external signals
 → graph-based supplier inference
 → vector-grounded reasoning
 → structured decision support
 ```
+
