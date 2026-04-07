@@ -135,11 +135,32 @@ pip install -r requirements.txt
 Create a .env file:
 ```bash
 OPENAI_API_KEY=your_key_here
+LLM_PROVIDER=openai
+RISK_STATE_BACKEND=csv
 ```
 Run the agent:
 ```bash
 python supplier_risk_agent.py
 ```
+
+### Optional: Amazon Bedrock + DynamoDB
+
+To use Bedrock for reasoning:
+
+```bash
+LLM_PROVIDER=bedrock
+BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+AWS_DEFAULT_REGION=us-west-2
+```
+
+To persist risk state in DynamoDB instead of a local CSV:
+
+```bash
+RISK_STATE_BACKEND=dynamodb
+RISK_STATE_TABLE=supplier_risk_state
+```
+
+
 ## Example Output
 ```text
 Daily Supply Chain Risk Summary

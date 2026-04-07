@@ -4,7 +4,7 @@ import feedparser
 import re
 import os
 import boto3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
 from dotenv import load_dotenv, find_dotenv
@@ -15,7 +15,6 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
 dotenv_path = find_dotenv()
-print("dotenv_path:", dotenv_path)
 load_dotenv(dotenv_path)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -53,6 +52,91 @@ SUPPLIER_ALIASES = {
     "Samsung Electronics": ["samsung electronics", "samsung"],
 }
 
+
+# ---- Risk Store ----
+class RiskStateStore:
+    def get(self, supplier: str, risk_type: str) -> dict | None:
+        raise NotImplementedError
+
+    def put(self, supplier: str, risk_type: str, row: dict) -> None:
+        raise NotImplementedError
+
+
+class CsvRiskStateStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.state = self._load()
+
+    def _load(self) -> dict[tuple[str, str], dict]:
+        if not self.path.exists():
+            return {}
+
+        state = {}
+        with open(self.path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                supplier = (row.get("supplier") or "").strip()
+                risk_type = (row.get("risk_type") or "").strip()
+                if supplier and risk_type:
+                    state[(supplier, risk_type)] = row
+        return state
+
+    def get(self, supplier: str, risk_type: str) -> dict | None:
+        return self.state.get((supplier, risk_type))
+
+    def put(self, supplier: str, risk_type: str, row: dict) -> None:
+        self.state[(supplier, risk_type)] = row
+
+    def flush(self) -> None:
+        fieldnames = [
+            "supplier",
+            "risk_type",
+            "current_risk_level",
+            "last_headline",
+            "last_seen_at",
+        ]
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in self.state.values():
+                writer.writerow(row)
+
+
+class DynamoRiskStateStore:
+    def __init__(self, table_name: str, region_name: str | None = None):
+        self.dynamodb = boto3.resource(
+            "dynamodb",
+            region_name=region_name or os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+        )
+        self.table = self.dynamodb.Table(table_name)
+        
+
+    @staticmethod
+    def _pk(supplier: str, risk_type: str) -> str:
+        return f"{supplier}#{risk_type}"
+
+    def get(self, supplier: str, risk_type: str) -> dict | None:
+        response = self.table.get_item(
+            Key={"pk": self._pk(supplier, risk_type)}
+        )
+        return response.get("Item")
+
+    def put(self, supplier: str, risk_type: str, row: dict) -> None:
+        item = dict(row)
+        item["pk"] = self._pk(supplier, risk_type)
+        item["supplier"] = supplier
+        item["risk_type"] = risk_type
+
+
+        response = self.table.put_item(Item=item)
+
+        verify = self.table.get_item(Key={"pk": item["pk"]})
+
+
+    def flush(self) -> None:
+        pass
+
+
 # ---- Alert Dictionary ----
 class AlertDict(TypedDict, total=False):
     status: Literal["ok", "inconclusive"]
@@ -74,6 +158,21 @@ class RiskState(TypedDict):
     is_valid: Optional[bool]
 
 
+def get_risk_store():
+    backend = os.getenv("RISK_STATE_BACKEND", "csv").lower()
+
+    if backend == "csv":
+        return CsvRiskStateStore(RISK_STATE_FILE)
+
+    if backend == "dynamodb":
+        return DynamoRiskStateStore(
+            table_name=os.getenv("RISK_STATE_TABLE", "supplier_risk_state"),
+            region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+        )
+
+    raise ValueError(f"Unsupported RISK_STATE_BACKEND: {backend}")
+
+
 def load_risk_state(path: Path = RISK_STATE_FILE) -> dict[tuple[str, str], dict]:
     if not path.exists():
         return {}
@@ -89,6 +188,11 @@ def load_risk_state(path: Path = RISK_STATE_FILE) -> dict[tuple[str, str], dict]
     return state
 
 
+def save_risk_state(risk_store) -> None:
+    risk_store.flush()
+
+
+'''
 def save_risk_state(state: dict[tuple[str, str], dict], path: Path = RISK_STATE_FILE) -> None:
     fieldnames = [
         "supplier",
@@ -103,6 +207,7 @@ def save_risk_state(state: dict[tuple[str, str], dict], path: Path = RISK_STATE_
         writer.writeheader()
         for row in state.values():
             writer.writerow(row)
+'''
 
 
 def normalize_risk_type(risk_type: str | None) -> str | None:
@@ -316,7 +421,7 @@ def write_enriched_alerts(rows: list[dict], path: Path = ENRICHED_ALERT_FILE) ->
 
         for row in rows:
             row = dict(row)
-            row["processed_at"] = datetime.utcnow().isoformat(timespec="seconds")
+            row["processed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             writer.writerow(row)
 
 
@@ -329,55 +434,60 @@ def headline_mentions(text: str, term: str) -> bool:
     return term.lower() in text.lower()
 
 
-def compare_and_update_risk_state(alert: dict, headline: str, state: dict[tuple[str, str], dict]) -> tuple[str, str]:
+def compare_and_update_risk_state(alert: dict, headline: str, state) -> tuple[str, str]:
     """
     Returns:
         change_type: new_alert | suppressed | escalated | downgraded
         change_message: human-friendly explanation
     """
+
+    supplier = (alert.get("supplier") or "").strip()
+    risk_type = normalize_risk_type(alert.get("risk_type"))
+    risk_level = (alert.get("risk_level") or "").strip()
+    status = (alert.get("status") or "").strip()
+
     if alert.get("status") != "ok":
         return "inconclusive", "No supplier-specific alert state change could be determined."
-
-    supplier = alert.get("supplier")
-    risk_type = normalize_risk_type(alert.get("risk_type"))
-    risk_level = alert.get("risk_level")
 
     if not supplier or not risk_type or not risk_level:
         return "inconclusive", "Missing supplier, risk type, or risk level for state comparison."
 
-    key = (supplier, risk_type)
-    prior = state.get(key)
-
-    now_ts = datetime.utcnow().isoformat(timespec="seconds")
+    prior = state.get(supplier, risk_type)
+    now_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     if prior is None:
-        state[key] = {
+        row = {
             "supplier": supplier,
             "risk_type": risk_type,
             "current_risk_level": risk_level,
             "last_headline": headline,
             "last_seen_at": now_ts,
         }
+        state.put(supplier, risk_type, row)
         return "new_alert", f"New disruption detected for {supplier} ({risk_type}) at {risk_level} risk."
 
     old_level = prior.get("current_risk_level")
     old_rank = RISK_RANK.get(old_level, 0)
     new_rank = RISK_RANK.get(risk_level, 0)
 
+    updated_row = {
+        **prior,
+        "supplier": supplier,
+        "risk_type": risk_type,
+        "current_risk_level": risk_level,
+        "last_headline": headline,
+        "last_seen_at": now_ts,
+    }
+    
     if new_rank > old_rank:
-        prior["current_risk_level"] = risk_level
-        prior["last_headline"] = headline
-        prior["last_seen_at"] = now_ts
+        state.put(supplier, risk_type, updated_row)
         return "escalated", f"Risk escalation detected for {supplier}: {old_level} → {risk_level} ({risk_type})."
 
     if new_rank == old_rank:
-        prior["last_headline"] = headline
-        prior["last_seen_at"] = now_ts
+        state.put(supplier, risk_type, updated_row)
         return "suppressed", f"Same supplier and risk level as prior alert for {supplier} ({risk_type}); suppressing duplicate."
 
-    prior["current_risk_level"] = risk_level
-    prior["last_headline"] = headline
-    prior["last_seen_at"] = now_ts
+    state.put(supplier, risk_type, updated_row)
     return "downgraded", f"Risk level decreased for {supplier}: {old_level} → {risk_level} ({risk_type})."
 
 
@@ -435,6 +545,89 @@ def get_llm():
     raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
 
 
+def make_pk(supplier: str, risk_type: str) -> str:
+    return f"{supplier}#{risk_type}"
+
+
+def get_risk_state_item(supplier: str, risk_type: str) -> dict | None:
+    response = risk_table.get_item(
+        Key={"pk": make_pk(supplier, risk_type)}
+    )
+    return response.get("Item")
+
+
+def put_risk_state_item(
+    supplier: str,
+    risk_type: str,
+    current_risk_level: str,
+    last_headline: str,
+    last_seen_at: str | None = None,
+) -> None:
+    if last_seen_at is None:
+        last_seen_at = datetime.now(timezone.utc).isoformat()
+
+    risk_table.put_item(
+        Item={
+            "pk": make_pk(supplier, risk_type),
+            "supplier": supplier,
+            "risk_type": risk_type,
+            "current_risk_level": current_risk_level,
+            "last_headline": last_headline,
+            "last_seen_at": last_seen_at,
+        }
+    )
+
+
+def model_text(response) -> str:
+    content = getattr(response, "content", response)
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(item["text"])
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+
+    return str(content)
+
+
+def parse_alert_response(raw_text: str) -> dict:
+    text = raw_text.strip()
+
+    # Remove ```json ... ``` or ``` ... ``` wrappers
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        return json.loads(text)
+    except Exception as e:
+        return {
+            "status": "inconclusive",
+            "supplier": None,
+            "risk_type": None,
+            "risk_level": None,
+            "impact": "Model output could not be parsed reliably.",
+            "recommended_action": "Review the headline and prompt logic.",
+            "relevant_supplier_context": "",
+        }
+
+
+# ---- DynamoDB ----
+dynamodb = boto3.resource(
+    "dynamodb",
+    region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+)
+
+risk_table = dynamodb.Table("supplier_risk_state")
+
 # ---- Graph ----
 graph_edges = load_graph_edges()
 # ---- Vectorstore ----
@@ -472,7 +665,8 @@ def decide_tool_use(state: RiskState) -> RiskState:
             """
 
     response = model.invoke(prompt)
-    decision = response.content.strip().lower()
+    raw_text = model_text(response)
+    decision = raw_text.strip().lower()
 
     if decision not in {"retrieve", "skip"}:
         decision = "skip"
@@ -552,12 +746,11 @@ def analyze_risk(state: RiskState) -> RiskState:
     """
 
     response = model.invoke(prompt)
-    content = response.content.strip()
-
-    print("-" * 50)
+    raw_text = model_text(response)
 
     try:
-        alert = json.loads(content)
+        alert = parse_alert_response(raw_text)
+        print("-" * 50)
 
         # normalize model output before downstream comparison
         alert["risk_type"] = normalize_risk_type(alert.get("risk_type"))
@@ -665,7 +858,7 @@ graph.add_edge("fallback", END)
 app = graph.compile()
 
 
-def process_alert_row(row: dict, risk_state: dict[tuple[str, str], dict]) -> dict:
+def process_alert_row(row: dict, risk_store) -> dict:
     headline = row["headline"]
 
     if not is_actionable_alert(headline):
@@ -701,7 +894,7 @@ def process_alert_row(row: dict, risk_state: dict[tuple[str, str], dict]) -> dic
     change_type, change_message = compare_and_update_risk_state(
         alert=alert,
         headline=headline,
-        state=risk_state,
+        state=risk_store,
     )
 
     
@@ -731,7 +924,8 @@ if __name__ == "__main__":
 
     alerts = load_alerts_csv()
     print(f"Alerts loaded: {len(alerts)}")
-    risk_state = load_risk_state()
+    #risk_state = load_risk_state()
+    risk_store = get_risk_store()
     
     enriched_rows = []
     for row in alerts:
@@ -740,23 +934,18 @@ if __name__ == "__main__":
         if row.get("status") != "new":
             continue
 
-        processed = process_alert_row(row, risk_state)
+        processed = process_alert_row(row, risk_store)
         print("processed:", type(processed), processed)
         enriched_rows.append(processed)
 
         # mark as processed so this row is not reprocessed next run
         row["status"] = "processed"
 
-    '''
-    print("----- enriched_rows debug -----")
-    for i, row in enumerate(enriched_rows):
-        print(i, type(row), row)
-    print("-------------------------------")
-    '''
+
     print(f"Alerts processed this run: {len(enriched_rows)}")
 
     write_enriched_alerts(enriched_rows)
-    save_risk_state(risk_state)
+    save_risk_state(risk_store)
     write_alerts_csv(alerts)
 
     print(f"Enriched alerts written: {len(enriched_rows)}")
