@@ -4,6 +4,7 @@ import feedparser
 import re
 import os
 import boto3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
@@ -162,7 +163,8 @@ def get_risk_store():
     backend = os.getenv("RISK_STATE_BACKEND", "csv").lower()
 
     if backend == "csv":
-        return CsvRiskStateStore(RISK_STATE_FILE)
+        path = Path(os.getenv("RISK_STATE_FILE", "risk_state.csv"))
+        return CsvRiskStateStore(path)
 
     if backend == "dynamodb":
         return DynamoRiskStateStore(
@@ -276,30 +278,55 @@ def load_vectorstore(path: Path = PROFILES_FILE):
     return FAISS.from_documents(docs, embeddings)
 
 
-def load_headlines_from_rss() -> list[str]:
+def load_headlines_from_rss() -> list[dict]:
     rss_url = "https://news.google.com/rss/search?q=TSMC+OR+Foxconn+OR+Murata&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(rss_url)
 
-    headlines = [entry.title for entry in feed.entries[:10]]
+    alerts = []
 
-    if not headlines:
-        headlines = [
-            "Murata faces disruption due to earthquake in Japan",
-            "Taiwan earthquake disrupts semiconductor operations",
-            "Flooding affects factories in Europe",
+    for idx, entry in enumerate(feed.entries[:10], start=1):
+        alerts.append({
+            "alert_id": "",
+            "headline": entry.title,
+            "source": "google_news_rss",
+            "status": "new",
+        })
+
+    if not alerts:
+        alerts = [
+            {
+                "alert_id": "",
+                "headline": "Murata faces disruption due to earthquake in Japan",
+                "source": "sample",
+                "status": "new",
+            },
+            {
+                "alert_id": "",
+                "headline": "Taiwan earthquake disrupts semiconductor operations",
+                "source": "sample",
+                "status": "new",
+            },
+            {
+                "alert_id": "",
+                "headline": "Flooding affects factories in Europe",
+                "source": "sample",
+                "status": "new",
+            },
         ]
         print("(Using sample headlines - RSS feed returned empty)\n")
 
-    return headlines
+    return alerts
 
 
 def bootstrap_alerts_csv_from_rss(alerts_file: Path = ALERT_FILE) -> int:
     """
-    Writes new, unseen RSS headlines into alerts.csv as raw alerts.
-    Returns the number of rows appended.
+    Fetch RSS alerts and append only unseen headlines to alerts.csv.
+
+    Returns:
+        int: number of rows appended
     """
     seen = load_seen_headlines()
-    headlines = load_headlines_from_rss()
+    alerts = load_headlines_from_rss()
 
     file_exists = alerts_file.exists()
     rows_written = 0
@@ -314,17 +341,24 @@ def bootstrap_alerts_csv_from_rss(alerts_file: Path = ALERT_FILE) -> int:
         if not file_exists:
             writer.writeheader()
 
-        for headline in headlines:
+        for alert in alerts:
+            headline = (alert.get("headline") or "").strip()
+            if not headline:
+                continue
+
             norm = normalize_headline(headline)
             if norm in seen:
                 continue
 
-            writer.writerow({
-                "alert_id": f"rss-{next_id}",
-                "headline": headline,
-                "source": "google_news_rss",
-                "status": "new",
-            })
+            writer.writerow(
+                {
+                    "alert_id": f"rss-{next_id}",
+                    "headline": headline,
+                    "source": alert.get("source", "google_news_rss"),
+                    "status": alert.get("status", "new"),
+                }
+            )
+
             seen.add(norm)
             rows_written += 1
             next_id += 1
@@ -916,36 +950,74 @@ def process_alert_row(row: dict, risk_store) -> dict:
         "relevant_supplier_context": alert.get("relevant_supplier_context", ""),
     }
 
+def run_pipeline() -> dict:
+    OUTPUT_MODE = os.getenv("OUTPUT_MODE", "csv")
+    alerts = []
+
+    if OUTPUT_MODE == "csv":
+        bootstrap_alerts_csv_from_rss()
+        alerts = load_alerts_csv()
+
+    elif OUTPUT_MODE == "lambda":
+        alerts = load_headlines_from_rss()
+        for idx, alert in enumerate(alerts, start=1):
+            if not alert.get("alert_id"):
+                alert["alert_id"] = f"runtime-{idx}"
+
+    else:
+        raise ValueError(f"Unsupported OUTPUT_MODE: {OUTPUT_MODE}")
+
+    print(f"Alerts loaded: {len(alerts)}")
+
+    risk_store = get_risk_store()
+    enriched_rows = []
+    alerts_processed = 0
+
+    max_alerts = int(os.getenv("MAX_ALERTS_PER_RUN", "1"))
+    new_alerts = [row for row in alerts if (row.get("status") or "").strip().lower() == "new"]
+    alerts_to_process = new_alerts[:max_alerts]
+
+    print(f"Alerts selected for processing: {len(alerts_to_process)}")
+
+    for idx, row in enumerate(alerts_to_process, start=1):
+        processed = process_alert_row(row, risk_store)
+        time.sleep(1.5)
+        enriched_rows.append(processed)
+
+        row["status"] = "processed"
+        alerts_processed += 1
+
+    print(f"Alerts processed this run: {alerts_processed}")
+
+    save_risk_state(risk_store)
+
+    if OUTPUT_MODE == "csv":
+        write_enriched_alerts(enriched_rows)
+        write_alerts_csv(alerts)
+    elif OUTPUT_MODE == "lambda":
+        pass
+    else:
+        raise ValueError(f"Unsupported OUTPUT_MODE: {OUTPUT_MODE}")
+
+    print(f"Enriched alerts written: {len(enriched_rows)}")
+
+    return {
+        "alerts_loaded": len(alerts),
+        "alerts_processed": alerts_processed,
+        "enriched_alerts": len(enriched_rows),
+        "llm_provider": os.getenv("LLM_PROVIDER", "openai"),
+        "risk_state_backend": os.getenv("RISK_STATE_BACKEND", "csv"),
+    }
+
+
+def lambda_handler(event, context):
+    result = run_pipeline()
+    return {
+        "statusCode": 200,
+        "body": result,
+    }
+
 
 # ---- Run ----
 if __name__ == "__main__":
-     # optional bootstrap step
-    bootstrap_alerts_csv_from_rss()
-
-    alerts = load_alerts_csv()
-    print(f"Alerts loaded: {len(alerts)}")
-    #risk_state = load_risk_state()
-    risk_store = get_risk_store()
-    
-    enriched_rows = []
-    for row in alerts:
-        row_status = (row.get("status") or "").strip().lower()
-
-        if row.get("status") != "new":
-            continue
-
-        processed = process_alert_row(row, risk_store)
-        print("processed:", type(processed), processed)
-        enriched_rows.append(processed)
-
-        # mark as processed so this row is not reprocessed next run
-        row["status"] = "processed"
-
-
-    print(f"Alerts processed this run: {len(enriched_rows)}")
-
-    write_enriched_alerts(enriched_rows)
-    save_risk_state(risk_store)
-    write_alerts_csv(alerts)
-
-    print(f"Enriched alerts written: {len(enriched_rows)}")
+     print(run_pipeline())

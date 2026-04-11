@@ -4,7 +4,9 @@ License
 
 # AI Supplier Risk Monitoring Agent
 
-An AI-powered supply chain risk agent that ingests live news signals, maps disruption events to suppliers using a lightweight knowledge graph, retrieves supplier context with FAISS, and generates structured risk assessments through a LangGraph-orchestrated workflow.
+An AI-powered supply chain risk agent that ingests live news signals, maps disruption events to suppliers using a lightweight knowledge graph, retrieves supplier context with FAISS, and generates structured risk assessments through a LangGraph-orchestrated workflow. 
+
+The project supports both a local development mode and a cloud-backed execution mode. In cloud mode, the LangGraph workflow runs in AWS Lambda, uses Amazon Bedrock for LLM inference, and persists supplier risk state in DynamoDB.
 
 ## Overview
 
@@ -171,22 +173,33 @@ Run the agent:
 python supplier_risk_agent.py
 ```
 
-### Optional: Amazon Bedrock + DynamoDB
+### Optional: Cloud Execution (AWS)
 
-To use Bedrock for reasoning:
+The agent can be deployed as a containerized function using AWS Lambda.
 
-```bash
+Example environment variables:
+
+```text
+OUTPUT_MODE=lambda
 LLM_PROVIDER=bedrock
 BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
-AWS_DEFAULT_REGION=us-west-2
-```
-
-To persist risk state in DynamoDB instead of a local CSV:
-
-```bash
 RISK_STATE_BACKEND=dynamodb
 RISK_STATE_TABLE=supplier_risk_state
+MAX_ALERTS_PER_RUN=1
 ```
+
+In this mode:
+
+```text
+Google News RSS
+→ Lambda
+→ LangGraph workflow
+→ Bedrock Claude
+→ DynamoDB supplier_risk_state
+→ structured alert summary
+```
+
+The local CSV/OpenAI path remains available for development and experimentation.
 
 ## Example Output
 
