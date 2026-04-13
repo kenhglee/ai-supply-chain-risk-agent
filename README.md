@@ -1,6 +1,6 @@
-Python
-OpenAI
-License
+![Python](https://img.shields.io/badge/python-3.10-blue)
+![LLM](https://img.shields.io/badge/LLM-OpenAI%20%7C%20Bedrock-green)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 # AI Supplier Risk Monitoring Agent
 
@@ -201,6 +201,61 @@ Google News RSS
 
 The local CSV/OpenAI path remains available for development and experimentation.
 
+
+## Cloud Deployment
+
+This project can be deployed to AWS Lambda using a container image.
+
+Build:
+
+docker buildx build \
+  --platform linux/amd64 \
+  --provenance=false \
+  -t supplier-risk-agent:latest .
+
+Push to ECR and configure Lambda to use:
+
+CMD ["supplier_risk_agent.lambda_handler"]
+
+```markdown
+The repository includes:
+
+- `Dockerfile` for packaging the agent as a Lambda-compatible container image
+- `.dockerignore` to keep the image small and avoid shipping local artifacts
+- `.env.example` showing both local and AWS configuration options
+```
+
+### Event-Driven Execution
+
+In production mode, the Lambda function is triggered on a schedule using Amazon EventBridge.
+
+```text
+EventBridge (hourly schedule)
+→ Lambda container
+→ Google News RSS ingestion
+→ LangGraph workflow
+→ Amazon Bedrock
+→ DynamoDB supplier_risk_state
+```
+
+Example Lambda Response
+
+```json
+{
+  "statusCode": 200,
+  "body": {
+    "alerts_loaded": 10,
+    "alerts_processed": 1,
+    "enriched_alerts": 1,
+    "llm_provider": "bedrock",
+    "risk_state_backend": "dynamodb"
+  }
+}
+```
+
+This allows the agent to continuously monitor supplier-related news and maintain persistent risk state over time without requiring a long-running server.
+
+
 ## Example Output
 
 ```text
@@ -279,7 +334,7 @@ relevant supplier context
 
 Outputs are validated before use. If no supplier can be identified or the signal is too weak, the system returns an explicit inconclusive result rather than generating unsupported recommendations.
 
-**Lightweight Operational Momery**
+**Lightweight Operational Memory**
 
 Previously processed headlines are stored in seen_headlines.json.
 
@@ -294,7 +349,7 @@ This prevents duplicate processing across runs while keeping the system self-con
 - Confidence scoring for supplier-risk matches and model outputs
 - Human-in-the-loop review workflow for high-severity alerts
 
-Longer term, the architecture could evolve toward multi-agent coordination and deeper integration with ERP and planning systems.
+Longer term, the architecture could evolve toward event-driven multi-agent coordination, deeper integration with ERP and planning systems, and infrastructure-as-code deployment with Terraform.
 
 ## Summary
 

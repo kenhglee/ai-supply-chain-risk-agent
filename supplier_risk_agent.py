@@ -5,6 +5,7 @@ import re
 import os
 import boto3
 import time
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
@@ -14,6 +15,9 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+
+logger = logging.getLogger()
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 dotenv_path = find_dotenv()
 load_dotenv(dotenv_path)
@@ -967,27 +971,62 @@ def run_pipeline() -> dict:
     else:
         raise ValueError(f"Unsupported OUTPUT_MODE: {OUTPUT_MODE}")
 
-    print(f"Alerts loaded: {len(alerts)}")
+    logger.info(json.dumps({
+        "stage": "alerts_loaded",
+        "output_mode": OUTPUT_MODE,
+        "alerts_loaded": len(alerts),
+    }))
 
     risk_store = get_risk_store()
     enriched_rows = []
     alerts_processed = 0
 
     max_alerts = int(os.getenv("MAX_ALERTS_PER_RUN", "1"))
-    new_alerts = [row for row in alerts if (row.get("status") or "").strip().lower() == "new"]
+    new_alerts = [
+        row for row in alerts 
+        if (row.get("status") or "new").strip().lower() == "new"
+    ]
     alerts_to_process = new_alerts[:max_alerts]
 
-    print(f"Alerts selected for processing: {len(alerts_to_process)}")
+    logger.info(json.dumps({
+        "stage": "alerts_selected",
+        "max_alerts_per_run": max_alerts,
+        "new_alerts_found": len(new_alerts),
+        "alerts_selected_for_processing": len(alerts_to_process),
+    }))
 
     for idx, row in enumerate(alerts_to_process, start=1):
+        alert_id = row.get("alert_id", f"unknown-{idx}")
+        supplier = row.get("supplier", "unknown")
+
+        logger.info(json.dumps({
+            "stage": "alert_processing_start",
+            "sequence": idx,
+            "alert_id": alert_id,
+            "supplier": supplier,
+        }))
+
         processed = process_alert_row(row, risk_store)
         time.sleep(1.5)
-        enriched_rows.append(processed)
+
+        if processed is not None:
+            enriched_rows.append(processed)
 
         row["status"] = "processed"
         alerts_processed += 1
 
-    print(f"Alerts processed this run: {alerts_processed}")
+        logger.info(json.dumps({
+            "stage": "alert_processing_complete",
+            "sequence": idx,
+            "alert_id": alert_id,
+            "supplier": supplier,
+            "processed_result": processed is not None,
+        }))
+
+    logger.info(json.dumps({
+        "stage": "alerts_processed",
+        "alerts_processed": alerts_processed,
+    }))
 
     save_risk_state(risk_store)
 
@@ -999,9 +1038,7 @@ def run_pipeline() -> dict:
     else:
         raise ValueError(f"Unsupported OUTPUT_MODE: {OUTPUT_MODE}")
 
-    print(f"Enriched alerts written: {len(enriched_rows)}")
-
-    return {
+    summary = {
         "alerts_loaded": len(alerts),
         "alerts_processed": alerts_processed,
         "enriched_alerts": len(enriched_rows),
@@ -1009,15 +1046,47 @@ def run_pipeline() -> dict:
         "risk_state_backend": os.getenv("RISK_STATE_BACKEND", "csv"),
     }
 
+    logger.info(json.dumps({
+        "stage": "pipeline_complete",
+        **summary,
+    }))
+
+    return summary
+
 
 def lambda_handler(event, context):
-    result = run_pipeline()
-    return {
-        "statusCode": 200,
-        "body": result,
-    }
+    request_id = getattr(context, "aws_request_id", None)
+
+    logger.info(json.dumps({
+        "stage": "lambda_start",
+        "request_id": request_id,
+        "event": event,
+    }))
+
+    try:
+        summary = run_pipeline()
+    
+        logger.info(json.dumps({
+            "stage": "lambda_complete",
+            "request_id": request_id,
+            "summary": summary,
+        }))
+    
+        return {
+            "statusCode": 200,
+            "body": json.dumps(summary),
+        }
+
+    except Exception as exc:
+        logger.exception(json.dumps({
+            "stage": "lambda_failed",
+            "request_id": request_id,
+            "error": str(exc),
+        }))
+        raise
 
 
 # ---- Run ----
 if __name__ == "__main__":
-     print(run_pipeline())
+     result = run_pipeline()
+     print(json.dumps(result, indent=2))
