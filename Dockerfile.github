@@ -5,4 +5,4 @@ RUN pip install -r requirements.txt -t ${LAMBDA_TASK_ROOT}
 
 COPY . ${LAMBDA_TASK_ROOT}
 
-CMD ["handlers.rss_handler.handler.lambda_handler"]
+CMD ["handlers.github_webhook_handler.handler.lambda_handler"]

@@ -15,6 +15,7 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from app.ingestion.rss_ingestion import load_headlines_from_rss
 
 logger = logging.getLogger()
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -28,8 +29,8 @@ SEEN_FILE = BASE_DIR / "seen_headlines.json"
 ALERT_FILE = BASE_DIR / "alerts.csv"
 ENRICHED_ALERT_FILE = BASE_DIR / "enriched_alerts.csv"
 RISK_STATE_FILE = BASE_DIR / "risk_state.csv"
-GRAPH_FILE = BASE_DIR / "supplier_graph.json"
-PROFILES_FILE = BASE_DIR / "supplier_profiles.json"
+GRAPH_FILE = BASE_DIR / "../storage/supplier_graph.json"
+PROFILES_FILE = BASE_DIR / "../storage/supplier_profiles.json"
 
 RISK_RANK = {
     "Low": 1,
@@ -280,46 +281,6 @@ def load_vectorstore(path: Path = PROFILES_FILE):
 
     embeddings = OpenAIEmbeddings()
     return FAISS.from_documents(docs, embeddings)
-
-
-def load_headlines_from_rss() -> list[dict]:
-    rss_url = "https://news.google.com/rss/search?q=TSMC+OR+Foxconn+OR+Murata&hl=en-US&gl=US&ceid=US:en"
-    feed = feedparser.parse(rss_url)
-
-    alerts = []
-
-    for idx, entry in enumerate(feed.entries[:10], start=1):
-        alerts.append({
-            "alert_id": "",
-            "headline": entry.title,
-            "source": "google_news_rss",
-            "status": "new",
-        })
-
-    if not alerts:
-        alerts = [
-            {
-                "alert_id": "",
-                "headline": "Murata faces disruption due to earthquake in Japan",
-                "source": "sample",
-                "status": "new",
-            },
-            {
-                "alert_id": "",
-                "headline": "Taiwan earthquake disrupts semiconductor operations",
-                "source": "sample",
-                "status": "new",
-            },
-            {
-                "alert_id": "",
-                "headline": "Flooding affects factories in Europe",
-                "source": "sample",
-                "status": "new",
-            },
-        ]
-        print("(Using sample headlines - RSS feed returned empty)\n")
-
-    return alerts
 
 
 def bootstrap_alerts_csv_from_rss(alerts_file: Path = ALERT_FILE) -> int:
@@ -1053,40 +1014,11 @@ def run_pipeline() -> dict:
 
     return summary
 
-
-def lambda_handler(event, context):
-    request_id = getattr(context, "aws_request_id", None)
-
-    logger.info(json.dumps({
-        "stage": "lambda_start",
-        "request_id": request_id,
-        "event": event,
-    }))
-
-    try:
-        summary = run_pipeline()
-    
-        logger.info(json.dumps({
-            "stage": "lambda_complete",
-            "request_id": request_id,
-            "summary": summary,
-        }))
-    
-        return {
-            "statusCode": 200,
-            "body": json.dumps(summary),
-        }
-
-    except Exception as exc:
-        logger.exception(json.dumps({
-            "stage": "lambda_failed",
-            "request_id": request_id,
-            "error": str(exc),
-        }))
-        raise
-
+def run_supplier_risk_flow(event):
+    summary = run_pipeline()
+    return summary
 
 # ---- Run ----
 if __name__ == "__main__":
-     result = run_pipeline()
+     result = run_supplier_risk_flow()
      print(json.dumps(result, indent=2))
