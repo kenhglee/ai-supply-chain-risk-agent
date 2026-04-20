@@ -362,3 +362,5 @@ external signals
 → structured decision support
 ```
 
+
+GitHub webhook integration test
