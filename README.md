@@ -20,30 +20,60 @@ This project demonstrates how those signals can be transformed into actionable i
 - LLM-driven risk evaluation and structured alerts
 
 ## Architecture
-
 ```mermaid
 flowchart TD
-    A["Signal Ingestion"]
-    B["Headline memory / deduplication"]
-    C["Risk filtering"]
-    D["Graph-based supplier inference"]
-    E["Vector retrieval of (FAISS)"]
-    F["LangGraph workflow orchestration"]
-    G["LLM risk analysis"]
-    H["Validation and fallback handling"]
-    I["Structured output"]
+    subgraph External Signals
+        A1[Google News RSS]
+        A2[GitHub Webhook]
+    end
 
-    A --> B
-    B --> C
+    subgraph AWS
+        B1[RSS Lambda Handler]
+        B2[GitHub Webhook Handler]
+        C[Risk Evaluation / LangGraph Workflow]
+        D[DynamoDB Risk State]
+    end
+
+    subgraph Outcomes
+        E1[Structured Supplier Alert]
+        E2[GitHub Risk Decision]
+    end
+
+    A1 --> B1
+    A2 --> B2
+
+    B1 --> C
     C --> D
-    D --> E
-    E --> F
-    F --> G
-    G --> H
-    H --> I
+    C --> E1
+
+    B2 --> E2
 ```
 
 
+## Project Structure
+```text
+app/
+├── ingestion/
+│   ├── rss_ingestion.py
+│   └── github_webhook_receiver.py
+├── workflows/
+│   ├── supplier_risk_agent.py
+│   └── github_risk_evaluator.py
+├── storage/
+│   ├── supplier_graph.json
+│   └── supplier_profiles.json
+
+handlers/
+├── rss_handler/
+│   └── handler.py
+└── github_webhook_handler/
+    └── handler.py
+
+tests/
+├── test_rss_locally.py
+├── test_lambda_handler_locally.py
+└── test_github_webhook_locally.py
+```
 
 ## How It Works
 
@@ -208,22 +238,26 @@ This project can be deployed to AWS Lambda using a container image.
 
 Build:
 
+```bash
 docker buildx build \
   --platform linux/amd64 \
   --provenance=false \
   -t supplier-risk-agent:latest .
+```
 
 Push to ECR and configure Lambda to use:
 
-CMD ["supplier_risk_agent.lambda_handler"]
+```text
+CMD ["handlers.rss_handler.handler.lambda_handler"]
+CMD ["handlers.github_webhook_handler.handler.lambda_handler"]
+```
 
-```markdown
 The repository includes:
 
-- `Dockerfile` for packaging the agent as a Lambda-compatible container image
+- Both `Dockerfile.rss` and `Dockerfile.github` for packaging the agent as a Lambda-compatible container image separately
 - `.dockerignore` to keep the image small and avoid shipping local artifacts
 - `.env.example` showing both local and AWS configuration options
-```
+
 
 ### Event-Driven Execution
 
@@ -256,8 +290,33 @@ Example Lambda Response
 This allows the agent to continuously monitor supplier-related news and maintain persistent risk state over time without requiring a long-running server.
 
 
-## Example Output
+## GitHub Webhook Integration
 
+The project also includes a GitHub webhook integration that demonstrates event-driven policy evaluation for software delivery workflows.
+
+A GitHub push or pull request triggers a dedicated AWS Lambda function through a Lambda Function URL.
+
+The Lambda:
+
+- verifies the GitHub webhook signature
+- normalizes the incoming event payload
+- extracts repository, branch, and pull request information
+- applies simple branch-aware risk evaluation logic
+
+Example flow:
+
+```text
+GitHub Webhook
+→ Lambda Function URL
+→ Signature Verification
+→ Payload Normalization
+→ Risk Evaluation
+→ Structured Decision
+```
+
+
+## Example Output
+### Example RSS driven Supply Chain Risk Evaluation
 ```text
 Daily Supply Chain Risk Summary
 -----------------------------------
@@ -276,6 +335,28 @@ Impact: Potential capacity constraints and supply continuity issues
 Recommended Action: Monitor developments closely and assess potential impacts on supply chain operations
 Relevant Supplier Context: Foxconn - Foxconn is a global electronics manufacturing services company with large operations in China, Vietnam, and India. Key risks include labor unrest, regulatory shifts, geopolitical tensions, manufacturing disruption, and logistics delays.
 -----------------------------------
+```
+
+### Example GitHub Risk Evaluation
+
+```json
+{
+  "normalized_event": {
+    "event_type": "pull_request",
+    "repository": "kenhglee/ai-supply-chain-risk-agent",
+    "pull_request": {
+      "number": 1,
+      "title": "Add GitHub webhook risk evaluation",
+      "head_ref": "feature/github-risk-evaluation",
+      "base_ref": "main"
+    }
+  },
+  "decision": {
+    "decision": "review_recommended",
+    "risk_score": 60,
+    "reason": "pull request targets main branch"
+  }
+}
 ```
 
 ## Design Decisions
@@ -348,17 +429,29 @@ This prevents duplicate processing across runs while keeping the system self-con
 - Lightweight monitoring dashboard
 - Confidence scoring for supplier-risk matches and model outputs
 - Human-in-the-loop review workflow for high-severity alerts
+- Persist GitHub webhook decisions to DynamoDB
+- Create ServiceNow-style incident or approval tickets for high-risk events
+- Post automated PR comments or commit statuses based on risk decisions
+- Add Terraform modules for Lambda, Function URL, IAM, and DynamoDB deployment
 
 Longer term, the architecture could evolve toward event-driven multi-agent coordination, deeper integration with ERP and planning systems, and infrastructure-as-code deployment with Terraform.
 
 ## Summary
-
-This project demonstrates a practical pattern for AI-driven operational intelligence:
+This project demonstrates two complementary event-driven AI patterns:
 
 ```text
-external signals
-→ graph-based supplier inference
+external supply chain signals
+→ supplier inference
 → vector-grounded reasoning
-→ structured decision support
+→ structured operational alerts
 ```
+
+```text
+github push / pull request events
+→ webhook verification
+→ payload normalization
+→ branch-aware risk evaluation
+→ structured decision workflow
+```
+
 
