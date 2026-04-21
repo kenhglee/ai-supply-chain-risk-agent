@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+from app.workflows.github_risk_evaluator import evaluate_github_event_risk
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -93,15 +94,16 @@ def process_github_webhook(event):
             "commits_count": len(payload.get("commits", []) or []),
         }
 
+    decision = evaluate_github_event_risk(normalized)
+
     logger.info(json.dumps({
         "stage": "github_webhook_received",
-        "delivery_id": normalized.get("delivery_id"),
-        "event_type": normalized.get("event_type"),
-        "repository": normalized.get("repository"),
-        "action": normalized.get("action"),
+        "normalized_event": normalized,
+        "decision": decision,
     }))
 
     return _response(200, {
         "message": "GitHub webhook received",
         "normalized_event": normalized,
+        "decision": decision,
     })
