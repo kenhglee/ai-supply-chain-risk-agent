@@ -8,7 +8,6 @@ An AI-powered supply chain risk agent that ingests live news signals, maps disru
 
 The project supports both a local development mode and a cloud-backed execution mode. In cloud mode, the LangGraph workflow runs in AWS Lambda, uses Amazon Bedrock for LLM inference, and persists supplier risk state in DynamoDB.
 
-
 ## Overview
 
 Supply chain disruptions often originate from external events such as natural disasters, geopolitical shifts, logistics bottlenecks, or supplier-specific issues.
