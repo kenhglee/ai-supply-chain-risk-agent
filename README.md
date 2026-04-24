@@ -315,7 +315,6 @@ GitHub Webhook
 → Ticket / Workflow Trigger
 ```
 
-
 ## Example Output
 ### Example RSS driven Supply Chain Risk Evaluation
 ```text
