@@ -302,6 +302,7 @@ The Lambda:
 - normalizes the incoming event payload
 - extracts repository, branch, and pull request information
 - applies simple branch-aware risk evaluation logic
+- triggers a mock ServiceNow-style ticket for higher-risk events
 
 Example flow:
 
@@ -311,7 +312,7 @@ GitHub Webhook
 → Signature Verification
 → Payload Normalization
 → Risk Evaluation
-→ Structured Decision
+→ Ticket / Workflow Trigger
 ```
 
 
@@ -356,6 +357,20 @@ Relevant Supplier Context: Foxconn - Foxconn is a global electronics manufacturi
     "risk_score": 60,
     "reason": "pull request targets main branch"
   }
+}
+```
+
+### Example Ticket Output
+```json
+"ticket": {
+  "ticket_id": "MOCK-CHG-XXXXXXX",
+  "status": "created",
+  "category": "software_supply_chain",
+  "repository": "...",
+  "event_type": "pull_request",
+  "branch": "main",
+  "risk_score": 60,
+  "decision": "review_recommended"
 }
 ```
 
