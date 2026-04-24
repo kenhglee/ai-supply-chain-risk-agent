@@ -20,6 +20,9 @@ payload = {
     "pull_request": {
         "number": 1,
         "title": "Test PR",
+        "state": "open",
+        "head": {"ref": "feature/github-risk-evaluation"},
+        "base": {"ref": "main"},
     },
 }
 

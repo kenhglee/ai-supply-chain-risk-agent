@@ -4,6 +4,8 @@ import hmac
 import json
 import logging
 import os
+from app.workflows.github_risk_evaluator import evaluate_github_event_risk
+from app.integrations.servicenow_mock import create_servicenow_ticket
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -93,15 +95,22 @@ def process_github_webhook(event):
             "commits_count": len(payload.get("commits", []) or []),
         }
 
+    decision = evaluate_github_event_risk(normalized)
+
+    ticket = None
+    if decision.get("decision") in {"review_recommended", "manual_review_required"}:
+        ticket = create_servicenow_ticket(normalized, decision)
+
     logger.info(json.dumps({
-        "stage": "github_webhook_received",
-        "delivery_id": normalized.get("delivery_id"),
-        "event_type": normalized.get("event_type"),
-        "repository": normalized.get("repository"),
-        "action": normalized.get("action"),
+         "stage": "github_webhook_evaluated",
+        "normalized_event": normalized,
+        "decision": decision,
+        "ticket": ticket,
     }))
 
     return _response(200, {
         "message": "GitHub webhook received",
         "normalized_event": normalized,
+        "decision": decision,
+        "ticket": ticket,
     })

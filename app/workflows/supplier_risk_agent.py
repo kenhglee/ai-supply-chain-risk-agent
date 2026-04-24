@@ -1014,7 +1014,7 @@ def run_pipeline() -> dict:
 
     return summary
 
-def run_supplier_risk_flow(event):
+def run_supplier_risk_flow(event=None):
     summary = run_pipeline()
     return summary
 
