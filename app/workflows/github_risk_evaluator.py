@@ -3,11 +3,7 @@ def evaluate_github_event_risk(normalized_event):
 
     if event_type == "push":
         push = normalized_event.get("push") or {}
-<<<<<<< HEAD
         ref = push.get("ref") or ""
-=======
-        ref = push.get("ref", "")
->>>>>>> 94ab5b1d7a427cf52e221d99d78a3f4b2610736c
 
         if ref == "refs/heads/main":
             return {
@@ -31,11 +27,7 @@ def evaluate_github_event_risk(normalized_event):
 
     if event_type == "pull_request":
         pr = normalized_event.get("pull_request") or {}
-<<<<<<< HEAD
         base_ref = pr.get("base_ref") or ""
-=======
-        base_ref = pr.get("base_ref", "")
->>>>>>> 94ab5b1d7a427cf52e221d99d78a3f4b2610736c
 
         if base_ref == "main":
             return {
