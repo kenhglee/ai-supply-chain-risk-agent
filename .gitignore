@@ -8,3 +8,4 @@ venv/
 venv-langgraph/
 seen_headlines.json
 *.lock.txt
+app/storage/risk_decisions.jsonl

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "supply-chain-risk": {
+      "command": "/opt/anaconda3/bin/python",
+      "args": ["mcp_server.py"],
+      "cwd": "/Users/kenhglee/projects/supplychain-ai-agent"
+    }
+  }
+}
