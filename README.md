@@ -126,13 +126,13 @@ tests/
 
 The MCP server exposes system capabilities as tools:
 
-- `**evaluate_github_event_risk**`
+- `evaluate_github_event_risk`
 → evaluate and persist risk decisions
-- `**get_recent_risk_decisions****`
+- `get_recent_risk_decisions`
 → query recent decision history
-- `**get_decisions_requiring_review**`
+- `get_decisions_requiring_review`
 → filter decisions requiring human review
-- `**create_mock_servicenow_ticket**`
+- `create_mock_servicenow_ticket`
 → create workflow tickets from decisions
 
 These tools enable higher-level workflows such as:
