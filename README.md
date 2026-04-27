@@ -4,9 +4,32 @@
 
 # AI Supplier Risk Monitoring Agent
 
-An AI-powered supply chain risk agent that ingests live news signals, maps disruption events to suppliers using a lightweight knowledge graph, retrieves supplier context with FAISS, and generates structured risk assessments through a LangGraph-orchestrated workflow. 
+An AI-powered supply chain risk system that ingests external signals, evaluates risk through structured workflows, and exposes those capabilities for both automated processing and AI-assisted operations.
 
-The project supports both a local development mode and a cloud-backed execution mode. In cloud mode, the LangGraph workflow runs in AWS Lambda, uses Amazon Bedrock for LLM inference, and persists supplier risk state in DynamoDB.
+## New: Agent-Operable Risk System (MCP Layer)
+This project now includes a **Model Context Protocol (MCP)** layer that exposes system capabilities as tools for AI assistants.
+
+Instead of only reacting to events, the system can now be operated conversationally.
+
+```mermaid
+flowchart TD
+    A[GitHub Webhook] --> B[Risk Evaluation]
+    B --> C[Decision Ledger]
+    C --> D[MCP Tools]
+    D --> E[Conversational Triage]
+```
+
+This enables queries such as:
+
+- “What software supply chain events need review right now?”
+- “Why was this event flagged as high risk?”
+- “Create a change ticket for this decision”
+
+
+### Key Design Principle
+> MCP is not part of the event pipeline — it sits **on top** as an interface layer over system capabilities.
+
+This preserves deterministic processing while enabling safe, read-first assistant interaction.
 
 ## Overview
 
@@ -20,6 +43,7 @@ This project demonstrates how those signals can be transformed into actionable i
 - LLM-driven risk evaluation and structured alerts
 
 ## Architecture
+### Core Event Pipelines
 ```mermaid
 flowchart TD
     subgraph External Signals
@@ -50,6 +74,14 @@ flowchart TD
 ```
 
 
+### MCP + Decision Ledger Layer
+```mermaid
+flowchart TD
+    A[GitHub Risk Decisions] --> B[Risk Decision Ledger (JSONL / DynamoDB)]
+    B --> C[MCP Server]
+    C --> D[AI Assistant / Client]
+```
+
 ## Project Structure
 ```text
 app/
@@ -62,6 +94,8 @@ app/
 ├── storage/
 │   ├── supplier_graph.json
 │   └── supplier_profiles.json
+│   └── risk_state_store.py
+│   └── risk_decisions.jsonl
 
 handlers/
 ├── rss_handler/
@@ -69,11 +103,35 @@ handlers/
 └── github_webhook_handler/
     └── handler.py
 
+mcp_Server.py         # MCP server exposing risk tools
+
 tests/
 ├── test_rss_locally.py
 ├── test_lambda_handler_locally.py
 └── test_github_webhook_locally.py
+└── test_mcp.py
 ```
+
+
+## MCP Tools
+The MCP server exposes system capabilities as tools:
+
+- **`evaluate_github_event_risk`**
+  → evaluate and persist risk decisions
+- **`get_recent_risk_decisions`**
+  → query recent decision history
+- **`get_decisions_requiring_review`**
+  → filter decisions requiring human review
+- **`create_mock_servicenow_ticket`**
+  → create workflow tickets from decisions
+
+These tools enable higher-level workflows such as:
+
+- risk triage
+- audit and review
+- conversational investigation
+- workflow orchestration
+
 
 ## How It Works
 
