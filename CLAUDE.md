@@ -20,7 +20,7 @@ python tests/test_lambda_handler_locally.py
 python mcp_server.py
 
 # Test MCP tools programmatically via the client
-python test_mcp.py
+python tests/test_mcp.py
 
 # Docker build for Lambda deployment
 docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-agent:latest .
