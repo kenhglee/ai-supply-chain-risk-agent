@@ -1,12 +1,13 @@
-![Python](https://img.shields.io/badge/python-3.10-blue)
-![LLM](https://img.shields.io/badge/LLM-OpenAI%20%7C%20Bedrock-green)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
+Python
+LLM
+License
 
 # AI Supplier Risk Monitoring Agent
 
 An AI-powered supply chain risk system that ingests external signals, evaluates risk through structured workflows, and exposes those capabilities for both automated processing and AI-assisted operations.
 
 ## New: Agent-Operable Risk System (MCP Layer)
+
 This project now includes a **Model Context Protocol (MCP)** layer that exposes system capabilities as tools for AI assistants.
 
 Instead of only reacting to events, the system can now be operated conversationally.
@@ -19,14 +20,16 @@ flowchart TD
     D --> E[Conversational Triage]
 ```
 
+
+
 This enables queries such as:
 
 - “What software supply chain events need review right now?”
 - “Why was this event flagged as high risk?”
 - “Create a change ticket for this decision”
 
-
 ### Key Design Principle
+
 > MCP is not part of the event pipeline — it sits **on top** as an interface layer over system capabilities.
 
 This preserves deterministic processing while enabling safe, read-first assistant interaction.
@@ -43,7 +46,9 @@ This project demonstrates how those signals can be transformed into actionable i
 - LLM-driven risk evaluation and structured alerts
 
 ## Architecture
+
 ### Core Event Pipelines
+
 ```mermaid
 flowchart TD
     subgraph External Signals
@@ -74,15 +79,20 @@ flowchart TD
 ```
 
 
+
 ### MCP + Decision Ledger Layer
+
 ```mermaid
 flowchart TD
-    A[GitHub Risk Decisions] --> B[Risk Decision Ledger (JSONL / DynamoDB)]
-    B --> C[MCP Server]
-    C --> D[AI Assistant / Client]
+    A["GitHub Risk Decisions"] --> B["Risk Decision Ledger: JSONL or DynamoDB"]
+    B --> C["MCP Server"]
+    C --> D["AI Assistant or Client"]
 ```
 
+
+
 ## Project Structure
+
 ```text
 app/
 ├── ingestion/
@@ -112,18 +122,18 @@ tests/
 └── test_mcp.py
 ```
 
-
 ## MCP Tools
+
 The MCP server exposes system capabilities as tools:
 
-- **`evaluate_github_event_risk`**
-  → evaluate and persist risk decisions
-- **`get_recent_risk_decisions`**
-  → query recent decision history
-- **`get_decisions_requiring_review`**
-  → filter decisions requiring human review
-- **`create_mock_servicenow_ticket`**
-  → create workflow tickets from decisions
+- `**evaluate_github_event_risk**`
+→ evaluate and persist risk decisions
+- `**get_recent_risk_decisions**`
+→ query recent decision history
+- `**get_decisions_requiring_review**`
+→ filter decisions requiring human review
+- `**create_mock_servicenow_ticket**`
+→ create workflow tickets from decisions
 
 These tools enable higher-level workflows such as:
 
@@ -131,7 +141,6 @@ These tools enable higher-level workflows such as:
 - audit and review
 - conversational investigation
 - workflow orchestration
-
 
 ## How It Works
 
@@ -289,7 +298,6 @@ Google News RSS
 
 The local CSV/OpenAI path remains available for development and experimentation.
 
-
 ## Cloud Deployment
 
 This project can be deployed to AWS Lambda using a container image.
@@ -315,7 +323,6 @@ The repository includes:
 - Both `Dockerfile.rss` and `Dockerfile.github` for packaging the agent as a Lambda-compatible container image separately
 - `.dockerignore` to keep the image small and avoid shipping local artifacts
 - `.env.example` showing both local and AWS configuration options
-
 
 ### Event-Driven Execution
 
@@ -347,7 +354,6 @@ Example Lambda Response
 
 This allows the agent to continuously monitor supplier-related news and maintain persistent risk state over time without requiring a long-running server.
 
-
 ## GitHub Webhook Integration
 
 The project also includes a GitHub webhook integration that demonstrates event-driven policy evaluation for software delivery workflows.
@@ -373,9 +379,10 @@ GitHub Webhook
 → Ticket / Workflow Trigger
 ```
 
-
 ## Example Output
+
 ### Example RSS driven Supply Chain Risk Evaluation
+
 ```text
 Daily Supply Chain Risk Summary
 -----------------------------------
@@ -419,6 +426,7 @@ Relevant Supplier Context: Foxconn - Foxconn is a global electronics manufacturi
 ```
 
 ### Example Ticket Output
+
 ```json
 "ticket": {
   "ticket_id": "MOCK-CHG-XXXXXXX",
@@ -510,6 +518,7 @@ This prevents duplicate processing across runs while keeping the system self-con
 Longer term, the architecture could evolve toward event-driven multi-agent coordination, deeper integration with ERP and planning systems, and infrastructure-as-code deployment with Terraform.
 
 ## Summary
+
 This project demonstrates two complementary event-driven AI patterns:
 
 ```text
@@ -526,5 +535,4 @@ github push / pull request events
 → branch-aware risk evaluation
 → structured decision workflow
 ```
-
 
