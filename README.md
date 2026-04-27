@@ -105,7 +105,7 @@ app/
 │   ├── supplier_graph.json
 │   └── supplier_profiles.json
 │   └── risk_state_store.py
-│   └── risk_decisions.jsonl
+│   └── risk_decisions.jsonl  # (generated at runtime; not checked into git)
 
 handlers/
 ├── rss_handler/
