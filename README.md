@@ -128,7 +128,7 @@ The MCP server exposes system capabilities as tools:
 
 - `**evaluate_github_event_risk**`
 → evaluate and persist risk decisions
-- `**get_recent_risk_decisions**`
+- `**get_recent_risk_decisions****`
 → query recent decision history
 - `**get_decisions_requiring_review**`
 → filter decisions requiring human review
