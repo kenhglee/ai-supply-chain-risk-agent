@@ -1,6 +1,12 @@
 ---
 name: risk_review_triage
 description: Identify, prioritize, and recommend actions for software supply chain risk events requiring operator attention.
+
+allowed-tools:
+  - get_recent_risk_decisions
+  - get_decisions_requiring_review
+  - evaluate_github_event_risk
+  - create_mock_servicenow_ticket
 ---
 
 # Risk Review Triage Skill
