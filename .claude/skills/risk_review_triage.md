@@ -2,6 +2,7 @@
 name: risk_review_triage
 description: Identify, prioritize, and recommend actions for software supply chain risk events requiring operator attention.
 
+verbosity: standard  # default: concise | standard | detailed
 allowed-tools:
   - get_recent_risk_decisions
   - get_decisions_requiring_review
@@ -90,6 +91,8 @@ Focus on:
 
 6. Ask before creating tickets unless explicitly requested
 
+7. Adjust the response format based on the verbosity setting before generating output.
+
 ---
 
 ## Decision Guidance
@@ -175,6 +178,39 @@ Base confidence on:
 - pattern consistency
 - presence of test indicators
 - recency and impact signals
+
+## Verbosity Modes
+
+Adjust output detail based on verbosity level.
+
+### concise (operator mode)
+- Show only:
+  - priority
+  - service / event
+  - risk score
+  - 1-line reason
+  - action
+- Omit:
+  - long explanations
+  - commit details unless critical
+  - repeated metadata (timestamps, IDs unless needed)
+
+### standard (default)
+- Current behavior:
+  - structured output
+  - short reasoning
+  - minimal explanation
+  - key metadata included
+
+### detailed (analyst mode)
+- Include:
+  - full reasoning ("why it matters")
+  - security implications
+  - contextual interpretation
+  - pattern explanations
+  - explicit assumptions
+
+Prefer concise unless the user explicitly asks for more detail or context is ambiguous.
 
 ### Optional Actions
 
