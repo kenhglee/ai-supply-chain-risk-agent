@@ -4,13 +4,15 @@ License
 
 # AI Supplier Risk Monitoring Agent
 
-An AI-powered supply chain risk system that ingests external signals, evaluates risk through structured workflows, and exposes those capabilities for both automated processing and AI-assisted operations.
+A production-grade **agentic AI system** that transforms external signals into structured decisions and exposes them as **operable workflows**.
 
-## New: Agent-Operable Risk System (MCP Layer)
+Built to demonstrate how LLM-based systems move beyond pipelines into **stateful, controllable, and deployable enterprise AI systems**.
 
-This project now includes a **Model Context Protocol (MCP)** layer that exposes system capabilities as tools for AI assistants.
+## Agent-Operable Risk System (MCP Layer)
 
-Instead of only reacting to events, the system can now be operated conversationally.
+This system introduces a **Model Context Protocol (MCP)** layer that turns AI workflows into **queryable, controllable, and observable systems**.
+
+Instead of only reacting to events, the system becomes **operable by both humans and AI agents**.
 
 ```mermaid
 flowchart TD
@@ -21,12 +23,6 @@ flowchart TD
 ```
 
 
-
-This enables queries such as:
-
-- “What software supply chain events need review right now?”
-- “Why was this event flagged as high risk?”
-- “Create a change ticket for this decision”
 
 ### Key Design Principle
 
