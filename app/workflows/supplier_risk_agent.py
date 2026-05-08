@@ -28,7 +28,6 @@ BASE_DIR = Path(__file__).resolve().parent
 SEEN_FILE = BASE_DIR / "seen_headlines.json"
 ALERT_FILE = BASE_DIR / "alerts.csv"
 ENRICHED_ALERT_FILE = BASE_DIR / "enriched_alerts.csv"
-RISK_STATE_FILE = BASE_DIR / "risk_state.csv"
 GRAPH_FILE = BASE_DIR / "../storage/supplier_graph.json"
 PROFILES_FILE = BASE_DIR / "../storage/supplier_profiles.json"
 
@@ -143,17 +142,6 @@ class DynamoRiskStateStore:
         pass
 
 
-# ---- Alert Dictionary ----
-class AlertDict(TypedDict, total=False):
-    status: Literal["ok", "inconclusive"]
-    supplier: Optional[str]
-    risk_type: Optional[str]
-    risk_level: Optional[str]
-    impact: str
-    recommended_action: str
-    relevant_supplier_context: str
-
-
 # ---- State ----
 class RiskState(TypedDict):
     headline: str
@@ -180,41 +168,8 @@ def get_risk_store():
     raise ValueError(f"Unsupported RISK_STATE_BACKEND: {backend}")
 
 
-def load_risk_state(path: Path = RISK_STATE_FILE) -> dict[tuple[str, str], dict]:
-    if not path.exists():
-        return {}
-
-    state = {}
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            supplier = (row.get("supplier") or "").strip()
-            risk_type = (row.get("risk_type") or "").strip()
-            if supplier and risk_type:
-                state[(supplier, risk_type)] = row
-    return state
-
-
 def save_risk_state(risk_store) -> None:
     risk_store.flush()
-
-
-'''
-def save_risk_state(state: dict[tuple[str, str], dict], path: Path = RISK_STATE_FILE) -> None:
-    fieldnames = [
-        "supplier",
-        "risk_type",
-        "current_risk_level",
-        "last_headline",
-        "last_seen_at",
-    ]
-
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in state.values():
-            writer.writerow(row)
-'''
 
 
 def normalize_risk_type(risk_type: str | None) -> str | None:
