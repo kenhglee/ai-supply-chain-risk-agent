@@ -6,6 +6,7 @@ from app.storage.risk_state_store import (
     get_recent_risk_decisions as _get_recent,
     save_risk_decision,
 )
+from app.storage.risk_trace_store import get_risk_trace_by_identifier as _get_risk_trace
 from app.workflows.github_risk_evaluator import evaluate_github_event_risk as _evaluate_risk
 
 mcp = FastMCP("supply-chain-risk")
@@ -106,6 +107,29 @@ def get_decisions_requiring_review(limit: int = 10) -> list[dict]:
         limit: maximum number of records to return (default 10)
     """
     return _get_requiring_review(limit)
+
+
+@mcp.tool()
+def get_risk_trace(identifier: str) -> dict:
+    """Retrieve a persisted supplier risk trace by alert_id or trace_id.
+
+    Args:
+        identifier: the alert_id or trace_id to look up
+    """
+    record = _get_risk_trace(identifier)
+    if record is None:
+        return {
+            "found": False,
+            "identifier": identifier,
+            "message": f"No risk trace found for identifier: {identifier}",
+        }
+    matched_by = "alert_id" if record.get("alert_id") == identifier else "trace_id"
+    return {
+        "found": True,
+        "identifier": identifier,
+        "matched_by": matched_by,
+        "trace": record,
+    }
 
 
 if __name__ == "__main__":
