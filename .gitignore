@@ -23,4 +23,4 @@ app/workflows/enriched_alerts.csv
 app/workflows/risk_state.csv
 app/workflows/seen_headlines.json
 risk_traces.jsonl
-app/workflows/risk_traces.jsonl
+app/storage/risk_traces.jsonl

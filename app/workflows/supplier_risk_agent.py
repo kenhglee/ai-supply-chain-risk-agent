@@ -17,6 +17,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from app.ingestion.rss_ingestion import load_headlines_from_rss
+from app.storage.risk_trace_store import append_risk_trace
 
 logger = logging.getLogger()
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -883,6 +884,20 @@ def process_alert_row(row: dict, risk_store) -> dict:
     trace_id = uuid.uuid4().hex
 
     if not is_actionable_alert(headline):
+        append_risk_trace({
+            "alert_id": alert_id,
+            "trace_id": trace_id,
+            "headline": headline,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "run_duration_ms": 0,
+            "tool_decision": "skip",
+            "final_status": "inconclusive",
+            "supplier": None,
+            "risk_type": None,
+            "risk_level": None,
+            "change_type": "ignored",
+            "trace_steps": [],
+        })
         return {
             "alert_id": alert_id,
             "trace_id": trace_id,
@@ -903,6 +918,7 @@ def process_alert_row(row: dict, risk_store) -> dict:
             "relevant_supplier_context": "",
         }
 
+    t_run_start = time.time()
     result = app.invoke({
         "alert_id": alert_id,
         "trace_id": trace_id,
@@ -914,6 +930,7 @@ def process_alert_row(row: dict, risk_store) -> dict:
         "is_valid": None,
         "trace_steps": [],
     })
+    run_duration_ms = round((time.time() - t_run_start) * 1000, 1)
 
     alert = result["alert"]
 
@@ -922,6 +939,21 @@ def process_alert_row(row: dict, risk_store) -> dict:
         headline=headline,
         state=risk_store,
     )
+
+    append_risk_trace({
+        "alert_id": alert_id,
+        "trace_id": trace_id,
+        "headline": headline,
+        "created_at": datetime.fromtimestamp(t_run_start, tz=timezone.utc).isoformat(timespec="milliseconds"),
+        "run_duration_ms": run_duration_ms,
+        "tool_decision": result.get("tool_decision"),
+        "final_status": alert.get("status"),
+        "supplier": alert.get("supplier"),
+        "risk_type": alert.get("risk_type"),
+        "risk_level": alert.get("risk_level"),
+        "change_type": change_type,
+        "trace_steps": result.get("trace_steps", []),
+    })
 
     return {
         "alert_id": alert_id,
