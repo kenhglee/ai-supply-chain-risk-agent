@@ -3,6 +3,7 @@ import json
 import feedparser
 import re
 import os
+import uuid
 import boto3
 import time
 import logging
@@ -144,6 +145,8 @@ class DynamoRiskStateStore:
 
 # ---- State ----
 class RiskState(TypedDict):
+    alert_id: str
+    trace_id: str
     headline: str
     candidate_suppliers: List[str]
     context: str
@@ -349,6 +352,7 @@ def write_enriched_alerts(rows: list[dict], path: Path = ENRICHED_ALERT_FILE) ->
     fieldnames = [
         "processed_at",
         "alert_id",
+        "trace_id",
         "headline",
         "source",
         "status",
@@ -814,10 +818,13 @@ app = graph.compile()
 
 def process_alert_row(row: dict, risk_store) -> dict:
     headline = row["headline"]
+    alert_id = row.get("alert_id") or uuid.uuid4().hex
+    trace_id = uuid.uuid4().hex
 
     if not is_actionable_alert(headline):
         return {
-            "alert_id": row.get("alert_id", ""),
+            "alert_id": alert_id,
+            "trace_id": trace_id,
             "headline": headline,
             "source": row.get("source", ""),
             "status": row.get("status", ""),
@@ -835,6 +842,8 @@ def process_alert_row(row: dict, risk_store) -> dict:
         }
 
     result = app.invoke({
+        "alert_id": alert_id,
+        "trace_id": trace_id,
         "headline": headline,
         "candidate_suppliers": [],
         "context": "",
@@ -851,9 +860,9 @@ def process_alert_row(row: dict, risk_store) -> dict:
         state=risk_store,
     )
 
-    
     return {
-        "alert_id": row.get("alert_id", ""),
+        "alert_id": alert_id,
+        "trace_id": trace_id,
         "headline": headline,
         "source": row.get("source", ""),
         "status": row.get("status", ""),
