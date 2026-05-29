@@ -12,3 +12,15 @@ app/storage/risk_decisions.jsonl
 
 .DS_Store
 node_modules/
+
+# Runtime outputs
+alerts.csv
+enriched_alerts.csv
+risk_state.csv
+seen_headlines.json
+app/workflows/alerts.csv
+app/workflows/enriched_alerts.csv
+app/workflows/risk_state.csv
+app/workflows/seen_headlines.json
+risk_traces.jsonl
+app/workflows/risk_traces.jsonl
