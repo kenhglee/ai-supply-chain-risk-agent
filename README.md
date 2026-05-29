@@ -249,10 +249,18 @@ cd ai-supply-chain-risk-agent
 Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
-Create a .env file:
+> `requirements.txt` is kept for backward compatibility (e.g. Docker builds). For local development, prefer `uv sync`.
+
+To add a new package:
+
+```bash
+uv add <package>
+```
+
+Create a `.env` file:
 
 ```bash
 OPENAI_API_KEY=your_key_here
@@ -263,7 +271,7 @@ RISK_STATE_BACKEND=csv
 Run the agent:
 
 ```bash
-python supplier_risk_agent.py
+uv run python -m app.workflows.supplier_risk_agent
 ```
 
 ### Optional: Cloud Execution (AWS)
