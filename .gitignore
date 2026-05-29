@@ -9,3 +9,6 @@ venv-langgraph/
 seen_headlines.json
 *.lock.txt
 app/storage/risk_decisions.jsonl
+
+.DS_Store
+node_modules/
