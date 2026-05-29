@@ -153,6 +153,7 @@ class RiskState(TypedDict):
     tool_decision: Optional[Literal["retrieve", "skip"]]
     alert: Optional[dict]
     is_valid: Optional[bool]
+    trace_steps: List[dict]
 
 
 def get_risk_store():
@@ -353,6 +354,7 @@ def write_enriched_alerts(rows: list[dict], path: Path = ENRICHED_ALERT_FILE) ->
         "processed_at",
         "alert_id",
         "trace_id",
+        "trace_steps_count",
         "headline",
         "source",
         "status",
@@ -594,15 +596,43 @@ vectorstore = load_vectorstore()
 model = get_llm()
 
 
+# ---- Trace helper ----
+def record_trace_step(
+    steps: list,
+    node_name: str,
+    t0: float,
+    decision: str | None = None,
+    error: str | None = None,
+) -> list:
+    t1 = time.time()
+    step = {
+        "node_name": node_name,
+        "started_at": datetime.fromtimestamp(t0, tz=timezone.utc).isoformat(timespec="milliseconds"),
+        "ended_at": datetime.fromtimestamp(t1, tz=timezone.utc).isoformat(timespec="milliseconds"),
+        "duration_ms": round((t1 - t0) * 1000, 1),
+    }
+    if decision is not None:
+        step["decision"] = decision
+    if error is not None:
+        step["error"] = error
+    return steps + [step]
+
+
 # ---- Node 1: infer suppliers (your existing graph/rule logic placeholder) ----
 def infer_suppliers(state: RiskState) -> RiskState:
+    t0 = time.time()
     headline = state["headline"]
     suppliers = infer_candidate_suppliers_from_graph(headline, graph_edges, SUPPLIER_ALIASES)
-    return {**state, "candidate_suppliers": suppliers}
+    return {
+        **state,
+        "candidate_suppliers": suppliers,
+        "trace_steps": record_trace_step(state["trace_steps"], "infer", t0),
+    }
 
 
 # ---- Node 2: controlled "reason" step ----
 def decide_tool_use(state: RiskState) -> RiskState:
+    t0 = time.time()
     headline = state["headline"]
     suppliers = state["candidate_suppliers"]
 
@@ -629,11 +659,16 @@ def decide_tool_use(state: RiskState) -> RiskState:
     if decision not in {"retrieve", "skip"}:
         decision = "skip"
 
-    return {**state, "tool_decision": decision}
+    return {
+        **state,
+        "tool_decision": decision,
+        "trace_steps": record_trace_step(state["trace_steps"], "decide", t0, decision=decision),
+    }
 
 
 # ---- Node 3: retrieval tool step (mock for now) ----
 def retrieve_context(state: RiskState) -> RiskState:
+    t0 = time.time()
     headline = state["headline"]
     suppliers = state["candidate_suppliers"]
     
@@ -657,11 +692,16 @@ def retrieve_context(state: RiskState) -> RiskState:
     context = "\n\n".join(doc.page_content for doc in docs) if docs else "No context found"
     print("-" * 50)
 
-    return {**state, "context": context}
+    return {
+        **state,
+        "context": context,
+        "trace_steps": record_trace_step(state["trace_steps"], "retrieve", t0),
+    }
 
 
 # ---- Node 4: Analysis ----
 def analyze_risk(state: RiskState) -> RiskState:
+    t0 = time.time()
     headline = state["headline"]
     candidate_suppliers = state["candidate_suppliers"]
     context = state["context"] or "No additional context retrieved."
@@ -725,8 +765,7 @@ def analyze_risk(state: RiskState) -> RiskState:
             alert["impact"] = "No clearly relevant supplier could be identified from the current signal."
             alert["recommended_action"] = "Monitor for more supplier-specific information before taking action."
             alert["relevant_supplier_context"] = ""
-    except Exception as e:
-
+    except Exception as exc:
         alert = {
             "status": "inconclusive",
             "supplier": None,
@@ -735,10 +774,20 @@ def analyze_risk(state: RiskState) -> RiskState:
             "recommended_action": "Review the headline and prompt logic.",
             "relevant_supplier_context": ""
         }
-    return {**state, "alert": alert}
+        return {
+            **state,
+            "alert": alert,
+            "trace_steps": record_trace_step(state["trace_steps"], "analyze", t0, error=str(exc)),
+        }
+    return {
+        **state,
+        "alert": alert,
+        "trace_steps": record_trace_step(state["trace_steps"], "analyze", t0),
+    }
 
 # ---- Node 5: Validation ----
 def validate_alert(state: RiskState) -> RiskState:
+    t0 = time.time()
     alert = state.get("alert")
     is_valid = False
 
@@ -748,19 +797,27 @@ def validate_alert(state: RiskState) -> RiskState:
             is_valid = True
         elif status == "ok":
             required = [
-                "supplier", 
+                "supplier",
                 "risk_type",
-                "risk_level", 
-                "impact", 
-                "recommended_action", 
+                "risk_level",
+                "impact",
+                "recommended_action",
                 "relevant_supplier_context"]
             is_valid = all(alert.get(k) for k in required)
 
-    return {**state, "is_valid": is_valid}
+    return {
+        **state,
+        "is_valid": is_valid,
+        "trace_steps": record_trace_step(
+            state["trace_steps"], "validate", t0,
+            decision="valid" if is_valid else "fallback",
+        ),
+    }
 
 
 # ---- Node 6: Fallback ----
 def fallback_alert(state: RiskState) -> RiskState:
+    t0 = time.time()
     fallback = {
         "status": "inconclusive",
         "supplier": None,
@@ -769,7 +826,11 @@ def fallback_alert(state: RiskState) -> RiskState:
         "recommended_action": "Review the model output and upstream prompt or retrieval logic.",
         "relevant_supplier_context": ""
     }
-    return {**state, "alert": fallback}
+    return {
+        **state,
+        "alert": fallback,
+        "trace_steps": record_trace_step(state["trace_steps"], "fallback", t0),
+    }
 
 
 # ---- Conditional router for tool decision ----
@@ -825,6 +886,7 @@ def process_alert_row(row: dict, risk_store) -> dict:
         return {
             "alert_id": alert_id,
             "trace_id": trace_id,
+            "trace_steps_count": 0,
             "headline": headline,
             "source": row.get("source", ""),
             "status": row.get("status", ""),
@@ -850,6 +912,7 @@ def process_alert_row(row: dict, risk_store) -> dict:
         "tool_decision": None,
         "alert": None,
         "is_valid": None,
+        "trace_steps": [],
     })
 
     alert = result["alert"]
@@ -863,6 +926,7 @@ def process_alert_row(row: dict, risk_store) -> dict:
     return {
         "alert_id": alert_id,
         "trace_id": trace_id,
+        "trace_steps_count": len(result.get("trace_steps", [])),
         "headline": headline,
         "source": row.get("source", ""),
         "status": row.get("status", ""),
