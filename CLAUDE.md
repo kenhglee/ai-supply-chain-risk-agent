@@ -114,3 +114,25 @@ The system maintains two independent state stores:
 - Software supply chain risk decisions (GitHub pipeline) → JSONL
 
 These are intentionally separate due to different data models and workflows.
+
+## Claude Code Working Preferences
+
+You may proceed without confirmation for:
+- Normal code edits
+- Creating new source files
+- Refactoring existing code
+- Frontend development under web/
+- Tests and documentation updates
+
+Ask before:
+- Installing new packages
+- Modifying .env files
+- Deleting files
+- Git operations (commit, reset, rebase, clean)
+- Infrastructure or deployment changes
+- Database schema changes
+
+Prefer:
+- Small incremental changes
+- Show implementation summary after completion
+- Validate changes before declaring success

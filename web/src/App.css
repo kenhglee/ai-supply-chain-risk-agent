@@ -1,0 +1,269 @@
+/* ---- Layout ---- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-header {
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.app-header h1 {
+  font-size: 20px;
+  margin: 14px 0;
+  letter-spacing: -0.3px;
+}
+
+.app-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.pane {
+  overflow-y: auto;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.pane-list {
+  width: 320px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+}
+
+.pane-detail {
+  flex: 1;
+}
+
+.pane-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text);
+  margin: 0 0 12px;
+}
+
+/* ---- Trace list ---- */
+
+.trace-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.trace-item {
+  padding: 10px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  transition: background 0.15s;
+}
+
+.trace-item:hover {
+  background: var(--accent-bg);
+}
+
+.trace-item.selected {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+}
+
+.trace-item-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.alert-id {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text-h);
+}
+
+.trace-item-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* ---- Badges ---- */
+
+.badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.badge-ok {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.badge-inconclusive {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.badge-unknown {
+  background: var(--code-bg);
+  color: var(--text);
+}
+
+@media (prefers-color-scheme: dark) {
+  .badge-ok { background: #064e3b; color: #6ee7b7; }
+  .badge-inconclusive { background: #451a03; color: #fcd34d; }
+}
+
+/* ---- Detail panel ---- */
+
+.detail-panel {
+  max-width: 720px;
+}
+
+.detail-headline {
+  font-size: 18px;
+  margin: 0 0 16px;
+  line-height: 1.4;
+}
+
+.detail-meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0 0 20px;
+  font-size: 14px;
+}
+
+.detail-meta dt {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.detail-meta dd {
+  margin: 0;
+  color: var(--text-h);
+}
+
+.detail-section {
+  margin-bottom: 20px;
+}
+
+.detail-section h3 {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text);
+  margin: 0 0 8px;
+}
+
+/* ---- Node sequence ---- */
+
+.node-sequence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.node {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  font-family: var(--mono);
+  line-height: 1.3;
+}
+
+.node.node-slowest {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.node-ms {
+  font-size: 10px;
+  color: var(--text);
+}
+
+.node-arrow {
+  color: var(--text);
+  padding: 0 2px;
+  font-size: 14px;
+  align-self: center;
+}
+
+.slowest-note {
+  font-size: 13px;
+  color: var(--text);
+  margin-top: 8px;
+}
+
+/* ---- Decision table ---- */
+
+.decision-table {
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.decision-table td {
+  padding: 3px 8px 3px 0;
+  vertical-align: middle;
+}
+
+.decision-arrow {
+  color: var(--text);
+  padding: 0 6px !important;
+}
+
+.error-table td {
+  color: #b91c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  .error-table td { color: #fca5a5; }
+}
+
+/* ---- Explanation ---- */
+
+.explanation {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  background: var(--code-bg);
+  padding: 12px 14px;
+  border-radius: 6px;
+  margin: 0;
+  color: var(--text-h);
+}
+
+/* ---- Utilities ---- */
+
+.mono { font-family: var(--mono); font-size: 13px; }
+.empty { color: var(--text); font-size: 14px; }
+.loading { color: var(--text); font-size: 14px; }
+.loading-inline { color: var(--text); font-size: 13px; margin: 0; }
+.error { color: #b91c1c; font-size: 14px; }
+
+@media (prefers-color-scheme: dark) {
+  .error { color: #fca5a5; }
+}
