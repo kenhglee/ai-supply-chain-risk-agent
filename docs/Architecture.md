@@ -2,12 +2,66 @@
 
 ## System Purpose
 
-This project is a **supply chain risk monitoring backend**. It watches two classes of signal and turns them into structured risk decisions:
+This project is a **supply chain risk monitoring system**. It watches two classes of signal and turns them into structured risk decisions:
 
 1. **Supplier disruption news** — Google News RSS headlines about key hardware suppliers (TSMC, Foxconn, Murata) are processed through an LLM-powered LangGraph agent and emitted as enriched risk alerts.
 2. **Software supply chain events** — GitHub push and pull-request webhooks are evaluated by a rule-based scorer; high-risk events trigger a mock ServiceNow change ticket.
 
-There is no web UI. The system is a set of Python modules deployed as AWS Lambda functions, plus a local MCP server that exposes the GitHub pipeline to AI assistants.
+A **risk trace observability layer** records per-node timing and decisions for every LangGraph run. Traces are exposed via a FastAPI HTTP layer and a React trace viewer, and are also queryable through MCP tools.
+
+---
+
+## Current Architecture
+
+```mermaid
+flowchart TD
+    subgraph Sources
+        RSS[Google News RSS]
+        GH[GitHub Webhook]
+    end
+
+    subgraph Lambda Handlers
+        L1[rss_handler]
+        L2[github_webhook_handler]
+    end
+
+    subgraph RSS Pipeline
+        RA["LangGraph Agent\ninfer → decide → retrieve → analyze → validate"]
+        RS[(risk_state.csv / DynamoDB)]
+        EA[(enriched_alerts.csv)]
+        RT[(risk_traces.jsonl)]
+    end
+
+    subgraph GitHub Pipeline
+        GE[github_risk_evaluator\nrule-based]
+        SN[servicenow_mock]
+        RD[(risk_decisions.jsonl)]
+    end
+
+    subgraph Interface Layer
+        MCP[MCP Server\nmcp_server.py]
+        API[FastAPI\napp/api/main.py]
+    end
+
+    subgraph Frontend
+        UI[React Trace Viewer\nweb/]
+    end
+
+    RSS --> L1 --> RA
+    RA --> RS
+    RA --> EA
+    RA --> RT
+
+    GH --> L2 --> GE --> SN
+    GE --> RD
+
+    MCP -->|GitHub tools| GE
+    MCP -->|read| RD
+    MCP -->|read| RT
+
+    RT --> API
+    API -->|GET /api/traces| UI
+```
 
 ---
 
@@ -15,6 +69,8 @@ There is no web UI. The system is a set of Python modules deployed as AWS Lambda
 
 ```
 app/
+  api/
+    main.py                   # FastAPI app — trace HTTP endpoints
   ingestion/
     rss_ingestion.py          # Fetches Google News RSS; returns raw headline dicts
     github_webhook_receiver.py # Verifies HMAC, normalizes GitHub payload, calls evaluator
@@ -22,6 +78,7 @@ app/
     servicenow_mock.py        # Returns a fake ServiceNow CHANGE ticket dict
   storage/
     risk_state_store.py       # Appends / queries risk_decisions.jsonl
+    risk_trace_store.py       # Appends / queries risk_traces.jsonl; build_trace_explanation
     supplier_graph.json       # Knowledge graph: [source, relation, target] triples
     supplier_profiles.json    # Text profiles for FAISS vectorstore
   workflows/
@@ -29,11 +86,43 @@ app/
     github_risk_evaluator.py  # Rule-based risk scorer (GitHub pipeline)
 
 handlers/
-  rss_handler/handler.py          # Lambda entry point for RSS pipeline
+  rss_handler/handler.py           # Lambda entry point for RSS pipeline
   github_webhook_handler/handler.py # Lambda entry point for GitHub webhooks
 
-mcp_server.py     # FastMCP server wrapping the GitHub pipeline tools
+mcp_server.py    # FastMCP server — GitHub pipeline tools + risk trace tools
+
+web/             # Vite + React + TypeScript trace viewer
+  src/
+    App.tsx      # Two-pane trace list / detail UI
+    api.ts       # Typed fetch wrappers for FastAPI endpoints
+    types.ts     # TraceSummary, TraceDetail, TraceStep interfaces
 ```
+
+---
+
+## Developer Workflow
+
+```bash
+# Install Python dependencies
+uv sync
+
+# Add a new Python package
+uv add <package>
+
+# Run the RSS pipeline locally (requires OPENAI_API_KEY)
+uv run python -m app.workflows.supplier_risk_agent
+
+# Start the FastAPI server
+uv run uvicorn app.api.main:app --reload
+
+# Start the MCP server
+uv run python mcp_server.py
+
+# Start the React trace viewer (separate terminal, from web/)
+cd web && npm run dev
+```
+
+`requirements.txt` is kept for Lambda Docker builds. `uv` manages the local `.venv`.
 
 ---
 
@@ -41,7 +130,7 @@ mcp_server.py     # FastMCP server wrapping the GitHub pipeline tools
 
 ### Trigger
 
-AWS EventBridge invokes `handlers/rss_handler/handler.py` on a schedule. Locally, run `python app/workflows/supplier_risk_agent.py`.
+AWS EventBridge invokes `handlers/rss_handler/handler.py` on a schedule. Locally: `uv run python -m app.workflows.supplier_risk_agent`.
 
 ### Request Flow
 
@@ -52,8 +141,11 @@ EventBridge (schedule)
       → bootstrap_alerts_csv_from_rss()   # fetch RSS, deduplicate, append to alerts.csv
       → for each "new" alert (up to MAX_ALERTS_PER_RUN):
           → is_actionable_alert()          # keyword pre-filter (no LLM call)
-          → LangGraph app.invoke()         # 6-node agent (see below)
+          → if not actionable: append_risk_trace(trace_steps=[])  → skip
+          → generate trace_id (uuid4 hex)
+          → LangGraph app.invoke()         # 6-node agent; nodes write to trace_steps
           → compare_and_update_risk_state() # detect escalation/suppression
+          → append_risk_trace(...)         # persist to risk_traces.jsonl
       → write_enriched_alerts()           # append to enriched_alerts.csv
       → risk_store.flush()               # persist risk state to CSV or DynamoDB
   → return { statusCode: 200, body: summary_json }
@@ -68,14 +160,16 @@ infer → decide ──retrieve──► analyze → validate ──end──►
                 └──skip──────►         └──fallback──► fallback → END
 ```
 
-| Node | What it does |
-|---|---|
-| `infer` | Maps headline to candidate suppliers via graph traversal (`has_risk` / `operates_in` / `depends_on` edges) and direct alias matching |
-| `decide` | LLM call — returns `"retrieve"` or `"skip"` to gate context retrieval |
-| `retrieve` | FAISS similarity search over `supplier_profiles.json`; filters results to inferred suppliers when possible |
-| `analyze` | LLM call — returns structured JSON alert (see schema below) |
-| `validate` | Checks required fields; routes to `fallback` on failure |
-| `fallback` | Replaces alert with a safe `inconclusive` sentinel |
+| Node | What it does | Records in trace |
+|---|---|---|
+| `infer` | Maps headline to candidate suppliers via graph traversal and alias matching | timing only |
+| `decide` | LLM call — returns `"retrieve"` or `"skip"` | timing + decision |
+| `retrieve` | FAISS similarity search over `supplier_profiles.json` | timing only |
+| `analyze` | LLM call — returns structured JSON alert | timing; error if parse fails |
+| `validate` | Checks required fields; routes to `fallback` on failure | timing + `"valid"` or `"fallback"` |
+| `fallback` | Replaces alert with a safe `inconclusive` sentinel | timing only |
+
+Each node records its own `started_at`, `ended_at`, `duration_ms`, and optional `decision` / `error` into `state["trace_steps"]` before returning.
 
 **Module-level initialization**: `supplier_risk_agent.py` builds the FAISS index and instantiates the LLM at import time. `OPENAI_API_KEY` must be set even when `LLM_PROVIDER=bedrock` because `OpenAIEmbeddings` is always used for FAISS.
 
@@ -90,6 +184,7 @@ After the agent runs, `compare_and_update_risk_state` compares the new alert aga
 | `suppressed` | Same risk level as prior (duplicate) |
 | `downgraded` | New risk level is lower than prior |
 | `inconclusive` | Alert status is not `"ok"`, or fields are missing |
+| `ignored` | Headline failed the pre-filter; no LangGraph run |
 
 ---
 
@@ -129,20 +224,115 @@ Note: the webhook handler does **not** persist decisions to `risk_decisions.json
 
 ---
 
+## Risk Trace Observability
+
+Every call to `process_alert_row` produces one trace record written to `app/storage/risk_traces.jsonl`.
+
+### What is captured
+
+- `alert_id` + `trace_id` — stable identifiers threaded through the entire run
+- `headline`, `created_at`, `run_duration_ms` — run-level metadata
+- `tool_decision`, `final_status`, `supplier`, `risk_type`, `risk_level`, `change_type` — outcome fields
+- `trace_steps` — list of per-node records, each with `node_name`, `started_at`, `ended_at`, `duration_ms`, and optionally `decision` or `error`
+
+For alerts that fail the `is_actionable_alert` pre-filter, `trace_steps` is `[]` and `change_type` is `"ignored"`.
+
+### Where traces flow
+
+```mermaid
+flowchart LR
+    LG["LangGraph run\n(supplier_risk_agent.py)"]
+    TS["risk_traces.jsonl\n(app/storage/)"]
+    API["FastAPI\n(app/api/main.py)"]
+    MCP["MCP Server\n(mcp_server.py)"]
+    UI["React Viewer\n(web/)"]
+    AI["AI assistant"]
+
+    LG -->|append_risk_trace| TS
+    TS -->|get_all_traces| API
+    TS -->|get_risk_trace_by_identifier| API
+    TS -->|get_risk_trace_by_identifier| MCP
+    API -->|HTTP GET| UI
+    MCP -->|get_risk_trace\nexplain_risk_trace| AI
+```
+
+---
+
 ## MCP Server
 
-`mcp_server.py` runs a FastMCP server (`supply-chain-risk`) that exposes the GitHub pipeline as tools for AI assistants. It is a separate process, not called by the Lambda webhook handler.
+`mcp_server.py` runs a FastMCP server (`supply-chain-risk`). It is a separate process, not invoked by the Lambda handlers.
 
 ### Tools
+
+**GitHub pipeline tools**
 
 | Tool | Description |
 |---|---|
 | `evaluate_github_event_risk` | Calls the rule-based evaluator and persists the decision to `risk_decisions.jsonl` |
 | `get_recent_risk_decisions` | Returns the N most recent decisions from `risk_decisions.jsonl` (default 20) |
+| `get_decisions_requiring_review` | Returns decisions with `manual_review_required` or `review_recommended` (default 10) |
 | `create_mock_servicenow_ticket` | Creates a mock ServiceNow ticket for a prior decision and persists the result |
-| `get_decisions_requiring_review` | Returns decisions where `decision` is `manual_review_required` or `review_recommended` (default 10) |
 
-Start it with `python mcp_server.py` (blocks on stdin waiting for an MCP client).
+**Risk trace tools**
+
+| Tool | Description |
+|---|---|
+| `get_risk_trace` | Returns the raw trace record for an `alert_id` or `trace_id`; includes `matched_by` field |
+| `explain_risk_trace` | Returns a human-readable explanation: outcome, node sequence, slowest node, decisions, errors |
+
+Start with: `uv run python mcp_server.py` (blocks on stdin waiting for an MCP client).  
+Test interactively: `npx @modelcontextprotocol/inspector uv run python mcp_server.py`
+
+---
+
+## FastAPI Layer
+
+`app/api/main.py` exposes trace data over HTTP. CORS is enabled for `http://localhost:5173` (Vite dev server).
+
+| Endpoint | Response |
+|---|---|
+| `GET /health` | `{"status": "ok"}` |
+| `GET /api/traces` | Summary list (alert_id, trace_id, headline, final_status, created_at, run_duration_ms), newest first |
+| `GET /api/traces/{identifier}` | Full trace record; matches `alert_id` or `trace_id`; 404 on miss |
+| `GET /api/traces/{identifier}/explanation` | `{"explanation": "<text>"}` using `build_trace_explanation` |
+
+Start with: `uv run uvicorn app.api.main:app --reload`
+
+---
+
+## React Trace Viewer
+
+`web/` is a Vite + React + TypeScript app. Start with `cd web && npm run dev`.
+
+### UI Layout
+
+Two-pane split:
+
+- **Left pane** — `TraceList`: shows all traces from `GET /api/traces`. Each row displays `alert_id`, `final_status` badge, `run_duration_ms`, and `created_at`. Clicking a row loads the detail pane.
+- **Right pane** — `TraceDetailPanel`: shows headline, full metadata, node sequence with per-node timing (slowest node highlighted), decisions table, error table if any, and the explanation text from `GET /api/traces/{id}/explanation`.
+
+### TypeScript Interfaces (`src/types.ts`)
+
+```typescript
+interface TraceSummary {
+  alert_id, trace_id, headline, final_status, created_at, run_duration_ms
+}
+
+interface TraceStep {
+  node_name, started_at, ended_at, duration_ms
+  decision?: string   // present on "decide" and "validate" nodes
+  error?: string      // present when analyze node fails to parse LLM output
+}
+
+interface TraceDetail extends TraceSummary {
+  tool_decision, supplier, risk_type, risk_level, change_type
+  trace_steps: TraceStep[]
+}
+```
+
+### Data Fetching (`src/api.ts`)
+
+Three typed fetch wrappers: `fetchTraces()`, `fetchTraceDetail(identifier)`, `fetchExplanation(identifier)`. All target `http://localhost:8000`.
 
 ---
 
@@ -152,12 +342,15 @@ Start it with `python mcp_server.py` (blocks on stdin waiting for an MCP client)
 
 ```python
 class RiskState(TypedDict):
+    alert_id: str
+    trace_id: str
     headline: str
     candidate_suppliers: List[str]
     context: str
     tool_decision: Optional[Literal["retrieve", "skip"]]
     alert: Optional[dict]
     is_valid: Optional[bool]
+    trace_steps: List[dict]
 ```
 
 ### LLM Alert Output (from `analyze` node)
@@ -176,7 +369,42 @@ class RiskState(TypedDict):
 
 ### Enriched Alert Row (`enriched_alerts.csv`)
 
-`processed_at`, `alert_id`, `headline`, `source`, `status`, `tool_decision`, `candidate_suppliers`, `final_status`, `supplier`, `risk_type`, `risk_level`, `change_type`, `change_message`, `impact`, `recommended_action`, `relevant_supplier_context`
+`processed_at`, `alert_id`, `trace_id`, `trace_steps_count`, `headline`, `source`, `status`, `tool_decision`, `candidate_suppliers`, `final_status`, `supplier`, `risk_type`, `risk_level`, `change_type`, `change_message`, `impact`, `recommended_action`, `relevant_supplier_context`
+
+### Risk Trace Record (`risk_traces.jsonl`)
+
+One JSON object per line, appended by `append_risk_trace`:
+
+```json
+{
+  "alert_id": "rss-1",
+  "trace_id": "<uuid hex>",
+  "headline": "...",
+  "created_at": "<ISO-8601 UTC with ms>",
+  "run_duration_ms": 4023.8,
+  "tool_decision": "retrieve" | "skip",
+  "final_status": "ok" | "inconclusive",
+  "supplier": "TSMC" | null,
+  "risk_type": "earthquake" | null,
+  "risk_level": "High" | null,
+  "change_type": "new_alert" | "escalated" | "suppressed" | "downgraded" | "inconclusive" | "ignored",
+  "trace_steps": [
+    {
+      "node_name": "infer",
+      "started_at": "<ISO-8601>",
+      "ended_at": "<ISO-8601>",
+      "duration_ms": 0.0
+    },
+    {
+      "node_name": "decide",
+      "started_at": "...", "ended_at": "...", "duration_ms": 934.9,
+      "decision": "retrieve"
+    }
+  ]
+}
+```
+
+For ignored alerts (pre-filter), `trace_steps` is `[]` and `run_duration_ms` is `0`.
 
 ### Supplier Risk State
 
@@ -186,8 +414,6 @@ Two backends, selected by `RISK_STATE_BACKEND`:
 - **DynamoDB** (table `supplier_risk_state`): same fields; PK = `{supplier}#{risk_type}`
 
 ### Risk Decision Record (`risk_decisions.jsonl`)
-
-One JSON object per line, appended on write:
 
 ```json
 {
@@ -230,24 +456,12 @@ One JSON object per line, appended on write:
 - **Hard-coded supplier set**: the knowledge base covers only TSMC, Murata, and Foxconn. Adding suppliers requires editing `supplier_graph.json`, `supplier_profiles.json`, and `SUPPLIER_ALIASES` in `supplier_risk_agent.py`.
 - **OPENAI_API_KEY always required**: `supplier_risk_agent.py` calls `OpenAIEmbeddings()` unconditionally at import time for the FAISS vectorstore, regardless of `LLM_PROVIDER`.
 - **Module-level side effects**: the graph JSON, FAISS index, and LLM client are constructed at import time, making the module slow to load and difficult to test in isolation.
-- **Local file storage only**: `risk_decisions.jsonl` and `enriched_alerts.csv` are local files on the Lambda instance. They are not shared across invocations or instances and are lost on cold-start container recycling.
-- **`seen_headlines.json` grows unbounded**: no TTL or pruning; over time the file will grow large.
+- **Local file storage only**: `risk_decisions.jsonl`, `risk_traces.jsonl`, and `enriched_alerts.csv` are local files. They are not shared across Lambda instances and are lost on cold-start container recycling.
+- **`seen_headlines.json` grows unbounded**: no TTL or pruning.
 - **No real ServiceNow integration**: `create_servicenow_ticket` returns a mock dict; nothing is sent externally.
-- **Webhook handler does not persist decisions**: the Lambda GitHub webhook handler calls the rule-based evaluator and creates a mock ticket, but does not write to `risk_decisions.jsonl`. Only the MCP server persists decisions.
+- **Webhook handler does not persist decisions**: the Lambda GitHub webhook handler does not write to `risk_decisions.jsonl`. Only the MCP server persists decisions.
 - **RSS feed is fixed**: `rss_ingestion.py` hard-codes a single Google News query for `TSMC OR Foxconn OR Murata`.
 - **No retry or dead-letter handling**: Lambda failures surface as unhandled exceptions with no DLQ configured.
-- **No observability layer**: structured JSON logs are emitted to CloudWatch, but there is no trace ID threading across nodes, no per-node latency, and no way to replay or inspect individual agent runs.
-
----
-
-## Next Roadmap Item: Risk Trace / Observability Panel
-
-The immediate next work item is a **Risk Trace panel** — a per-alert trace view that surfaces what happened inside each LangGraph run.
-
-**Motivation**: when an alert is emitted as `inconclusive` or an unexpected `risk_level`, there is currently no way to see which node made which decision, what the LLM was given, or how long each node took. All diagnostic data lives in `enriched_alerts.csv` at the row level; there is no node-level record.
-
-**Planned shape**:
-- Capture a trace record alongside each enriched alert: node sequence, per-node inputs/outputs, LLM prompts and raw responses, timing.
-- Store traces in a structured file (e.g. `risk_traces.jsonl`) keyed by `alert_id`.
-- Surface traces via a new MCP tool (`get_risk_trace`) so an AI assistant can explain a specific alert's reasoning chain on demand.
-- Longer term: a lightweight local UI (or Jupyter notebook) that renders the trace as a step-by-step panel — node name, decision, context snippet, latency.
+- **Trace store is append-only**: `risk_traces.jsonl` grows indefinitely with no compaction or TTL; all reads scan the full file.
+- **LLM prompt/response not captured**: `trace_steps` records timing and routing decisions but not the raw prompts sent to or responses received from the LLM.
+- **FastAPI CORS locked to localhost**: the `allow_origins` list in `app/api/main.py` includes only `http://localhost:5173`; a deployed frontend would require updating this.
