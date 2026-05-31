@@ -93,9 +93,10 @@ mcp_server.py    # FastMCP server — GitHub pipeline tools + risk trace tools
 
 web/             # Vite + React + TypeScript trace viewer
   src/
-    App.tsx      # Two-pane trace list / detail UI
-    api.ts       # Typed fetch wrappers for FastAPI endpoints
-    types.ts     # TraceSummary, TraceDetail, TraceStep interfaces
+    App.tsx        # Two-pane trace list / detail UI
+    api.ts         # Fetch wrappers; parse responses through Zod schemas before returning
+    types.ts       # Zod schemas (TraceSummary, TraceDetail, TraceStep); TypeScript types inferred from schemas
+    types.test.ts  # Vitest contract tests: valid payloads pass, malformed payloads throw at schema boundary
 ```
 
 ---
@@ -300,6 +301,49 @@ Start with: `uv run uvicorn app.api.main:app --reload`
 
 ---
 
+## API Contract Enforcement
+
+The boundary between the FastAPI backend and the React frontend is treated as an explicit contract enforcement point. Every API response is validated against a declared schema at the moment it crosses that boundary, before it reaches any React component.
+
+### Response validation flow
+
+```
+FastAPI
+   ↓
+JSON Response (untyped bytes)
+   ↓
+Zod Runtime Validation          ← enforced in web/src/api.ts
+   ↓
+Typed React Components
+```
+
+### Compile-time vs runtime contracts
+
+TypeScript interfaces describe the shape a developer *intends* a value to have. They are erased at compile time and cannot detect divergence between what the backend serializes and what the frontend expects to receive.
+
+Runtime contracts — schemas enforced as data crosses a system boundary — catch actual payload deviations: renamed fields, changed types, dropped array elements, unexpected nulls, or string-encoded numbers. In a system where the backend is Python and the frontend is TypeScript, no compiler bridges that gap. The two type systems are independent; only an executable check at the wire boundary provides a guarantee.
+
+For a system with multiple autonomous components, this distinction is operationally significant. The LangGraph agent, the risk trace store, the FastAPI serializer, and the React viewer each carry their own data model. A change to how `trace_steps` are written in `risk_trace_store.py` will not produce a TypeScript error in `web/src/types.ts`. Without a runtime contract, that divergence surfaces silently as a render failure or incorrect data in the UI. Executable schemas at system boundaries convert silent drift into loud, located errors with field-level diagnostics.
+
+### Design Decision
+
+**Problem**: Trace records flow through the LangGraph agent, the risk trace store, FastAPI JSON serialization, and HTTP fetch parsing before reaching React components. Any layer can change — through a backend refactor, a newly optional field, or a serialization edge case — without triggering a compile error in the frontend. The distance between the backend Python data model and the frontend TypeScript types is invisible to the build system.
+
+**Decision**: Define the frontend's expected shape as executable Zod schemas in `web/src/types.ts`. Derive TypeScript types from those schemas using `z.infer<>`, so the compile-time and runtime representations share a single definition and cannot drift from each other. In `web/src/api.ts`, parse every API response through its schema before returning it to the caller. Failures throw `ZodError` with the field path and expected type, surfacing contract violations at the boundary rather than inside component logic.
+
+**Benefits**:
+- Contract violations are located at the API boundary, not buried in render or display logic
+- Error messages name the specific field path and the type mismatch, which shortens diagnosis across Python/TypeScript component boundaries
+- TypeScript types cannot diverge from what is actually validated — one definition produces both
+- Schemas are testable in isolation: representative and malformed payloads can be asserted against without starting the backend (`web/src/types.test.ts`)
+- Governed and observable: when a backend field changes, the failure is explicit, repeatable, and attributable
+
+**Tradeoffs**:
+- Parse cost per response: negligible at this payload size; a concern only if response volume grows significantly
+- Unknown keys are silently stripped by default. If the backend adds a field before the schema is updated, that field is discarded rather than forwarded. Use `.passthrough()` to preserve unknown keys; use `.strict()` to reject them and enforce a tighter contract
+
+---
+
 ## React Trace Viewer
 
 `web/` is a Vite + React + TypeScript app. Start with `cd web && npm run dev`.
@@ -311,28 +355,33 @@ Two-pane split:
 - **Left pane** — `TraceList`: shows all traces from `GET /api/traces`. Each row displays `alert_id`, `final_status` badge, `run_duration_ms`, and `created_at`. Clicking a row loads the detail pane.
 - **Right pane** — `TraceDetailPanel`: shows headline, full metadata, node sequence with per-node timing (slowest node highlighted), decisions table, error table if any, and the explanation text from `GET /api/traces/{id}/explanation`.
 
-### TypeScript Interfaces (`src/types.ts`)
+### Schemas and Types (`src/types.ts`)
 
-```typescript
-interface TraceSummary {
-  alert_id, trace_id, headline, final_status, created_at, run_duration_ms
-}
+The file defines four Zod schemas. TypeScript types are inferred from the schemas via `z.infer<>`, so the compile-time type and the runtime validator share a single definition.
 
-interface TraceStep {
-  node_name, started_at, ended_at, duration_ms
-  decision?: string   // present on "decide" and "validate" nodes
-  error?: string      // present when analyze node fails to parse LLM output
-}
+| Schema | Validates |
+|---|---|
+| `TraceSummarySchema` | One row in the `GET /api/traces` list response |
+| `TraceStepSchema` | One entry in `trace_steps`; `decision` and `error` are optional |
+| `TraceDetailSchema` | Full `GET /api/traces/{id}` response, including the `trace_steps` array |
+| `ExplanationResponseSchema` | `GET /api/traces/{id}/explanation` wrapper `{ explanation: string }` |
 
-interface TraceDetail extends TraceSummary {
-  tool_decision, supplier, risk_type, risk_level, change_type
-  trace_steps: TraceStep[]
-}
-```
+Exported types (`TraceSummary`, `TraceStep`, `TraceDetail`) are derived from the schemas and used throughout `App.tsx`.
 
 ### Data Fetching (`src/api.ts`)
 
-Three typed fetch wrappers: `fetchTraces()`, `fetchTraceDetail(identifier)`, `fetchExplanation(identifier)`. All target `http://localhost:8000`.
+Three fetch wrappers: `fetchTraces()`, `fetchTraceDetail(identifier)`, `fetchExplanation(identifier)`. All target `http://localhost:8000`. Each wrapper parses the HTTP response body through its Zod schema before returning; a `ZodError` is thrown if the payload does not conform. See [API Contract Enforcement](#api-contract-enforcement) for the rationale.
+
+### Contract Tests (`src/types.test.ts`)
+
+Vitest unit tests exercise the schemas directly, without a running backend. The test suite verifies:
+
+- Representative valid payloads for `GET /api/traces` and `GET /api/traces/{id}` parse successfully
+- `run_duration_ms` returned as a string (a common Python serialization edge case) throws at the schema boundary
+- A `trace_steps` item missing a required field (`duration_ms`) throws at the schema boundary
+- `trace_steps: null` throws, catching the case where an array field is changed to a nullable scalar
+
+Run with: `cd web && npm test`
 
 ---
 
