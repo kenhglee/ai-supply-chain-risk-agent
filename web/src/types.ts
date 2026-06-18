@@ -1,5 +1,12 @@
 import { z } from 'zod';
 
+export const PromptMetadataSchema = z.object({
+  prompt_id: z.string(),
+  prompt_version: z.string(),
+  prompt_status: z.string(),
+  prompt_description: z.string(),
+});
+
 export const TraceSummarySchema = z.object({
   alert_id: z.string().nullable(),
   trace_id: z.string().nullable(),
@@ -31,6 +38,7 @@ export const TraceDetailSchema = z.object({
   risk_level: z.string().nullable(),
   change_type: z.string().nullable(),
   trace_steps: z.array(TraceStepSchema),
+  prompt_metadata: z.array(PromptMetadataSchema).optional(),
 });
 
 export const ExplanationResponseSchema = z.object({
@@ -40,3 +48,4 @@ export const ExplanationResponseSchema = z.object({
 export type TraceSummary = z.infer<typeof TraceSummarySchema>;
 export type TraceStep = z.infer<typeof TraceStepSchema>;
 export type TraceDetail = z.infer<typeof TraceDetailSchema>;
+export type PromptMetadata = z.infer<typeof PromptMetadataSchema>;

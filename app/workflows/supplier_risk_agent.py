@@ -18,6 +18,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from app.ingestion.rss_ingestion import load_headlines_from_rss
 from app.storage.risk_trace_store import append_risk_trace
+from app.prompt_registry import get_prompt
 
 logger = logging.getLogger()
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -595,6 +596,9 @@ graph_edges = load_graph_edges()
 vectorstore = load_vectorstore()
 # ---- Model ----
 model = get_llm()
+# ---- Prompt Registry ----
+_triage_prompt = get_prompt("triage_agent")
+_risk_prompt = get_prompt("risk_classifier")
 
 
 # ---- Trace helper ----
@@ -637,21 +641,10 @@ def decide_tool_use(state: RiskState) -> RiskState:
     headline = state["headline"]
     suppliers = state["candidate_suppliers"]
 
-    prompt = f"""
-            You are a supply chain risk analyst.
-
-            Headline:
-            {headline}
-
-            Candidate suppliers:
-            {", ".join(suppliers) if suppliers else "None"}
-
-            Decide whether supplier-context retrieval is needed before risk analysis.
-
-            Return exactly one word:
-            - retrieve
-            - skip
-            """
+    prompt = _triage_prompt.template.format(
+        headline=headline,
+        suppliers=", ".join(suppliers) if suppliers else "None",
+    )
 
     response = model.invoke(prompt)
     raw_text = model_text(response)
@@ -707,42 +700,11 @@ def analyze_risk(state: RiskState) -> RiskState:
     candidate_suppliers = state["candidate_suppliers"]
     context = state["context"] or "No additional context retrieved."
 
-    prompt = f"""
-    You are a supply chain risk analyst.
-
-    Headline:
-    {headline}
-
-    Candidate suppliers:
-    {", ".join(candidate_suppliers) if candidate_suppliers else "None"}
-
-    Relevant supplier context:
-    {context}
-
-    Return ONLY valid JSON with this exact schema:
-
-    {{
-        "status": "ok" or "inconclusive",
-        "supplier": string or null,
-        "risk_type": string or null,
-        "risk_level": "High" or "Medium" or "Low" or null,
-        "impact": string,
-        "recommended_action": string,
-        "relevant_supplier_context": string
-    }}
-
-    Rules:
-    - Risk_type should be a short normalized label such as earthquake, flood, strike, sanctions, outage, export_controls
-    - If at least one candidate supplier is provided and the retrieved context is relevant, use status = "ok".
-    - If no supplier is clearly relevant, use status = "inconclusive".
-    - If status = "inconclusive":
-        - supplier must be null
-        - risk_level must be null
-        - impact must explain that no clearly relevant supplier could be identified
-        - recommended_action must focus on monitoring or gathering more supplier-specific information
-        - do not speculate about concrete supplier impact
-    - Do not include any text outside the JSON.
-    """
+    prompt = _risk_prompt.template.format(
+        headline=headline,
+        candidate_suppliers=", ".join(candidate_suppliers) if candidate_suppliers else "None",
+        context=context,
+    )
 
     response = model.invoke(prompt)
     raw_text = model_text(response)
@@ -953,6 +915,20 @@ def process_alert_row(row: dict, risk_store) -> dict:
         "risk_level": alert.get("risk_level"),
         "change_type": change_type,
         "trace_steps": result.get("trace_steps", []),
+        "prompt_metadata": [
+            {
+                "prompt_id": _triage_prompt.prompt_id,
+                "prompt_version": _triage_prompt.version,
+                "prompt_status": _triage_prompt.status,
+                "prompt_description": _triage_prompt.description,
+            },
+            {
+                "prompt_id": _risk_prompt.prompt_id,
+                "prompt_version": _risk_prompt.version,
+                "prompt_status": _risk_prompt.status,
+                "prompt_description": _risk_prompt.description,
+            },
+        ],
     })
 
     return {

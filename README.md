@@ -506,6 +506,76 @@ Previously processed headlines are stored in seen_headlines.json.
 
 This prevents duplicate processing across runs while keeping the system self-contained and free of external infrastructure.
 
+## Prompt Registry
+
+LLM prompts are versioned and stored as JSON files under `prompts/`, separate from application code.
+
+### Where prompts live
+
+```text
+prompts/
+├── risk_classifier/
+│   └── v1.json        ← analyzes a headline and returns a structured risk alert
+└── triage_agent/
+    └── v1.json        ← decides whether supplier-context retrieval is needed
+```
+
+Each file follows this schema:
+
+```json
+{
+  "prompt_id": "risk_classifier",
+  "version": "v1",
+  "status": "approved",
+  "owner": "Ken Hyounggon Lee",
+  "created_at": "2026-06-18",
+  "description": "...",
+  "template": "..."
+}
+```
+
+Templates use Python `str.format()` placeholders (`{headline}`, `{candidate_suppliers}`, `{context}`, `{suppliers}`). Literal `{` and `}` in JSON schema examples are escaped as `{{` and `}}`.
+
+### How to add a new prompt version
+
+1. Create a new file, e.g. `prompts/risk_classifier/v2.json`, with `"status": "draft"`.
+2. Iterate on the template and test it.
+3. Set `"status": "approved"` when ready.
+4. The registry automatically selects the latest approved version by numeric suffix (`v2` > `v1`).
+
+### How approval status works
+
+The registry only loads a prompt automatically (when no version is specified) if its `status` is `"approved"`. A `"draft"` or other status is never selected by default. This prevents untested prompts from reaching production. You can still load a specific draft version explicitly:
+
+```python
+from app.prompt_registry import get_prompt
+
+record = get_prompt("risk_classifier", version="v2")
+```
+
+### How prompt metadata appears in traces
+
+Each risk trace written to `app/storage/risk_traces.jsonl` includes a `prompt_metadata` field listing the prompt(s) used:
+
+```json
+"prompt_metadata": [
+  {
+    "prompt_id": "triage_agent",
+    "prompt_version": "v1",
+    "prompt_status": "approved",
+    "prompt_description": "Decides whether supplier-context retrieval is needed..."
+  },
+  {
+    "prompt_id": "risk_classifier",
+    "prompt_version": "v1",
+    "prompt_status": "approved",
+    "prompt_description": "Analyzes a supply chain headline and returns a structured JSON risk alert..."
+  }
+]
+```
+
+The `/api/traces/{identifier}/explanation` endpoint also includes this information in the human-readable explanation text.
+
 ## Future Improvements
 
 - Expanded supplier and dependency graph

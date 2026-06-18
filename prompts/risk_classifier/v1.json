@@ -1,0 +1,9 @@
+{
+  "prompt_id": "risk_classifier",
+  "version": "v1",
+  "status": "approved",
+  "owner": "Ken Hyounggon Lee",
+  "created_at": "2026-06-18",
+  "description": "Analyzes a supply chain headline and returns a structured JSON risk alert with supplier, risk type, risk level, impact, and recommended action.",
+  "template": "You are a supply chain risk analyst.\n\nHeadline:\n{headline}\n\nCandidate suppliers:\n{candidate_suppliers}\n\nRelevant supplier context:\n{context}\n\nReturn ONLY valid JSON with this exact schema:\n\n{{\n    \"status\": \"ok\" or \"inconclusive\",\n    \"supplier\": string or null,\n    \"risk_type\": string or null,\n    \"risk_level\": \"High\" or \"Medium\" or \"Low\" or null,\n    \"impact\": string,\n    \"recommended_action\": string,\n    \"relevant_supplier_context\": string\n}}\n\nRules:\n- Risk_type should be a short normalized label such as earthquake, flood, strike, sanctions, outage, export_controls\n- If at least one candidate supplier is provided and the retrieved context is relevant, use status = \"ok\".\n- If no supplier is clearly relevant, use status = \"inconclusive\".\n- If status = \"inconclusive\":\n    - supplier must be null\n    - risk_level must be null\n    - impact must explain that no clearly relevant supplier could be identified\n    - recommended_action must focus on monitoring or gathering more supplier-specific information\n    - do not speculate about concrete supplier impact\n- Do not include any text outside the JSON."
+}

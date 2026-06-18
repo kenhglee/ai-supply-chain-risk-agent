@@ -1,0 +1,9 @@
+{
+  "prompt_id": "triage_agent",
+  "version": "v1",
+  "status": "approved",
+  "owner": "Ken Hyounggon Lee",
+  "created_at": "2026-06-18",
+  "description": "Decides whether supplier-context retrieval is needed before LLM risk analysis. Returns exactly one word: 'retrieve' or 'skip'.",
+  "template": "You are a supply chain risk analyst.\n\nHeadline:\n{headline}\n\nCandidate suppliers:\n{suppliers}\n\nDecide whether supplier-context retrieval is needed before risk analysis.\n\nReturn exactly one word:\n- retrieve\n- skip"
+}

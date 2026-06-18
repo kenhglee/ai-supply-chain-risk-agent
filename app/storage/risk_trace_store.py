@@ -89,4 +89,17 @@ def build_trace_explanation(record: dict) -> str:
             for node, error in errors:
                 lines.append(f"  {node:<10} → {error}")
 
+    prompt_meta = record.get("prompt_metadata")
+    if prompt_meta:
+        lines.append("")
+        lines.append("Prompts:")
+        for p in prompt_meta:
+            pid = p.get("prompt_id", "?")
+            ver = p.get("prompt_version", "?")
+            status = p.get("prompt_status", "?")
+            desc = p.get("prompt_description", "")
+            lines.append(f"  {pid} {ver} ({status})")
+            if desc:
+                lines.append(f"    {desc}")
+
     return "\n".join(lines)
