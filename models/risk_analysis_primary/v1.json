@@ -1,0 +1,11 @@
+{
+  "model_id": "risk_analysis_primary",
+  "version": "v1",
+  "status": "approved",
+  "owner": "Ken Hyounggon Lee",
+  "created_at": "2026-06-18",
+  "description": "Primary model for supply chain risk classification. Receives a headline, candidate suppliers, and retrieved context; returns a structured JSON risk alert.",
+  "provider": "openai",
+  "model_name": "gpt-4o-mini",
+  "use_case": "risk_classification"
+}

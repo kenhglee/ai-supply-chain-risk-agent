@@ -102,4 +102,19 @@ def build_trace_explanation(record: dict) -> str:
             if desc:
                 lines.append(f"    {desc}")
 
+    model_meta = record.get("model_metadata")
+    if model_meta:
+        lines.append("")
+        lines.append("Models:")
+        for m in model_meta:
+            mid = m.get("model_id", "?")
+            ver = m.get("model_version", "?")
+            status = m.get("model_status", "?")
+            provider = m.get("model_provider", "?")
+            name = m.get("model_name", "?")
+            desc = m.get("model_description", "")
+            lines.append(f"  {mid} {ver} ({status})  [{provider}/{name}]")
+            if desc:
+                lines.append(f"    {desc}")
+
     return "\n".join(lines)

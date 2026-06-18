@@ -19,6 +19,7 @@ from langchain_core.documents import Document
 from app.ingestion.rss_ingestion import load_headlines_from_rss
 from app.storage.risk_trace_store import append_risk_trace
 from app.prompt_registry import get_prompt
+from app.model_registry import get_model, ModelRecord, ModelRuntime, resolve_model_runtime
 
 logger = logging.getLogger()
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -488,23 +489,25 @@ def infer_candidate_suppliers_from_graph(headline: str, graph_edges, supplier_al
     return list(candidate_suppliers)
 
 
-def get_llm():
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+def get_llm(model_record: ModelRecord):
+    """Build a LangChain LLM from a ModelRecord.
 
-    if provider == "openai":
-        return ChatOpenAI(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            temperature=0.2,
-        )
+    Delegates to resolve_model_runtime() so LLM construction and trace metadata
+    are guaranteed to use identical provider/model values.
+    """
+    rt = resolve_model_runtime(model_record)
 
-    elif provider == "bedrock":
+    if rt.runtime_provider == "openai":
+        return ChatOpenAI(model=rt.runtime_model_name, temperature=0.2)
+
+    if rt.runtime_provider == "bedrock":
         return ChatBedrockConverse(
-            model=os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            model=rt.runtime_model_name,
             region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
             temperature=0.2,
         )
 
-    raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+    raise ValueError(f"Unsupported LLM_PROVIDER: '{rt.runtime_provider}'")
 
 
 def make_pk(supplier: str, risk_type: str) -> str:
@@ -594,8 +597,15 @@ risk_table = dynamodb.Table("supplier_risk_state")
 graph_edges = load_graph_edges()
 # ---- Vectorstore ----
 vectorstore = load_vectorstore()
-# ---- Model ----
-model = get_llm()
+# ---- Model Registry ----
+_triage_model_record = get_model("triage_primary")
+_risk_model_record = get_model("risk_analysis_primary")
+# ---- Runtime Resolution (captures env overrides once at startup) ----
+_triage_runtime = resolve_model_runtime(_triage_model_record)
+_risk_runtime = resolve_model_runtime(_risk_model_record)
+# ---- Models ----
+_triage_llm = get_llm(_triage_model_record)
+_risk_llm = get_llm(_risk_model_record)
 # ---- Prompt Registry ----
 _triage_prompt = get_prompt("triage_agent")
 _risk_prompt = get_prompt("risk_classifier")
@@ -646,7 +656,7 @@ def decide_tool_use(state: RiskState) -> RiskState:
         suppliers=", ".join(suppliers) if suppliers else "None",
     )
 
-    response = model.invoke(prompt)
+    response = _triage_llm.invoke(prompt)
     raw_text = model_text(response)
     decision = raw_text.strip().lower()
 
@@ -706,7 +716,7 @@ def analyze_risk(state: RiskState) -> RiskState:
         context=context,
     )
 
-    response = model.invoke(prompt)
+    response = _risk_llm.invoke(prompt)
     raw_text = model_text(response)
 
     try:
@@ -927,6 +937,30 @@ def process_alert_row(row: dict, risk_store) -> dict:
                 "prompt_version": _risk_prompt.version,
                 "prompt_status": _risk_prompt.status,
                 "prompt_description": _risk_prompt.description,
+            },
+        ],
+        "model_metadata": [
+            {
+                "model_id": _triage_runtime.model_id,
+                "model_version": _triage_runtime.model_version,
+                "model_status": _triage_runtime.model_status,
+                "model_provider": _triage_runtime.model_provider,
+                "model_name": _triage_runtime.model_name,
+                "model_description": _triage_runtime.model_description,
+                "runtime_provider": _triage_runtime.runtime_provider,
+                "runtime_model_name": _triage_runtime.runtime_model_name,
+                "runtime_overridden": _triage_runtime.runtime_overridden,
+            },
+            {
+                "model_id": _risk_runtime.model_id,
+                "model_version": _risk_runtime.model_version,
+                "model_status": _risk_runtime.model_status,
+                "model_provider": _risk_runtime.model_provider,
+                "model_name": _risk_runtime.model_name,
+                "model_description": _risk_runtime.model_description,
+                "runtime_provider": _risk_runtime.runtime_provider,
+                "runtime_model_name": _risk_runtime.runtime_model_name,
+                "runtime_overridden": _risk_runtime.runtime_overridden,
             },
         ],
     })

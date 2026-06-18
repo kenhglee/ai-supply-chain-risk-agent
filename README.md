@@ -506,6 +506,92 @@ Previously processed headlines are stored in seen_headlines.json.
 
 This prevents duplicate processing across runs while keeping the system self-contained and free of external infrastructure.
 
+## Model Registry
+
+LLM model configurations are versioned and stored as JSON files under `models/`, following the same governance pattern as the Prompt Registry.
+
+### Where model definitions live
+
+```text
+models/
+├── risk_analysis_primary/
+│   └── v1.json        ← model used in the risk classification (analyze_risk) node
+└── triage_primary/
+    └── v1.json        ← model used in the triage decision (decide_tool_use) node
+```
+
+Each file follows this schema:
+
+```json
+{
+  "model_id": "risk_analysis_primary",
+  "version": "v1",
+  "status": "approved",
+  "owner": "Ken Hyounggon Lee",
+  "created_at": "2026-06-18",
+  "description": "Primary model for supply chain risk classification.",
+  "provider": "openai",
+  "model_name": "gpt-4o-mini",
+  "use_case": "risk_classification"
+}
+```
+
+### Approval workflow
+
+The same approval gate from the Prompt Registry applies here. Only versions with `"status": "approved"` are loaded automatically. A `"draft"` or `"pending"` version is never selected by default:
+
+```python
+from app.model_registry import get_model
+
+# Production: loads the latest approved version
+record = get_model("risk_analysis_primary")
+
+# Development / testing: load a specific draft without the approval check
+record = get_model("risk_analysis_primary", version="v2", require_approved=False)
+```
+
+### Version management
+
+Add a new model version by creating a new file, e.g. `models/risk_analysis_primary/v2.json`, with `"status": "draft"`. Validate it, then set `"status": "approved"` to promote it. The registry automatically selects the highest-numbered approved version (`v2` > `v1`).
+
+### Relationship to Prompt Registry
+
+The Model Registry and Prompt Registry are independent but complementary. Each LangGraph node draws from both:
+
+| Node | Prompt | Model |
+|---|---|---|
+| `decide_tool_use` | `triage_agent` | `triage_primary` |
+| `analyze_risk` | `risk_classifier` | `risk_analysis_primary` |
+
+The `LLM_PROVIDER` env var overrides the registry's `provider` field (for Bedrock deployments). `OPENAI_MODEL` and `BEDROCK_MODEL_ID` override the registry's `model_name` field. When neither env var is set, the registry is the sole source of truth.
+
+### How model metadata appears in traces
+
+Each risk trace in `app/storage/risk_traces.jsonl` includes a `model_metadata` field:
+
+```json
+"model_metadata": [
+  {
+    "model_id": "triage_primary",
+    "model_version": "v1",
+    "model_status": "approved",
+    "model_provider": "openai",
+    "model_name": "gpt-4o-mini",
+    "model_description": "Primary model for triage decisions..."
+  },
+  {
+    "model_id": "risk_analysis_primary",
+    "model_version": "v1",
+    "model_status": "approved",
+    "model_provider": "openai",
+    "model_name": "gpt-4o-mini",
+    "model_description": "Primary model for supply chain risk classification..."
+  }
+]
+```
+
+The `/api/traces/{identifier}/explanation` endpoint also includes this in the human-readable explanation text.
+
 ## Prompt Registry
 
 LLM prompts are versioned and stored as JSON files under `prompts/`, separate from application code.

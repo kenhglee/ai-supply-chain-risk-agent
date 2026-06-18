@@ -1,0 +1,11 @@
+{
+  "model_id": "triage_primary",
+  "version": "v1",
+  "status": "approved",
+  "owner": "Ken Hyounggon Lee",
+  "created_at": "2026-06-18",
+  "description": "Primary model for triage decisions. Decides whether supplier-context retrieval is needed before risk analysis; returns 'retrieve' or 'skip'.",
+  "provider": "openai",
+  "model_name": "gpt-4o-mini",
+  "use_case": "triage"
+}

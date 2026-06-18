@@ -7,6 +7,18 @@ export const PromptMetadataSchema = z.object({
   prompt_description: z.string(),
 });
 
+export const ModelMetadataSchema = z.object({
+  model_id: z.string(),
+  model_version: z.string(),
+  model_status: z.string(),
+  model_provider: z.string(),
+  model_name: z.string(),
+  model_description: z.string(),
+  runtime_provider: z.string().optional(),
+  runtime_model_name: z.string().optional(),
+  runtime_overridden: z.boolean().optional(),
+});
+
 export const TraceSummarySchema = z.object({
   alert_id: z.string().nullable(),
   trace_id: z.string().nullable(),
@@ -39,6 +51,7 @@ export const TraceDetailSchema = z.object({
   change_type: z.string().nullable(),
   trace_steps: z.array(TraceStepSchema),
   prompt_metadata: z.array(PromptMetadataSchema).optional(),
+  model_metadata: z.array(ModelMetadataSchema).optional(),
 });
 
 export const ExplanationResponseSchema = z.object({
@@ -49,3 +62,4 @@ export type TraceSummary = z.infer<typeof TraceSummarySchema>;
 export type TraceStep = z.infer<typeof TraceStepSchema>;
 export type TraceDetail = z.infer<typeof TraceDetailSchema>;
 export type PromptMetadata = z.infer<typeof PromptMetadataSchema>;
+export type ModelMetadata = z.infer<typeof ModelMetadataSchema>;
