@@ -506,6 +506,88 @@ Previously processed headlines are stored in seen_headlines.json.
 
 This prevents duplicate processing across runs while keeping the system self-contained and free of external infrastructure.
 
+## Evaluation Dataset
+
+A curated golden set and lightweight regression harness lives in `evals/`. Run it before promoting a new prompt or model version.
+
+### Where eval cases live
+
+```text
+evals/
+└── risk_classifier/
+    └── golden_set_v1.jsonl    ← 15 curated cases covering all major risk categories
+```
+
+Each line is a JSON object:
+
+```json
+{
+  "eval_id": "risk-001",
+  "headline": "Magnitude 7.4 earthquake strikes Hualien, Taiwan...",
+  "candidate_suppliers": ["TSMC"],
+  "context": "TSMC is a Taiwan-based semiconductor foundry...",
+  "expected": {
+    "status": "ok",
+    "supplier": "TSMC",
+    "risk_type": "earthquake",
+    "risk_level": "High",
+    "must_include_terms": ["TSMC", "earthquake"]
+  }
+}
+```
+
+The golden set covers: clear supplier risk · ambiguous supplier mention · no relevant supplier · sanctions / export controls · logistics disruption · cyber / software dependency · outage · low / medium / high risk examples.
+
+### How to run the eval
+
+```bash
+# Live mode (requires OPENAI_API_KEY or Bedrock credentials):
+uv run python -m app.evaluation.risk_classifier_eval
+
+# Mock mode — deterministic outputs, no credentials required:
+uv run python -m app.evaluation.risk_classifier_eval --mock
+
+# Custom dataset:
+uv run python -m app.evaluation.risk_classifier_eval --dataset path/to/cases.jsonl
+```
+
+Exit code 0 if all cases pass; non-zero if any fail.
+
+### What metrics are reported
+
+| Metric | Description |
+|---|---|
+| Pass rate | Fraction of cases where all five fields matched |
+| Status accuracy | Fraction where `ok` vs `inconclusive` matched |
+| Supplier accuracy | Fraction where the supplier name matched (case-insensitive) |
+| Risk type accuracy | Fraction where normalized risk type matched |
+| Risk level accuracy | Fraction where `High` / `Medium` / `Low` matched |
+
+A failure report lists each failing case with the expected vs actual value for each mismatched field.
+
+The report header includes the prompt and model registry metadata used for the run:
+
+```text
+Registry
+  prompt_id:          risk_classifier
+  prompt_version:     v1
+  model_id:           risk_analysis_primary
+  model_version:      v1
+  runtime_provider:   openai
+  runtime_model_name: gpt-4o-mini
+```
+
+### How this supports prompt / model promotion governance
+
+Before changing `status` from `"draft"` to `"approved"` on a new prompt or model version:
+
+1. Add a new version file under `prompts/risk_classifier/` or `models/risk_analysis_primary/`.
+2. Load it with `require_approved=False` and point the evaluator at it (env var or registry version override).
+3. Run the eval harness and review the report.
+4. If pass rate meets the acceptance threshold, set `"status": "approved"` to promote it.
+
+The eval harness enforces no specific pass threshold — that decision belongs to the team — but the report provides all the signal needed to make it.
+
 ## Model Registry
 
 LLM model configurations are versioned and stored as JSON files under `models/`, following the same governance pattern as the Prompt Registry.
