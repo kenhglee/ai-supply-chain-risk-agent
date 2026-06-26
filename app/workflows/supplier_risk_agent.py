@@ -13,10 +13,9 @@ from typing import TypedDict, List, Optional, Literal
 from dotenv import load_dotenv, find_dotenv
 from langchain_aws import ChatBedrockConverse
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
+from langchain_openai import ChatOpenAI
 from app.ingestion.rss_ingestion import load_headlines_from_rss
+from app.retrieval.retriever import get_retriever
 from app.storage.risk_trace_store import append_risk_trace
 from app.prompt_registry import get_prompt
 from app.model_registry import get_model, ModelRecord, ModelRuntime, resolve_model_runtime
@@ -227,22 +226,6 @@ def save_seen_headlines(seen: set):
 def load_graph_edges(path: Path = GRAPH_FILE):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def load_vectorstore(path: Path = PROFILES_FILE):
-    with open(path, "r", encoding="utf-8") as f:
-        profiles = json.load(f)
-
-    docs = [
-        Document(
-            page_content=item["profile"],
-            metadata={"supplier": item["supplier"]}
-        )
-        for item in profiles
-    ]
-
-    embeddings = OpenAIEmbeddings()
-    return FAISS.from_documents(docs, embeddings)
 
 
 def bootstrap_alerts_csv_from_rss(alerts_file: Path = ALERT_FILE) -> int:
@@ -595,8 +578,17 @@ risk_table = dynamodb.Table("supplier_risk_state")
 
 # ---- Graph ----
 graph_edges = load_graph_edges()
-# ---- Vectorstore ----
-vectorstore = load_vectorstore()
+# ---- Retriever ----
+_retriever = None
+
+
+def _get_retriever():
+    global _retriever
+    if _retriever is None:
+        _retriever = get_retriever(PROFILES_FILE)
+    return _retriever
+
+
 # ---- Model Registry ----
 _triage_model_record = get_model("triage_primary")
 _risk_model_record = get_model("risk_analysis_primary")
@@ -670,35 +662,23 @@ def decide_tool_use(state: RiskState) -> RiskState:
     }
 
 
-# ---- Node 3: retrieval tool step (mock for now) ----
+# ---- Node 3: retrieval ----
 def retrieve_context(state: RiskState) -> RiskState:
     t0 = time.time()
     headline = state["headline"]
     suppliers = state["candidate_suppliers"]
-    
+
     query_parts = [headline]
     if suppliers:
         query_parts.extend(suppliers)
-
     query = " ".join(query_parts)
-    docs = vectorstore.similarity_search(query, k=4)
 
-    # Prefer docs whose metadata supplier matches inferred suppliers
-    if suppliers:
-        filtered = [
-            d for d in docs
-            if d.metadata.get("supplier") in suppliers
-        ]
-        docs = filtered[:2] if filtered else docs[:2]
-    else:
-        docs = docs[:2]
-
-    context = "\n\n".join(doc.page_content for doc in docs) if docs else "No context found"
+    result = _get_retriever().retrieve(query, suppliers)
     print("-" * 50)
 
     return {
         **state,
-        "context": context,
+        "context": result.context,
         "trace_steps": record_trace_step(state["trace_steps"], "retrieve", t0),
     }
 
@@ -912,6 +892,7 @@ def process_alert_row(row: dict, risk_store) -> dict:
         state=risk_store,
     )
 
+    _r = _retriever  # None when retrieve node was skipped; instance otherwise
     append_risk_trace({
         "alert_id": alert_id,
         "trace_id": trace_id,
@@ -925,6 +906,16 @@ def process_alert_row(row: dict, risk_store) -> dict:
         "risk_level": alert.get("risk_level"),
         "change_type": change_type,
         "trace_steps": result.get("trace_steps", []),
+        "retriever_metadata": {
+            "retriever_id": _r.retriever_id if _r is not None else None,
+            "retriever_version": _r.retriever_version if _r is not None else None,
+            "embedding_provider": _r.embedding_provider if _r is not None else None,
+            "top_k": _r.top_k if _r is not None else None,
+            "latency_ms": next(
+                (s["duration_ms"] for s in result.get("trace_steps", []) if s["node_name"] == "retrieve"),
+                None,
+            ),
+        },
         "prompt_metadata": [
             {
                 "prompt_id": _triage_prompt.prompt_id,
