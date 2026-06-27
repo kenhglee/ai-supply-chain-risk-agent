@@ -41,6 +41,10 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 | `MAX_ALERTS_PER_RUN` | `1` | Limits LLM calls per run |
 | `GITHUB_WEBHOOK_SECRET` | — | Required for webhook handler signature verification |
 | `AWS_DEFAULT_REGION` | `us-west-2` | |
+| `TRACE_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |
+| `RISK_TRACES_TABLE` | `risk_traces` | DynamoDB table name for trace records |
+| `DECISION_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |
+| `RISK_DECISIONS_TABLE` | `risk_decisions` | DynamoDB table name for risk decisions |
 
 ## Architecture
 
