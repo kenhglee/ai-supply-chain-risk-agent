@@ -45,6 +45,9 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 | `RISK_TRACES_TABLE` | `risk_traces` | DynamoDB table name for trace records |
 | `DECISION_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |
 | `RISK_DECISIONS_TABLE` | `risk_decisions` | DynamoDB table name for risk decisions |
+| `RETRIEVER_PROVIDER` | `faiss` | `faiss` (default) or `bedrock_kb` |
+| `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
+| `BEDROCK_KB_TOP_K` | `4` | Number of KB results to request (bedrock_kb only) |
 
 ## Architecture
 
