@@ -165,14 +165,14 @@ infer → decide ──retrieve──► analyze → validate ──end──►
 |---|---|---|
 | `infer` | Maps headline to candidate suppliers via graph traversal and alias matching | timing only |
 | `decide` | LLM call — returns `"retrieve"` or `"skip"` | timing + decision |
-| `retrieve` | FAISS similarity search over `supplier_profiles.json` | timing only |
+| `retrieve` | Calls the configured retriever backend (FAISS or Bedrock KB) | timing only |
 | `analyze` | LLM call — returns structured JSON alert | timing; error if parse fails |
 | `validate` | Checks required fields; routes to `fallback` on failure | timing + `"valid"` or `"fallback"` |
 | `fallback` | Replaces alert with a safe `inconclusive` sentinel | timing only |
 
 Each node records its own `started_at`, `ended_at`, `duration_ms`, and optional `decision` / `error` into `state["trace_steps"]` before returning.
 
-**Module-level initialization**: `supplier_risk_agent.py` builds the FAISS index and instantiates the LLM at import time. `OPENAI_API_KEY` must be set even when `LLM_PROVIDER=bedrock` because `OpenAIEmbeddings` is always used for FAISS.
+**Module-level initialization**: `supplier_risk_agent.py` instantiates the LLM and retriever at import time. `OPENAI_API_KEY` is required when `RETRIEVER_PROVIDER=faiss` (the default), because `OpenAIEmbeddings` is used to build the FAISS index. It is not required when `RETRIEVER_PROVIDER=bedrock_kb`.
 
 ### Risk State Change Types
 
@@ -485,7 +485,7 @@ Two backends, selected by `RISK_STATE_BACKEND`:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `OPENAI_API_KEY` | — | Always required (used for FAISS embeddings even when `LLM_PROVIDER=bedrock`) |
+| `OPENAI_API_KEY` | — | Required when `RETRIEVER_PROVIDER=faiss` or `LLM_PROVIDER=openai`; not required on the Bedrock KB path |
 | `LLM_PROVIDER` | `openai` | `openai` or `bedrock` |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
 | `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID for Bedrock provider |
@@ -495,6 +495,15 @@ Two backends, selected by `RISK_STATE_BACKEND`:
 | `OUTPUT_MODE` | `csv` | `csv` (writes local files) or `lambda` (skips file writes) |
 | `MAX_ALERTS_PER_RUN` | `1` | Limits LLM calls per invocation |
 | `GITHUB_WEBHOOK_SECRET` | — | HMAC secret for GitHub webhook signature verification |
+| `RETRIEVER_PROVIDER` | `faiss` | `faiss` or `bedrock_kb` |
+| `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
+| `BEDROCK_KB_TOP_K` | `4` | Number of results to request from the KB |
+| `CORPUS_S3_BUCKET` | — | S3 bucket for supplier corpus (publish script) |
+| `CORPUS_S3_PREFIX` | `supplier-profiles/` | Key prefix within the corpus bucket |
+| `TRACE_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |
+| `RISK_TRACES_TABLE` | `risk_traces` | DynamoDB table name for trace records |
+| `DECISION_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |
+| `RISK_DECISIONS_TABLE` | `risk_decisions` | DynamoDB table name for risk decisions |
 | `AWS_DEFAULT_REGION` | `us-west-2` | AWS region for DynamoDB and Bedrock |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 
@@ -503,7 +512,7 @@ Two backends, selected by `RISK_STATE_BACKEND`:
 ## Current Limitations
 
 - **Hard-coded supplier set**: the knowledge base covers only TSMC, Murata, and Foxconn. Adding suppliers requires editing `supplier_graph.json`, `supplier_profiles.json`, and `SUPPLIER_ALIASES` in `supplier_risk_agent.py`.
-- **OPENAI_API_KEY always required**: `supplier_risk_agent.py` calls `OpenAIEmbeddings()` unconditionally at import time for the FAISS vectorstore, regardless of `LLM_PROVIDER`.
+- **OPENAI_API_KEY required on FAISS path**: `supplier_risk_agent.py` calls `OpenAIEmbeddings()` at import time when `RETRIEVER_PROVIDER=faiss` (the default). Set `RETRIEVER_PROVIDER=bedrock_kb` to eliminate this dependency.
 - **Module-level side effects**: the graph JSON, FAISS index, and LLM client are constructed at import time, making the module slow to load and difficult to test in isolation.
 - **Local file storage only**: `risk_decisions.jsonl`, `risk_traces.jsonl`, and `enriched_alerts.csv` are local files. They are not shared across Lambda instances and are lost on cold-start container recycling.
 - **`seen_headlines.json` grows unbounded**: no TTL or pruning.

@@ -85,7 +85,78 @@ flowchart TD
     C --> D["AI Assistant or Client"]
 ```
 
+### LangGraph Workflow (RSS Pipeline)
 
+The supplier risk agent is a six-node `StateGraph`:
+
+```
+infer → decide → [retrieve] → analyze → validate → [fallback] → END
+```
+
+| Node | Role |
+|---|---|
+| `infer` | Maps headline to candidate suppliers via graph traversal and alias matching |
+| `decide` | LLM call — returns `retrieve` or `skip` to gate context retrieval |
+| `retrieve` | Calls the configured retriever backend (FAISS or Bedrock KB) |
+| `analyze` | LLM call — returns a structured JSON risk alert |
+| `validate` | Checks required fields; routes to `fallback` on missing or weak output |
+| `fallback` | Replaces the alert with a safe `inconclusive` sentinel |
+
+**Prompt Registry** — prompts for `decide` and `analyze` are versioned JSON files under `prompts/`. Only `"status": "approved"` versions load automatically.
+
+**Model Registry** — LLM configurations are versioned JSON files under `models/`. The `LLM_PROVIDER` env var (`openai` or `bedrock`) overrides the registry's provider field at runtime.
+
+**Retriever abstraction** — the `retrieve` node calls `get_retriever()`, which returns either a `FaissRetriever` or a `BedrockKBRetriever` based on `RETRIEVER_PROVIDER`. The LangGraph node is unaware of the backend.
+
+**TraceStore / DecisionStore** — every agent run appends a structured trace record. Risk decisions from the GitHub pipeline are persisted to a separate store. Both support a JSONL backend (local/dev) and a DynamoDB backend (Lambda).
+
+## Retrieval Backends
+
+The `retrieve` node delegates to a retriever selected by the `RETRIEVER_PROVIDER` env var. Both backends satisfy the same duck-typed interface (`retriever_id`, `retriever_version`, `embedding_provider`, `top_k`, `retrieve(query, candidate_suppliers) → RetrieverResult`).
+
+### FAISS (default)
+
+`RETRIEVER_PROVIDER=faiss`
+
+Builds an in-process FAISS index from `app/storage/supplier_profiles.json` using OpenAI embeddings. Suitable for local development and experimentation. Requires `OPENAI_API_KEY`.
+
+### Bedrock Knowledge Base
+
+`RETRIEVER_PROVIDER=bedrock_kb`
+
+Delegates retrieval to an Amazon Bedrock Knowledge Base via the `bedrock-agent-runtime:Retrieve` API. The vector store backing the KB (Amazon S3 Vectors in the current deployment) is a Bedrock configuration detail — the application calls only the Retrieve API and is unaware of the storage backend.
+
+Supplier-filtered queries use the Bedrock metadata filter API (`{"in": {"key": "supplier", "value": [...]}}`) against `.metadata.json` sidecars uploaded alongside each profile.
+
+The class-level constant `embedding_provider = "bedrock_managed"` records in traces that the embedding model is managed by Bedrock, not by the application. `OPENAI_API_KEY` is not required on this path.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RETRIEVER_PROVIDER` | `faiss` | `faiss` or `bedrock_kb` |
+| `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
+| `BEDROCK_KB_TOP_K` | `4` | Number of results to request from the KB |
+
+## Storage Backends
+
+### TraceStore (`TRACE_STORE_BACKEND`)
+
+Every RSS pipeline run appends a structured record to the trace store. Records include per-node timing, routing decisions, LLM prompt/model metadata, and retriever metadata.
+
+| Backend | Value | Location |
+|---|---|---|
+| JSONL | `jsonl` (default) | `app/storage/risk_traces.jsonl` |
+| DynamoDB | `dynamodb` | Table named by `RISK_TRACES_TABLE` (default: `risk_traces`) |
+
+Use `jsonl` locally. Use `dynamodb` on Lambda (JSONL files are lost on cold-start container recycling).
+
+### DecisionStore (`DECISION_STORE_BACKEND`)
+
+GitHub pipeline risk decisions are persisted separately from supplier risk traces, reflecting their different data model and workflow.
+
+| Backend | Value | Location |
+|---|---|---|
+| JSONL | `jsonl` (default) | `app/storage/risk_decisions.jsonl` |
+| DynamoDB | `dynamodb` | Table named by `RISK_DECISIONS_TABLE` (default: `risk_decisions`) |
 
 ## Project Structure
 
@@ -93,15 +164,19 @@ flowchart TD
 app/
 ├── ingestion/
 │   ├── rss_ingestion.py
-│   └── github_webhook_receiver.py
+│   ├── github_webhook_receiver.py
+│   └── publish_supplier_corpus.py  # uploads supplier profiles to S3 for Bedrock KB
+├── retrieval/
+│   └── retriever.py                # FaissRetriever and BedrockKBRetriever; get_retriever() factory
 ├── workflows/
 │   ├── supplier_risk_agent.py
 │   └── github_risk_evaluator.py
 ├── storage/
 │   ├── supplier_graph.json
-│   └── supplier_profiles.json
-│   └── risk_state_store.py
-│   └── risk_decisions.jsonl  # (generated at runtime; not checked into git)
+│   ├── supplier_profiles.json
+│   ├── risk_state_store.py
+│   ├── risk_trace_store.py
+│   └── risk_decisions.jsonl        # (generated at runtime; not checked into git)
 
 handlers/
 ├── rss_handler/
@@ -109,13 +184,17 @@ handlers/
 └── github_webhook_handler/
     └── handler.py
 
-mcp_Server.py         # MCP server exposing risk tools
+scripts/
+└── integration_bedrock_kb.py  # live integration test for BedrockKBRetriever
+
+mcp_server.py         # MCP server exposing risk tools
 
 tests/
 ├── test_rss_locally.py
 ├── test_lambda_handler_locally.py
-└── test_github_webhook_locally.py
-└── test_mcp.py
+├── test_github_webhook_locally.py
+├── test_mcp.py
+└── test_bedrock_kb_retriever.py
 ```
 
 ## MCP Tools
@@ -170,11 +249,14 @@ A lightweight dependency graph links:
 
 This step identifies candidate suppliers potentially exposed to the event.
 
-**5. Vector retrieval (FAISS)**
+**5. Context retrieval**
 
-Supplier profiles are embedded and stored in a vector index.
+The `retrieve` node calls the configured retriever backend to fetch relevant supplier context.
 
-Using the headline and graph-inferred supplier candidates, the system retrieves the most relevant supplier context to ground the analysis.
+- **FAISS** (default): in-process similarity search over `supplier_profiles.json` using OpenAI embeddings.
+- **Bedrock Knowledge Base**: managed retrieval via the Bedrock Retrieve API, backed by Amazon S3 Vectors. Supplier-filtered using metadata sidecars. Does not require `OPENAI_API_KEY`.
+
+The candidate suppliers identified by graph inference are passed as a metadata filter, so retrieval is scoped to suppliers plausibly exposed to the event.
 
 **6. LangGraph workflow orchestration**
 
@@ -220,20 +302,25 @@ Each alert is compared with previously stored supplier risk state and labeled as
 - Headline deduplication across runs
 - Keyword-based disruption filtering
 - Graph-based supplier exposure inference
-- FAISS-based vector retrieval of supplier context
-- Supplier-specific grounding for risk analysis
-- LangGraph workflow orchestration with conditional routing
+- Retriever abstraction with two backends: FAISS (local/dev) and Bedrock Knowledge Base (managed AWS)
+- Supplier metadata filtering for scoped vector retrieval
+- LangGraph workflow orchestration with conditional routing (`infer → decide → retrieve → analyze → validate`)
+- Prompt Registry with versioned, approval-gated prompt files
+- Model Registry with versioned, approval-gated model configurations
 - Structured JSON risk alerts (supplier, risk level, impact, action)
 - Validation and fallback handling for weak or ambiguous signals
 - Persistent supplier risk state with duplicate suppression and escalation tracking
+- Risk trace observability with per-node timing, prompt metadata, model metadata, and retriever metadata
+- JSONL and DynamoDB storage backends for traces and decisions (`TRACE_STORE_BACKEND`, `DECISION_STORE_BACKEND`)
 
 ## Tech Stack
 
 - Python
-- OpenAI API
-- LangGraph
-- LangChain
-- FAISS (vector store)
+- LangGraph / LangChain
+- OpenAI API (LLM + FAISS embeddings on the local path)
+- Amazon Bedrock (LLM via `ChatBedrockConverse`; Knowledge Base retrieval)
+- Amazon S3 Vectors (vector store backend for the Bedrock Knowledge Base)
+- FAISS (in-process vector store for local/dev retrieval)
 - Feedparser
 - python-dotenv
 
@@ -263,9 +350,17 @@ uv add <package>
 Create a `.env` file:
 
 ```bash
+# Local development with OpenAI LLM and FAISS retriever
 OPENAI_API_KEY=your_key_here
 LLM_PROVIDER=openai
 RISK_STATE_BACKEND=csv
+RETRIEVER_PROVIDER=faiss
+
+# Bedrock LLM + Bedrock KB retriever (OPENAI_API_KEY not required)
+# LLM_PROVIDER=bedrock
+# BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+# RETRIEVER_PROVIDER=bedrock_kb
+# BEDROCK_KB_ID=<your-kb-id>
 ```
 
 Run the agent:
@@ -273,6 +368,31 @@ Run the agent:
 ```bash
 uv run python -m app.workflows.supplier_risk_agent
 ```
+
+### Environment Variables
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OPENAI_API_KEY` | — | Required when `RETRIEVER_PROVIDER=faiss` or `LLM_PROVIDER=openai` |
+| `LLM_PROVIDER` | `openai` | `openai` or `bedrock` |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
+| `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID for Bedrock provider |
+| `RETRIEVER_PROVIDER` | `faiss` | `faiss` or `bedrock_kb` |
+| `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
+| `BEDROCK_KB_TOP_K` | `4` | Number of results to request from the KB |
+| `CORPUS_S3_BUCKET` | — | S3 bucket for supplier corpus (used by publish script) |
+| `CORPUS_S3_PREFIX` | `supplier-profiles/` | Key prefix within the corpus bucket |
+| `RISK_STATE_BACKEND` | `csv` | `csv` or `dynamodb` |
+| `RISK_STATE_FILE` | `risk_state.csv` | Used when backend is `csv` |
+| `RISK_STATE_TABLE` | `supplier_risk_state` | DynamoDB table name |
+| `TRACE_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |
+| `RISK_TRACES_TABLE` | `risk_traces` | DynamoDB table name for trace records |
+| `DECISION_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |
+| `RISK_DECISIONS_TABLE` | `risk_decisions` | DynamoDB table name for risk decisions |
+| `OUTPUT_MODE` | `csv` | `csv` (local) or `lambda` (cloud) |
+| `MAX_ALERTS_PER_RUN` | `1` | Limits LLM calls per run |
+| `GITHUB_WEBHOOK_SECRET` | — | Required for webhook HMAC signature verification |
+| `AWS_DEFAULT_REGION` | `us-west-2` | AWS region for Bedrock and DynamoDB |
 
 ### Optional: Cloud Execution (AWS)
 
@@ -284,8 +404,12 @@ Example environment variables:
 OUTPUT_MODE=lambda
 LLM_PROVIDER=bedrock
 BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+RETRIEVER_PROVIDER=bedrock_kb
+BEDROCK_KB_ID=<your-kb-id>
 RISK_STATE_BACKEND=dynamodb
 RISK_STATE_TABLE=supplier_risk_state
+TRACE_STORE_BACKEND=dynamodb
+DECISION_STORE_BACKEND=dynamodb
 MAX_ALERTS_PER_RUN=1
 ```
 
@@ -357,6 +481,63 @@ Example Lambda Response
 ```
 
 This allows the agent to continuously monitor supplier-related news and maintain persistent risk state over time without requiring a long-running server.
+
+## Bedrock Knowledge Base Setup
+
+This section describes how to provision and populate the Bedrock Knowledge Base used by `RETRIEVER_PROVIDER=bedrock_kb`.
+
+### 1. Publish the supplier corpus to S3
+
+`app/ingestion/publish_supplier_corpus.py` transforms `supplier_profiles.json` into individually addressable S3 objects. Each supplier produces two files:
+
+- `supplier-profiles/TSMC.txt` — the profile text
+- `supplier-profiles/TSMC.txt.metadata.json` — `{"metadataAttributes": {"supplier": "TSMC"}}`
+
+The `.metadata.json` sidecars enable the Bedrock Retrieve API's supplier metadata filter. Without them, supplier-scoped retrieval returns no results.
+
+```bash
+CORPUS_S3_BUCKET=your-bucket \
+  CORPUS_S3_PREFIX=supplier-profiles/ \
+  python -m app.ingestion.publish_supplier_corpus
+```
+
+Publishing is idempotent (S3 PUT). Re-run whenever `supplier_profiles.json` changes.
+
+### 2. Sync the Knowledge Base
+
+After publishing, trigger KB re-indexing. This is a separate operational step — publishing and indexing have different owners and failure modes.
+
+```bash
+aws bedrock-agent start-ingestion-job \
+  --knowledge-base-id $BEDROCK_KB_ID \
+  --data-source-id $BEDROCK_KB_DATA_SOURCE_ID \
+  --region us-west-2
+```
+
+Wait for the ingestion job to reach `COMPLETE` status (typically under two minutes for three supplier profiles).
+
+### 3. Verify with the integration smoke test
+
+`scripts/integration_bedrock_kb.py` runs a live retrieval check against the provisioned KB. It is not part of the offline pytest suite — it requires live AWS resources and credentials.
+
+```bash
+# Full run: publish corpus, prompt for sync, then run assertions
+BEDROCK_KB_ID=<id> CORPUS_S3_BUCKET=<bucket> \
+  python scripts/integration_bedrock_kb.py
+
+# Skip publish/sync — re-run assertions against an already-synced KB
+BEDROCK_KB_ID=<id> CORPUS_S3_BUCKET=<bucket> \
+  python scripts/integration_bedrock_kb.py --skip-publish
+```
+
+The script verifies:
+- Filtered retrieval returns the correct supplier profile for TSMC, Murata, and Foxconn
+- Unfiltered retrieval returns non-empty context
+- `retriever_id`, `retriever_version`, and `embedding_provider` are correct
+
+### Vector store backend
+
+The current deployment uses **Amazon S3 Vectors** as the KB vector store (1024-dimensional float32 index, cosine distance, matching Amazon Titan Embed Text v2 defaults). This is a Bedrock configuration detail — the application calls only the `bedrock-agent-runtime:Retrieve` API and has no dependency on S3 Vectors directly.
 
 ## GitHub Webhook Integration
 
@@ -743,6 +924,26 @@ Each risk trace written to `app/storage/risk_traces.jsonl` includes a `prompt_me
 ```
 
 The `/api/traces/{identifier}/explanation` endpoint also includes this information in the human-readable explanation text.
+
+## Validation Status
+
+| Test | Status |
+|---|---|
+| Unit tests (`pytest tests/`) | Passing — all suites including `test_bedrock_kb_retriever.py` (12 tests, mock-based) |
+| Bedrock KB integration test (`scripts/integration_bedrock_kb.py --skip-publish`) | Passed — 4/4 assertions against live AWS resources |
+| End-to-end LangGraph run with `RETRIEVER_PROVIDER=bedrock_kb` | Passed — full `infer → decide → retrieve → analyze → validate` path executed |
+| `OPENAI_API_KEY` not required on Bedrock KB path | Confirmed — workflow ran without it when `LLM_PROVIDER=bedrock` and `RETRIEVER_PROVIDER=bedrock_kb` |
+
+Trace record from the end-to-end run confirmed:
+
+```json
+"retriever_metadata": {
+  "retriever_id": "bedrock_kb_supplier_profiles",
+  "retriever_version": "v1",
+  "embedding_provider": "bedrock_managed",
+  "top_k": 4
+}
+```
 
 ## Future Improvements
 
