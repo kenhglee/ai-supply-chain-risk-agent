@@ -14,6 +14,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.copilot.presentation import (
+    format_approval_confirmation,
+    format_monitor_briefing,
+    format_why_response,
+)
 from app.integrations.servicenow_mock import create_servicenow_ticket
 from app.storage.risk_state_store import save_risk_decision
 
@@ -24,6 +29,12 @@ COPILOT_LOG_FILE = STORAGE_DIR / "copilot_log.jsonl"
 
 RISK_RANK = {"Low": 1, "Medium": 2, "High": 3}
 TICKET_RISK_SCORE = {"High": 85, "Medium": 60, "Low": 30}
+REVIEW_APPROVED_DECISION = "review_approved"
+RECOMMENDED_ACTION = {
+    "High": "Escalate for manual review",
+    "Medium": "Monitor closely; review if signal count increases",
+    "Low": "Continue routine monitoring",
+}
 
 
 # ---- Data loading (reuses the same env vars / files as the RSS pipeline) ----
@@ -81,6 +92,30 @@ def graph_exposures(graph_edges: list[list[str]], supplier: str) -> list[str]:
     )
 
 
+def _confidence(risk_signal_count: int) -> str:
+    """Deterministic evidence-volume bucket, not a model-derived score."""
+    if risk_signal_count >= 3:
+        return "High"
+    if risk_signal_count == 2:
+        return "Medium"
+    return "Low"
+
+
+def _business_impact(supplier: str, risk_type: str | None, exposures: list[str]) -> str:
+    exposure_text = ", ".join(exposures) if exposures else "no structural exposure on record"
+    risk_label = risk_type or "unspecified"
+    return f"{risk_label} risk could disrupt {supplier}'s ability to deliver, given exposure to {exposure_text}."
+
+
+def _match_supplier(text: str, suppliers: list[dict]) -> dict | None:
+    """Case-insensitive substring match of a supplier name within free text."""
+    t = text.lower()
+    for s in suppliers:
+        if s["supplier"].lower() in t:
+            return s
+    return None
+
+
 def _retriever_context(query: str, suppliers: list[str]) -> str | None:
     """Best-effort FAISS retrieval for extra narrative context. Degrades to None
     if the retriever can't be built (e.g. no OPENAI_API_KEY configured)."""
@@ -131,6 +166,8 @@ def classify_intent(text: str) -> str:
     t = text.strip().lower()
     if not t:
         return "unknown"
+    if "approve" in t and "review" in t:
+        return "approve_review"
     if "ticket" in t and any(w in t for w in ("create", "open", "file")):
         return "create_ticket"
     if t.startswith("why"):
@@ -194,6 +231,8 @@ class PlannerCopilot:
             return self._handle_why(text)
         if intent == "create_ticket":
             return self._handle_create_ticket(text)
+        if intent == "approve_review":
+            return self._handle_approve_review(text)
         return self._handle_unknown(text)
 
     def _handle_monitor(self, text: str) -> str:
@@ -205,6 +244,9 @@ class PlannerCopilot:
         for s in ranked:
             s["profile"] = profiles.get(s["supplier"], "")
             s["exposures"] = graph_exposures(graph_edges, s["supplier"])
+            s["business_impact"] = _business_impact(s["supplier"], s["risk_type"], s["exposures"])
+            s["confidence"] = _confidence(s["risk_signal_count"])
+            s["recommended_action"] = RECOMMENDED_ACTION.get(s["risk_level"], "Continue routine monitoring")
 
         context = self._context_retriever(text, [s["supplier"] for s in ranked]) if ranked else None
 
@@ -217,16 +259,7 @@ class PlannerCopilot:
             created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
 
-        if not ranked:
-            answer = "No supplier risk signals found. Run the RSS pipeline first to populate the risk state ledger."
-        else:
-            lines = ["Top suppliers to monitor this week:"]
-            for i, s in enumerate(ranked, start=1):
-                lines.append(
-                    f"{i}. {s['supplier']} — {s['risk_level']} risk ({s['risk_type']}), "
-                    f"last seen {s['last_seen_at']}"
-                )
-            answer = "\n".join(lines)
+        answer = format_monitor_briefing(ranked)
 
         self._log(
             trace_id=trace_id,
@@ -245,28 +278,18 @@ class PlannerCopilot:
             self._log(trace_id=uuid.uuid4().hex, question=text, intent="why", evidence=None, recommendation=None, action=None)
             return answer
 
-        lines = [f"Evidence behind the recommendation from {rec.created_at}:"]
-        for s in rec.suppliers:
-            lines.append(
-                f"- {s['supplier']}: {s['risk_level']} risk from '{s['risk_type']}' — "
-                f"\"{s['last_headline']}\" (seen {s['last_seen_at']}, {s['risk_signal_count']} signal(s) on record)"
-            )
-            if s.get("exposures"):
-                lines.append(f"  Structural exposure: {', '.join(s['exposures'])}")
-            if s.get("profile"):
-                lines.append(f"  Profile: {s['profile']}")
-        if rec.context:
-            lines.append("")
-            lines.append("Retrieved context:")
-            lines.append(rec.context)
+        matched = _match_supplier(text, rec.suppliers)
+        targets = [matched] if matched else rec.suppliers
+        others = [s for s in rec.suppliers if s is not matched] if matched else []
 
-        answer = "\n".join(lines)
+        answer = format_why_response(matched, targets, others, rec.created_at, rec.context)
+
         self._log(
             trace_id=uuid.uuid4().hex,
             question=text,
             intent="why",
-            evidence=rec.suppliers,
-            recommendation=[s["supplier"] for s in rec.suppliers],
+            evidence=targets,
+            recommendation=[s["supplier"] for s in targets],
             action=None,
             parent_trace_id=rec.trace_id,
         )
@@ -315,12 +338,51 @@ class PlannerCopilot:
         )
         return answer
 
+    def _handle_approve_review(self, text: str) -> str:
+        rec = self.last_recommendation
+        if rec is None or not rec.suppliers:
+            answer = "No recommendation to act on yet. Ask \"Which suppliers should I monitor this week?\" first."
+            self._log(trace_id=uuid.uuid4().hex, question=text, intent="approve_review", evidence=None, recommendation=None, action=None)
+            return answer
+
+        top = rec.suppliers[0]
+        risk_level = top["risk_level"]
+        risk_score = TICKET_RISK_SCORE.get(risk_level, 50)
+        reason = (
+            f"Review approved for {top['supplier']}: {top['risk_type']} risk, "
+            f"latest signal: \"{top['last_headline']}\""
+        )
+
+        normalized_event = {
+            "event_type": "supplier_risk_review",
+            "repository": None,
+            "supplier": top["supplier"],
+        }
+        decision = {"decision": REVIEW_APPROVED_DECISION, "risk_score": risk_score, "reason": reason}
+
+        record_id = self._decision_saver(normalized_event, decision, ticket=None)
+
+        answer = format_approval_confirmation(top, record_id)
+
+        trace_id = uuid.uuid4().hex
+        self._log(
+            trace_id=trace_id,
+            question=text,
+            intent="approve_review",
+            evidence=top,
+            recommendation=[top["supplier"]],
+            action={"decision_record_id": record_id},
+            parent_trace_id=rec.trace_id,
+        )
+        return answer
+
     def _handle_unknown(self, text: str) -> str:
         answer = (
             "I can help with:\n"
-            "  - \"Which suppliers should I monitor this week?\"\n"
-            "  - \"Why?\"\n"
-            "  - \"Create a review ticket for the top supplier.\""
+            "  - \"Which suppliers require attention today?\"\n"
+            "  - \"Why?\" or \"Why <Supplier>?\"\n"
+            "  - \"Create a review ticket for the top supplier.\"\n"
+            "  - \"Approve review\""
         )
         self._log(trace_id=uuid.uuid4().hex, question=text, intent="unknown", evidence=None, recommendation=None, action=None)
         return answer

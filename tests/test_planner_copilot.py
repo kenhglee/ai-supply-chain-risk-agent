@@ -8,6 +8,11 @@ if PROJECT_ROOT not in sys.path:
 from app.copilot.planner_copilot import (
     CopilotLogStore,
     PlannerCopilot,
+    RECOMMENDED_ACTION,
+    REVIEW_APPROVED_DECISION,
+    _business_impact,
+    _confidence,
+    _match_supplier,
     classify_intent,
     graph_exposures,
     load_supplier_risk_rows,
@@ -33,6 +38,46 @@ def test_classify_intent_create_ticket():
 def test_classify_intent_unknown():
     assert classify_intent("What's the weather?") == "unknown"
     assert classify_intent("") == "unknown"
+
+
+def test_classify_intent_approve_review():
+    assert classify_intent("Approve review") == "approve_review"
+    assert classify_intent("Please approve the review") == "approve_review"
+
+
+def test_classify_intent_why_with_supplier_name():
+    assert classify_intent("Why TSMC?") == "why"
+
+
+# ---- _confidence / _business_impact / _match_supplier ----
+
+def test_confidence_buckets_by_signal_count():
+    assert _confidence(0) == "Low"
+    assert _confidence(1) == "Low"
+    assert _confidence(2) == "Medium"
+    assert _confidence(3) == "High"
+    assert _confidence(10) == "High"
+
+
+def test_business_impact_includes_risk_type_and_exposures():
+    text = _business_impact("TSMC", "earthquake", ["drought", "earthquake"])
+    assert "TSMC" in text
+    assert "earthquake" in text
+    assert "drought" in text
+
+
+def test_business_impact_handles_missing_risk_type_and_exposures():
+    text = _business_impact("TSMC", None, [])
+    assert "TSMC" in text
+    assert "unspecified" in text
+    assert "no structural exposure on record" in text
+
+
+def test_match_supplier_case_insensitive():
+    suppliers = [{"supplier": "TSMC"}, {"supplier": "Foxconn"}]
+    assert _match_supplier("Why tsmc?", suppliers)["supplier"] == "TSMC"
+    assert _match_supplier("why FOXCONN", suppliers)["supplier"] == "Foxconn"
+    assert _match_supplier("Why?", suppliers) is None
 
 
 # ---- top_suppliers ----
@@ -161,6 +206,21 @@ def test_monitor_returns_top_three_suppliers():
     assert copilot.last_recommendation.suppliers[0]["supplier"] == "TSMC"
 
 
+def test_monitor_response_includes_business_impact_confidence_and_recommended_action():
+    copilot = _make_copilot()
+    answer = copilot.handle("Which suppliers require attention today?")
+
+    assert "impact:" in answer
+    assert "confidence:" in answer
+    assert "recommended action:" in answer
+
+    top = copilot.last_recommendation.suppliers[0]
+    assert top["supplier"] == "TSMC"
+    assert top["confidence"] == "Low"  # single signal per supplier in fake fixture data
+    assert top["recommended_action"] == RECOMMENDED_ACTION["High"]
+    assert "TSMC" in top["business_impact"]
+
+
 def test_why_without_prior_recommendation():
     copilot = _make_copilot()
     answer = copilot.handle("Why?")
@@ -175,6 +235,36 @@ def test_why_explains_prior_recommendation():
     assert "earthquake" in answer
     assert "Structural exposure" in answer
     assert "TSMC profile text." in answer
+    assert "Business impact" in answer
+    assert "Confidence" in answer
+
+
+def test_why_with_supplier_name_scopes_to_that_supplier():
+    copilot = _make_copilot()
+    copilot.handle("Which suppliers should I monitor this week?")
+    answer = copilot.handle("Why TSMC?")
+
+    assert "Evidence for TSMC:" in answer
+    assert "- TSMC:" in answer
+    assert "- Foxconn:" not in answer
+    assert "- Murata:" not in answer
+    assert "Prioritized above" in answer
+    assert "Foxconn (Medium risk" in answer
+    assert "Murata (Low risk" in answer
+
+
+def test_why_with_supplier_name_no_comparison_when_single_supplier():
+    copilot = PlannerCopilot(
+        risk_rows_loader=lambda: [_row("TSMC", "earthquake", "High", "h", "2026-01-01T00:00:00+00:00")],
+        profiles_loader=_fake_profiles,
+        graph_loader=_fake_graph,
+        context_retriever=lambda query, suppliers: None,
+        decision_saver=lambda event, decision, ticket=None: "record-123",
+        log_store=_FakeLogStore(),
+    )
+    copilot.handle("Which suppliers should I monitor this week?")
+    answer = copilot.handle("Why TSMC?")
+    assert "Prioritized above" not in answer
 
 
 def test_create_ticket_without_prior_recommendation():
@@ -206,6 +296,37 @@ def test_create_ticket_for_top_supplier():
     assert saved["decision"]["risk_score"] == 85
 
 
+def test_approve_review_without_prior_recommendation():
+    copilot = _make_copilot()
+    answer = copilot.handle("Approve review")
+    assert "No recommendation to act on yet" in answer
+
+
+def test_approve_review_for_top_supplier():
+    saved = {}
+
+    def fake_decision_saver(event, decision, ticket=None):
+        saved["event"] = event
+        saved["decision"] = decision
+        saved["ticket"] = ticket
+        return "record-approved"
+
+    def failing_ticket_creator(event, decision):
+        raise AssertionError("approve_review must not create a ServiceNow ticket")
+
+    copilot = _make_copilot(ticket_creator=failing_ticket_creator, decision_saver=fake_decision_saver)
+    copilot.handle("Which suppliers should I monitor this week?")
+    answer = copilot.handle("Approve review")
+
+    assert "Approved review for TSMC" in answer
+    assert "High risk" in answer
+    assert "record-approved" in answer
+    assert saved["event"]["supplier"] == "TSMC"
+    assert saved["decision"]["decision"] == REVIEW_APPROVED_DECISION
+    assert saved["decision"]["risk_score"] == 85
+    assert saved["ticket"] is None
+
+
 def test_unknown_question():
     copilot = _make_copilot()
     answer = copilot.handle("What's the capital of France?")
@@ -227,6 +348,21 @@ def test_conversation_logs_each_turn():
         assert record["session_id"] == copilot.session_id
     assert log_store.records[1]["parent_trace_id"] == log_store.records[0]["trace_id"]
     assert log_store.records[2]["action"]["ticket"]["ticket_id"] == "MOCK-CHG-TEST"
+
+
+def test_conversation_logs_approve_review_turn_chained_to_recommendation():
+    log_store = _FakeLogStore()
+    copilot = _make_copilot(log_store=log_store)
+    copilot.handle("Which suppliers require attention today?")
+    copilot.handle("Why TSMC?")
+    copilot.handle("Approve review")
+
+    intents = [r["intent"] for r in log_store.records]
+    assert intents == ["monitor", "why", "approve_review"]
+    monitor_trace_id = log_store.records[0]["trace_id"]
+    assert log_store.records[1]["parent_trace_id"] == monitor_trace_id
+    assert log_store.records[2]["parent_trace_id"] == monitor_trace_id
+    assert log_store.records[2]["action"]["decision_record_id"] == "record-123"
 
 
 def test_copilot_log_store_appends_jsonl(tmp_path):
