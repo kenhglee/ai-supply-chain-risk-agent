@@ -361,6 +361,12 @@ RETRIEVER_PROVIDER=faiss
 # BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
 # RETRIEVER_PROVIDER=bedrock_kb
 # BEDROCK_KB_ID=<your-kb-id>
+
+# Bifrost gateway (local proxy, e.g. to test Bedrock models via an OpenAI-shaped client)
+# LLM_PROVIDER=bifrost
+# BIFROST_MODEL_ID=bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
+# BIFROST_BASE_URL=http://localhost:8080/langchain
+# BIFROST_API_KEY=dummy-key
 ```
 
 Run the agent:
@@ -374,9 +380,12 @@ uv run python -m app.workflows.supplier_risk_agent
 | Variable | Default | Notes |
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required when `RETRIEVER_PROVIDER=faiss` or `LLM_PROVIDER=openai` |
-| `LLM_PROVIDER` | `openai` | `openai` or `bedrock` |
+| `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
 | `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID for Bedrock provider |
+| `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway when `LLM_PROVIDER=bifrost` (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`) |
+| `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
+| `BIFROST_API_KEY` | `dummy-key` | Placeholder key; Bifrost does not validate it |
 | `RETRIEVER_PROVIDER` | `faiss` | `faiss` or `bedrock_kb` |
 | `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
 | `BEDROCK_KB_TOP_K` | `4` | Number of results to request from the KB |

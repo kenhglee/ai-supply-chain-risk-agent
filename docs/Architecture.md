@@ -486,9 +486,12 @@ Two backends, selected by `RISK_STATE_BACKEND`:
 | Variable | Default | Notes |
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required when `RETRIEVER_PROVIDER=faiss` or `LLM_PROVIDER=openai`; not required on the Bedrock KB path |
-| `LLM_PROVIDER` | `openai` | `openai` or `bedrock` |
+| `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
 | `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID for Bedrock provider |
+| `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway when `LLM_PROVIDER=bifrost` (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`) |
+| `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
+| `BIFROST_API_KEY` | `dummy-key` | Placeholder key; Bifrost does not validate it |
 | `RISK_STATE_BACKEND` | `csv` | `csv` or `dynamodb` |
 | `RISK_STATE_FILE` | `risk_state.csv` | Path when backend is `csv` |
 | `RISK_STATE_TABLE` | `supplier_risk_state` | DynamoDB table name |

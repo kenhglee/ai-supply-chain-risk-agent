@@ -159,6 +159,15 @@ def _build_llm(model_record: ModelRecord):
             temperature=0.2,
         )
 
+    if runtime.runtime_provider == "bifrost":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=runtime.runtime_model_name,
+            temperature=0.2,
+            base_url=os.getenv("BIFROST_BASE_URL", "http://localhost:8080/langchain"),
+            api_key=os.getenv("BIFROST_API_KEY", "dummy-key"),
+        )
+
     raise ValueError(f"Unsupported provider: '{runtime.runtime_provider}'")
 
 

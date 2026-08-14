@@ -239,3 +239,24 @@ def test_resolve_bedrock_model_id_override(monkeypatch):
     assert rt.runtime_provider == "bedrock"
     assert rt.runtime_model_name == bedrock_id
     assert rt.runtime_overridden is True
+
+
+def test_resolve_bifrost_provider_override(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "bifrost")
+    monkeypatch.delenv("BIFROST_MODEL_ID", raising=False)
+    record = get_model("risk_analysis_primary")   # registered as openai
+    rt = resolve_model_runtime(record)
+    assert rt.runtime_provider == "bifrost"
+    assert rt.runtime_overridden is True
+    assert rt.model_provider == "openai"          # registry value unchanged
+
+
+def test_resolve_bifrost_model_id_override(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "bifrost")
+    bifrost_id = "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    monkeypatch.setenv("BIFROST_MODEL_ID", bifrost_id)
+    record = get_model("risk_analysis_primary")
+    rt = resolve_model_runtime(record)
+    assert rt.runtime_provider == "bifrost"
+    assert rt.runtime_model_name == bifrost_id
+    assert rt.runtime_overridden is True

@@ -52,6 +52,7 @@ def resolve_model_runtime(model_record: ModelRecord) -> ModelRuntime:
     - LLM_PROVIDER overrides model_record.provider.
     - OPENAI_MODEL overrides model_name when the effective provider is openai.
     - BEDROCK_MODEL_ID overrides model_name when the effective provider is bedrock.
+    - BIFROST_MODEL_ID overrides model_name when the effective provider is bifrost.
     - runtime_overridden is True when either value differs from the registry.
     """
     runtime_provider = os.getenv("LLM_PROVIDER", model_record.provider).lower()
@@ -60,6 +61,8 @@ def resolve_model_runtime(model_record: ModelRecord) -> ModelRuntime:
         env_model = os.getenv("OPENAI_MODEL")
     elif runtime_provider == "bedrock":
         env_model = os.getenv("BEDROCK_MODEL_ID")
+    elif runtime_provider == "bifrost":
+        env_model = os.getenv("BIFROST_MODEL_ID")
     else:
         env_model = None
 
