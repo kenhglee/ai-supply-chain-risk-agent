@@ -24,3 +24,9 @@ app/workflows/risk_state.csv
 app/workflows/seen_headlines.json
 risk_traces.jsonl
 app/storage/risk_traces.jsonl
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
