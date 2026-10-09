@@ -1,7 +1,12 @@
 .venv
+venv/
+venv-*/
 __pycache__/
 .git/
 .env
+*.tfstate
+*.tfstate.*
+.terraform/
 *.csv
 *.log
 output/
