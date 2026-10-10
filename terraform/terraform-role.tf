@@ -50,7 +50,16 @@ resource "aws_iam_role_policy" "terraform_deployment" {
           "ecr:TagResource",
           "ecr:UntagResource",
           "ecr:PutImageScanningConfiguration",
-          "ecr:PutImageTagMutability"
+          "ecr:PutImageTagMutability",
+          "ecr:DescribeImages",
+          # Container image push
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:PutImage"
         ]
         Resource = "arn:aws:ecr:us-west-2:${data.aws_caller_identity.current.account_id}:repository/*"
       },
@@ -68,7 +77,8 @@ resource "aws_iam_role_policy" "terraform_deployment" {
           "lambda:UntagResource",
           "lambda:UpdateFunctionCode",
           "lambda:UpdateFunctionConfiguration",
-          "lambda:ListVersionsByFunction"
+          "lambda:ListVersionsByFunction",
+          "lambda:InvokeFunction"
         ]
         Resource = "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:*"
       },
@@ -133,6 +143,12 @@ resource "aws_iam_role_policy" "terraform_deployment" {
         ]
         Resource = "arn:aws:s3:::hgkenlee-ai-dev-tfstate-714781437949/supplychain-ai-agent/*"
       },
+      {
+        Sid      = "ECRAuthentication"
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+      }
     ]
   })
 }

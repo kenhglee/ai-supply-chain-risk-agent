@@ -30,3 +30,6 @@ app/storage/risk_traces.jsonl
 *.tfstate
 *.tfstate.*
 .terraform.tfstate.lock.info
+
+# Local Lambda invocation output
+response.json
