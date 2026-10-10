@@ -4,7 +4,6 @@ import feedparser
 import re
 import os
 import uuid
-import boto3
 import time
 import logging
 from datetime import datetime, timezone
@@ -17,6 +16,12 @@ from langchain_openai import ChatOpenAI
 from app.ingestion.rss_ingestion import load_headlines_from_rss
 from app.retrieval.retriever import get_retriever
 from app.storage.risk_trace_store import append_risk_trace
+from app.storage.supplier_risk_state_store import (
+    RiskStateStore,
+    CsvRiskStateStore,
+    DynamoRiskStateStore,
+    get_risk_store,
+)
 from app.prompt_registry import get_prompt
 from app.model_registry import get_model, ModelRecord, ModelRuntime, resolve_model_runtime
 
@@ -63,90 +68,6 @@ SUPPLIER_ALIASES = {
 }
 
 
-# ---- Risk Store ----
-class RiskStateStore:
-    def get(self, supplier: str, risk_type: str) -> dict | None:
-        raise NotImplementedError
-
-    def put(self, supplier: str, risk_type: str, row: dict) -> None:
-        raise NotImplementedError
-
-
-class CsvRiskStateStore:
-    def __init__(self, path: Path):
-        self.path = path
-        self.state = self._load()
-
-    def _load(self) -> dict[tuple[str, str], dict]:
-        if not self.path.exists():
-            return {}
-
-        state = {}
-        with open(self.path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                supplier = (row.get("supplier") or "").strip()
-                risk_type = (row.get("risk_type") or "").strip()
-                if supplier and risk_type:
-                    state[(supplier, risk_type)] = row
-        return state
-
-    def get(self, supplier: str, risk_type: str) -> dict | None:
-        return self.state.get((supplier, risk_type))
-
-    def put(self, supplier: str, risk_type: str, row: dict) -> None:
-        self.state[(supplier, risk_type)] = row
-
-    def flush(self) -> None:
-        fieldnames = [
-            "supplier",
-            "risk_type",
-            "current_risk_level",
-            "last_headline",
-            "last_seen_at",
-        ]
-        with open(self.path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in self.state.values():
-                writer.writerow(row)
-
-
-class DynamoRiskStateStore:
-    def __init__(self, table_name: str, region_name: str | None = None):
-        self.dynamodb = boto3.resource(
-            "dynamodb",
-            region_name=region_name or os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
-        )
-        self.table = self.dynamodb.Table(table_name)
-        
-
-    @staticmethod
-    def _pk(supplier: str, risk_type: str) -> str:
-        return f"{supplier}#{risk_type}"
-
-    def get(self, supplier: str, risk_type: str) -> dict | None:
-        response = self.table.get_item(
-            Key={"pk": self._pk(supplier, risk_type)}
-        )
-        return response.get("Item")
-
-    def put(self, supplier: str, risk_type: str, row: dict) -> None:
-        item = dict(row)
-        item["pk"] = self._pk(supplier, risk_type)
-        item["supplier"] = supplier
-        item["risk_type"] = risk_type
-
-
-        response = self.table.put_item(Item=item)
-
-        verify = self.table.get_item(Key={"pk": item["pk"]})
-
-
-    def flush(self) -> None:
-        pass
-
-
 # ---- State ----
 class RiskState(TypedDict):
     alert_id: str
@@ -158,22 +79,6 @@ class RiskState(TypedDict):
     alert: Optional[dict]
     is_valid: Optional[bool]
     trace_steps: List[dict]
-
-
-def get_risk_store():
-    backend = os.getenv("RISK_STATE_BACKEND", "csv").lower()
-
-    if backend == "csv":
-        path = Path(os.getenv("RISK_STATE_FILE", "risk_state.csv"))
-        return CsvRiskStateStore(path)
-
-    if backend == "dynamodb":
-        return DynamoRiskStateStore(
-            table_name=os.getenv("RISK_STATE_TABLE", "supplier_risk_state"),
-            region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
-        )
-
-    raise ValueError(f"Unsupported RISK_STATE_BACKEND: {backend}")
 
 
 def save_risk_state(risk_store) -> None:
@@ -503,39 +408,6 @@ def get_llm(model_record: ModelRecord):
     raise ValueError(f"Unsupported LLM_PROVIDER: '{rt.runtime_provider}'")
 
 
-def make_pk(supplier: str, risk_type: str) -> str:
-    return f"{supplier}#{risk_type}"
-
-
-def get_risk_state_item(supplier: str, risk_type: str) -> dict | None:
-    response = risk_table.get_item(
-        Key={"pk": make_pk(supplier, risk_type)}
-    )
-    return response.get("Item")
-
-
-def put_risk_state_item(
-    supplier: str,
-    risk_type: str,
-    current_risk_level: str,
-    last_headline: str,
-    last_seen_at: str | None = None,
-) -> None:
-    if last_seen_at is None:
-        last_seen_at = datetime.now(timezone.utc).isoformat()
-
-    risk_table.put_item(
-        Item={
-            "pk": make_pk(supplier, risk_type),
-            "supplier": supplier,
-            "risk_type": risk_type,
-            "current_risk_level": current_risk_level,
-            "last_headline": last_headline,
-            "last_seen_at": last_seen_at,
-        }
-    )
-
-
 def model_text(response) -> str:
     content = getattr(response, "content", response)
 
@@ -577,14 +449,6 @@ def parse_alert_response(raw_text: str) -> dict:
             "relevant_supplier_context": "",
         }
 
-
-# ---- DynamoDB ----
-dynamodb = boto3.resource(
-    "dynamodb",
-    region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
-)
-
-risk_table = dynamodb.Table("supplier_risk_state")
 
 # ---- Graph ----
 graph_edges = load_graph_edges()

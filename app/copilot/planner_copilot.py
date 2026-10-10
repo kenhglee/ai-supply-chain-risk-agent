@@ -6,9 +6,7 @@ retriever, and the mock ServiceNow ticket tool. Keeps a small amount of
 conversational state per session so follow-up questions like "Why?" can
 refer back to the last recommendation.
 """
-import csv
 import json
-import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,6 +19,7 @@ from app.copilot.presentation import (
 )
 from app.integrations.servicenow_mock import create_servicenow_ticket
 from app.storage.risk_state_store import save_risk_decision
+from app.storage.supplier_risk_state_store import get_risk_store
 
 STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
 PROFILES_FILE = STORAGE_DIR / "supplier_profiles.json"
@@ -41,32 +40,7 @@ RECOMMENDED_ACTION = {
 
 def load_supplier_risk_rows() -> list[dict]:
     """Read the supplier risk ledger written by the RSS pipeline."""
-    backend = os.getenv("RISK_STATE_BACKEND", "csv").lower()
-
-    if backend == "csv":
-        path = Path(os.getenv("RISK_STATE_FILE", "risk_state.csv"))
-        if not path.exists():
-            return []
-        with open(path, newline="", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
-
-    if backend == "dynamodb":
-        import boto3
-        table = boto3.resource(
-            "dynamodb", region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2")
-        ).Table(os.getenv("RISK_STATE_TABLE", "supplier_risk_state"))
-        items: list[dict] = []
-        kwargs: dict = {}
-        while True:
-            response = table.scan(**kwargs)
-            items.extend(response.get("Items", []))
-            last = response.get("LastEvaluatedKey")
-            if not last:
-                break
-            kwargs["ExclusiveStartKey"] = last
-        return items
-
-    raise ValueError(f"Unsupported RISK_STATE_BACKEND: '{backend}'")
+    return get_risk_store().list_all()
 
 
 def load_supplier_profiles(path: Path = PROFILES_FILE) -> dict[str, str]:

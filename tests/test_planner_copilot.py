@@ -1,6 +1,8 @@
 import os
 import sys
 
+import pytest
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -155,6 +157,37 @@ def test_load_supplier_risk_rows_csv_missing_file(tmp_path, monkeypatch):
     monkeypatch.setenv("RISK_STATE_BACKEND", "csv")
     monkeypatch.setenv("RISK_STATE_FILE", str(tmp_path / "missing.csv"))
     assert load_supplier_risk_rows() == []
+
+
+# ---- load_supplier_risk_rows (dynamodb backend, requires moto) ----
+
+try:
+    from moto import mock_aws
+    MOTO_AVAILABLE = True
+except ImportError:
+    MOTO_AVAILABLE = False
+
+
+@pytest.mark.skipif(not MOTO_AVAILABLE, reason="moto not installed")
+def test_load_supplier_risk_rows_dynamodb(monkeypatch):
+    import boto3
+    for var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SECURITY_TOKEN", "AWS_SESSION_TOKEN"):
+        monkeypatch.setenv(var, "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("RISK_STATE_BACKEND", "dynamodb")
+    monkeypatch.setenv("RISK_STATE_TABLE", "supplier_risk_state")
+    with mock_aws():
+        table = boto3.resource("dynamodb", region_name="us-east-1").create_table(
+            TableName="supplier_risk_state",
+            BillingMode="PAY_PER_REQUEST",
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        )
+        table.put_item(Item={"pk": "TSMC#earthquake", **_row("TSMC", "earthquake", "High", "h", "2026-01-01T00:00:00+00:00")})
+        rows = load_supplier_risk_rows()
+    assert len(rows) == 1
+    assert rows[0]["supplier"] == "TSMC"
+    assert rows[0]["pk"] == "TSMC#earthquake"
 
 
 # ---- PlannerCopilot end-to-end conversation ----

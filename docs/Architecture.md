@@ -77,8 +77,9 @@ app/
   integrations/
     servicenow_mock.py        # Returns a fake ServiceNow CHANGE ticket dict
   storage/
-    risk_state_store.py       # Appends / queries risk_decisions.jsonl
-    risk_trace_store.py       # Appends / queries risk_traces.jsonl; build_trace_explanation
+    supplier_risk_state_store.py # Supplier risk state (RSS pipeline): RiskStateStore, CSV / DynamoDB backends
+    risk_state_store.py       # GitHub decision ledger: appends / queries risk_decisions (JSONL / DynamoDB)
+    risk_trace_store.py       # Risk trace audit log: appends / queries risk_traces (JSONL / DynamoDB); build_trace_explanation
     supplier_graph.json       # Knowledge graph: [source, relation, target] triples
     supplier_profiles.json    # Text profiles for FAISS vectorstore
   workflows/
@@ -227,7 +228,7 @@ Note: the webhook handler does **not** persist decisions to `risk_decisions.json
 
 ## Risk Trace Observability
 
-Every call to `process_alert_row` produces one trace record written to `app/storage/risk_traces.jsonl`.
+Every call to `process_alert_row` produces one trace record, written according to `TRACE_STORE_BACKEND`: `app/storage/risk_traces.jsonl` (`jsonl`, default) or the DynamoDB table named by `RISK_TRACES_TABLE` (`dynamodb`, default `risk_traces`).
 
 ### What is captured
 
@@ -455,14 +456,36 @@ One JSON object per line, appended by `append_risk_trace`:
 
 For ignored alerts (pre-filter), `trace_steps` is `[]` and `run_duration_ms` is `0`.
 
+### Persistence Concerns
+
+Three separate stores in `app/storage/`, each with its own data model and configuration:
+
+| Store | Module | Holds | Configured by |
+|---|---|---|---|
+| Supplier risk state | `supplier_risk_state_store.py` | Current state per `(supplier, risk_type)` (RSS pipeline) | `RISK_STATE_BACKEND`, `RISK_STATE_FILE`, `RISK_STATE_TABLE` |
+| Decision ledger | `risk_state_store.py` | GitHub / software supply chain risk decisions | `DECISION_STORE_BACKEND`, `RISK_DECISIONS_TABLE` |
+| Risk traces | `risk_trace_store.py` | Per-run audit trace of the LangGraph agent | `TRACE_STORE_BACKEND`, `RISK_TRACES_TABLE` |
+
+Despite its name, `risk_state_store.py` is the GitHub decision ledger, not supplier risk state.
+
 ### Supplier Risk State
 
-Two backends, selected by `RISK_STATE_BACKEND`:
+`app/storage/supplier_risk_state_store.py` is the only application code that reads or writes supplier risk state. `get_risk_store()` returns a `RiskStateStore` implementation selected by `RISK_STATE_BACKEND`:
 
-- **CSV** (`risk_state.csv`): `supplier`, `risk_type`, `current_risk_level`, `last_headline`, `last_seen_at`
-- **DynamoDB** (table `supplier_risk_state`): same fields; PK = `{supplier}#{risk_type}`
+- **`CsvRiskStateStore`** (`RISK_STATE_FILE`, default `risk_state.csv`): columns `supplier`, `risk_type`, `current_risk_level`, `last_headline`, `last_seen_at`. Loaded into memory on construction; written back by `flush()`.
+- **`DynamoRiskStateStore`** (`RISK_STATE_TABLE`, default `supplier_risk_state`): same fields; PK = `{supplier}#{risk_type}`. Writes go straight to the table; `flush()` is a no-op.
+
+Interface: `get(supplier, risk_type)`, `put(supplier, risk_type, row)`, `list_all()`, `flush()`.
+
+The store is canonical current state: one row per `(supplier, risk_type)`. When the CSV is loaded, rows with an empty `supplier` or `risk_type` are skipped and the last duplicate wins, so `list_all()` returns one row per key.
+
+Callers:
+- RSS pipeline: `run_pipeline()` → `compare_and_update_risk_state()` (`get` / `put`) → `flush()`
+- Planner copilot: `load_supplier_risk_rows()` → `list_all()`
 
 ### Risk Decision Record (`risk_decisions.jsonl`)
+
+Written by `app/storage/risk_state_store.py` (JSONL locally, or the `RISK_DECISIONS_TABLE` DynamoDB table when `DECISION_STORE_BACKEND=dynamodb`).
 
 ```json
 {
