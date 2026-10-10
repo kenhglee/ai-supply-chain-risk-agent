@@ -115,6 +115,24 @@ resource "aws_iam_role_policy" "terraform_deployment" {
         ]
         Resource = aws_iam_role.terraform_deployment.arn
       },
+      {
+        Sid    = "TerraformStateBucket"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket"
+        ]
+        Resource = "arn:aws:s3:::hgkenlee-ai-dev-tfstate-714781437949"
+      },
+      {
+        Sid    = "TerraformStateObjects"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ]
+        Resource = "arn:aws:s3:::hgkenlee-ai-dev-tfstate-714781437949/supplychain-ai-agent/*"
+      },
     ]
   })
 }
