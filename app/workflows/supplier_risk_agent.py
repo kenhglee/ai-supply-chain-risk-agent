@@ -287,6 +287,10 @@ def headline_mentions(text: str, term: str) -> bool:
     return term.lower() in text.lower()
 
 
+# change_type values returned by compare_and_update_risk_state after a state.put()
+STATE_WRITE_CHANGE_TYPES = {"new_alert", "escalated", "suppressed", "downgraded"}
+
+
 def compare_and_update_risk_state(alert: dict, headline: str, state) -> tuple[str, str]:
     """
     Returns:
@@ -876,6 +880,7 @@ def run_pipeline() -> dict:
     risk_store = get_risk_store()
     enriched_rows = []
     alerts_processed = 0
+    state_writes = 0
 
     max_alerts = int(os.getenv("MAX_ALERTS_PER_RUN", "1"))
     new_alerts = [
@@ -893,13 +898,11 @@ def run_pipeline() -> dict:
 
     for idx, row in enumerate(alerts_to_process, start=1):
         alert_id = row.get("alert_id", f"unknown-{idx}")
-        supplier = row.get("supplier", "unknown")
 
         logger.info(json.dumps({
             "stage": "alert_processing_start",
             "sequence": idx,
             "alert_id": alert_id,
-            "supplier": supplier,
         }))
 
         processed = process_alert_row(row, risk_store)
@@ -907,6 +910,8 @@ def run_pipeline() -> dict:
 
         if processed is not None:
             enriched_rows.append(processed)
+            if processed.get("change_type") in STATE_WRITE_CHANGE_TYPES:
+                state_writes += 1
 
         row["status"] = "processed"
         alerts_processed += 1
@@ -915,8 +920,10 @@ def run_pipeline() -> dict:
             "stage": "alert_processing_complete",
             "sequence": idx,
             "alert_id": alert_id,
-            "supplier": supplier,
             "processed_result": processed is not None,
+            "analyzed_supplier": (processed or {}).get("supplier") or None,
+            "final_status": (processed or {}).get("final_status"),
+            "change_type": (processed or {}).get("change_type"),
         }))
 
     logger.info(json.dumps({
@@ -938,6 +945,7 @@ def run_pipeline() -> dict:
         "alerts_loaded": len(alerts),
         "alerts_processed": alerts_processed,
         "enriched_alerts": len(enriched_rows),
+        "state_writes": state_writes,
         "llm_provider": os.getenv("LLM_PROVIDER", "openai"),
         "risk_state_backend": os.getenv("RISK_STATE_BACKEND", "csv"),
     }
