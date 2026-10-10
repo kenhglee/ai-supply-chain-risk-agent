@@ -27,10 +27,12 @@ dotenv_path = find_dotenv()
 load_dotenv(dotenv_path)
 
 BASE_DIR = Path(__file__).resolve().parent
+RUNTIME_DIR = Path(os.getenv("RUNTIME_DIR", str(BASE_DIR)))
 
-SEEN_FILE = BASE_DIR / "seen_headlines.json"
-ALERT_FILE = BASE_DIR / "alerts.csv"
-ENRICHED_ALERT_FILE = BASE_DIR / "enriched_alerts.csv"
+SEEN_FILE = RUNTIME_DIR / "seen_headlines.json"
+ALERT_FILE = RUNTIME_DIR / "alerts.csv"
+ENRICHED_ALERT_FILE = RUNTIME_DIR / "enriched_alerts.csv"
+
 GRAPH_FILE = BASE_DIR / "../storage/supplier_graph.json"
 PROFILES_FILE = BASE_DIR / "../storage/supplier_profiles.json"
 

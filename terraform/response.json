@@ -1,0 +1,1 @@
+{"statusCode": 200, "body": "{\"alerts_loaded\": 10, \"alerts_processed\": 1, \"enriched_alerts\": 1, \"llm_provider\": \"bedrock\", \"risk_state_backend\": \"dynamodb\"}"}
