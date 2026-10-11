@@ -942,6 +942,7 @@ The `/api/traces/{identifier}/explanation` endpoint also includes this informati
 | Bedrock KB integration test (`scripts/integration_bedrock_kb.py --skip-publish`) | Passed — 4/4 assertions against live AWS resources |
 | End-to-end LangGraph run with `RETRIEVER_PROVIDER=bedrock_kb` | Passed — full `infer → decide → retrieve → analyze → validate` path executed |
 | `OPENAI_API_KEY` not required on Bedrock KB path | Confirmed — workflow ran without it when `LLM_PROVIDER=bedrock` and `RETRIEVER_PROVIDER=bedrock_kb` |
+| Container runtime portability (Phase 3C1): Lambda START → local Docker RESUME | Passed — same image digest (`sha256:a0500bbe…`). Docker resumed `thread-fa78851119384563a725219cee7707c4` from its `thread_id` alone, ran only `analyze → validate`, and wrote supplier state once. Repeat RESUMEs from Docker and from a different Lambda executor returned `already_completed`. Details in `docs/Architecture.md` |
 
 Trace record from the end-to-end run confirmed:
 

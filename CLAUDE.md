@@ -105,6 +105,7 @@ It is a separate interaction layer intended for AI assistants and manual workflo
   - `{"action": "checkpoint_start", "headline": "..."}` → `start_workflow(..., pause_before=["analyze"])`, returns `status=paused`, `thread_id`, `trace_id`
   - `{"action": "checkpoint_resume", "thread_id": "thread-<32 hex>"}` → `resume_workflow(thread_id)`; accepts no other input
   - malformed/unknown → 400, unknown thread → 404; saver and stores are built per invocation (continuity is only DynamoDB + `thread_id`)
+- `app/workers/risk_worker.py` — runtime-neutral equivalent for containers or plain Python: `python -m app.workers.risk_worker start --headline "..."` / `resume --thread-id thread-<32 hex>`. It uses the same `risk_workflow` lifecycle and `docker/worker.env` (Lambda env mirror, no credentials). In the Lambda image, run it with `--entrypoint python`. Phase 3C1 proved Lambda START → local Docker RESUME on one image digest (see `docs/Architecture.md`)
 - `handlers/github_webhook_handler/handler.py` — wraps the GitHub pipeline; exposed via Lambda Function URL; verifies HMAC signature before processing
 
 ### Data Flow

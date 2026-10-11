@@ -87,10 +87,15 @@ app/
     supplier_risk_agent.py    # LangGraph agent (RSS pipeline); build_app(checkpointer=None)
     risk_workflow.py          # Checkpointed START / RESUME lifecycle over the same graph
     github_risk_evaluator.py  # Rule-based risk scorer (GitHub pipeline)
+  workers/
+    risk_worker.py            # Runtime-neutral START / RESUME CLI for containers and plain Python
 
 handlers/
   rss_handler/handler.py           # Lambda entry point for RSS pipeline
   github_webhook_handler/handler.py # Lambda entry point for GitHub webhooks
+
+docker/
+  worker.env       # Container runtime config mirroring the Lambda env (no credentials)
 
 mcp_server.py    # FastMCP server — GitHub pipeline tools + risk trace tools
 
@@ -445,6 +450,107 @@ The response body has `action`, `status`, `thread_id`, `trace_id`, `next`, `chan
   - supplier state is written only after B.
 - **Executor identity.** Lambda may reuse a warm environment, so equal `executor_id`s don't weaken the result: RESUME reconstructs everything from DynamoDB.
 - **Invoke synchronously with client retries disabled** (for example `AWS_MAX_ATTEMPTS=1` and a long `--cli-read-timeout`). An asynchronous invoke or a client retry can produce a duplicate START thread or a concurrent RESUME, which this design does not guard against.
+
+### Container portability experiment (Phase 3C1)
+
+**Worker.** `app/workers/risk_worker.py` is a thin command-line adapter over the same lifecycle the Lambda handler uses. It shares `START_PAUSE_BEFORE`, `THREAD_ID_PATTERN`, `OUTCOME_FIELDS` and `checkpoint_dependencies_from_env()` from `risk_workflow.py`; it duplicates no workflow logic.
+
+```
+python -m app.workers.risk_worker start  --headline "..."
+python -m app.workers.risk_worker resume --thread-id thread-<32 hex>   # no other input accepted
+```
+
+It prints one JSON outcome line and exits with 0 (success), 2 (invalid arguments) or 3 (`not_found`).
+
+Running it from the Lambda image needs an entrypoint override, because the image's default entrypoint is Lambda's bootstrap script:
+
+```
+docker run --rm --platform linux/amd64 --hostname c1-docker-worker \
+  --entrypoint python --env-file docker/worker.env \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+  <image> -m app.workers.risk_worker resume --thread-id <thread_id>
+```
+
+`docker/worker.env` mirrors the Lambda environment and contains no credentials.
+
+**Experiment: Lambda START, then local Docker RESUME, on one artifact.**
+
+*Artifact*
+- Code commit `3b18c1a`, image built for linux/amd64.
+- Lambda and the local Docker container ran the same image digest: `sha256:a0500bbef2e4f5d1939b2d7815b37d2faa2f0f9ed065cbb2e9d11c8cb0a7b224`. Application code and LangGraph serialization versions were therefore identical in both executors.
+
+*Lambda START* (`checkpoint_start`, headline `TSMC halts wafer production after earthquake in Taiwan [C1-demo-2026-10-11]`)
+
+| Field | Value |
+|---|---|
+| `thread_id` | `thread-fa78851119384563a725219cee7707c4` |
+| `trace_id` | `97c3b508f4fb4852b0b72cf5308e9c55` |
+| `executor_id` | `2026/10/11/[$LATEST]6e43d61f20d746fdb801f3440f21b249` |
+| `status` / `next` / `state_written` | `paused` / `analyze` / `false` |
+| Nodes completed before the pause | `infer → decide → retrieve` (decide chose `retrieve`) |
+| Checkpoint items for the thread | 5 `chk`, 48 `wr` |
+| Supplier state for the headline | absent |
+
+*Local Docker RESUME*
+- The worker received only the `thread_id` as workflow input.
+- Credentials were temporary ones exported from the `ken-ai-dev` profile.
+
+| Field | Value |
+|---|---|
+| `trace_id` | `b703a840b5454ae296df306526cf6eff` |
+| `executor_id` | `c1-docker-worker:1` |
+| `status` / `final_status` | `completed` / `ok` |
+| `change_type` / `state_written` | `suppressed` / `true` |
+| `supplier` | `TSMC` |
+| Nodes executed | `analyze → validate` (validate decision `valid`) |
+| `workflow_event` | `resumed_completed` |
+
+*The prefix was not re-run.* Trace B kept the original Lambda timestamps for the completed prefix, and Docker executed only the remaining nodes:
+
+| Node | Executor | Started | Ended |
+|---|---|---|---|
+| `infer` | Lambda | 2026-10-11T20:51:37.553+00:00 | — |
+| `decide` | Lambda | 2026-10-11T20:51:37.648+00:00 | 2026-10-11T20:51:38.241+00:00 |
+| `retrieve` | Lambda | 2026-10-11T20:51:38.250+00:00 | 2026-10-11T20:51:46.472+00:00 |
+| `analyze` | Docker | 2026-10-11T20:54:56.822+00:00 | 2026-10-11T20:54:59.341+00:00 |
+| `validate` | Docker | 2026-10-11T20:54:59.486+00:00 | — |
+
+*Business state after completion* (`supplier_risk_state`)
+- `pk=TSMC#earthquake`, `supplier=TSMC`, `risk_type=earthquake`, `current_risk_level=High`
+- `last_headline=TSMC halts wafer production after earthquake in Taiwan [C1-demo-2026-10-11]`
+- `last_seen_at=2026-10-11T20:55:00+00:00`
+
+*Completed-workflow idempotency*
+1. A second Docker RESUME returned `already_completed` with `state_written=false`, reporting the same completed trace.
+2. A later Lambda RESUME also returned `already_completed` with `state_written=false` and the same completed trace.
+3. That Lambda call ran in a different Lambda executor: `2026/10/11/[$LATEST]3620a1481aae4cd99b60c56574778c0f`.
+
+**Conclusion.** A LangGraph workflow started in AWS Lambda was durably checkpointed, resumed to completion by a separate local Docker executor using only its `thread_id`, and afterwards recognized as completed by both Docker and a different Lambda executor, without repeating the business-state write.
+
+**What C1 does not show**
+- Kubernetes or EKS portability (not tested).
+- Exactly-once execution.
+- Safe concurrent RESUME.
+- Least-privilege credentials for the Docker worker.
+- Kill-switch or authority revocation.
+
+**Limitations that still apply**
+- At-least-once node execution.
+- The window between graph completion and the supplier-state write: a crash there loses the write.
+- Concurrent RESUME of one thread is not protected.
+- The Docker worker used temporary `ken-ai-dev` credentials for portability testing, not a dedicated least-privilege workload identity.
+
+### Phase 3 status
+
+Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
+
+- [x] A1: separate `thread_id` / `trace_id`, `build_app(checkpointer)`, in-process interrupt/resume
+- [x] A2: `DynamoCheckpointSaver` and explicit START/RESUME lifecycle (proven under moto)
+- [x] A3: AWS Lambda START → pause → later Lambda RESUME
+- [x] C1: container runtime portability (Lambda START → local Docker RESUME, same image digest)
+- [ ] Kubernetes: run the worker as a pod, and resume after a pod restart or replacement
+- [ ] Workload identity for the worker (least privilege, no developer credentials)
+- [ ] Kill switch / authority revocation
 
 ## Data Models and Storage
 
