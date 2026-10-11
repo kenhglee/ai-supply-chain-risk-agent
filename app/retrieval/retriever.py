@@ -4,6 +4,33 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+TITAN_EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
+SUPPORTED_EMBEDDING_PROVIDERS = ("openai", "bedrock")
+
+
+def build_embeddings(provider: str):
+    """Embeddings for the FAISS retriever, selected by EMBEDDING_PROVIDER.
+
+    bedrock uses the standard AWS credential chain (Lambda role, profile or env);
+    no credentials are passed here.
+    """
+    if provider == "openai":
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings()
+
+    if provider == "bedrock":
+        from langchain_aws import BedrockEmbeddings
+        return BedrockEmbeddings(
+            model_id=TITAN_EMBED_MODEL_ID,
+            region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+        )
+
+    raise ValueError(
+        f"Unsupported EMBEDDING_PROVIDER: '{provider}' "
+        f"(supported: {', '.join(SUPPORTED_EMBEDDING_PROVIDERS)})"
+    )
+
+
 @dataclass
 class RetrieverResult:
     context: str
@@ -33,11 +60,7 @@ class FaissRetriever:
             for item in profiles
         ]
 
-        if embedding_provider == "openai":
-            from langchain_openai import OpenAIEmbeddings
-            embeddings = OpenAIEmbeddings()
-        else:
-            raise ValueError(f"Unsupported EMBEDDING_PROVIDER: '{embedding_provider}'")
+        embeddings = build_embeddings(embedding_provider)
 
         from langchain_community.vectorstores import FAISS
         return FAISS.from_documents(docs, embeddings)
