@@ -86,7 +86,7 @@ def _run(env, headline: str, alert: dict | None) -> dict:
         {"alert_id": "", "headline": headline, "source": "google_news_rss", "status": "new"},
     ])
 
-    def fake_invoke(state):
+    def fake_invoke(state, config=None, **kwargs):
         return {
             **state,
             "candidate_suppliers": ["TSMC"],

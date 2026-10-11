@@ -57,10 +57,10 @@ def test_retriever_result_holds_context():
 
 def test_process_alert_row_does_not_call_get_retriever():
     """
-    process_alert_row must read the module global _retriever directly rather
-    than calling _get_retriever(). Calling the accessor would force retriever
-    initialization on the 'decide → skip → analyze' path, where retrieve()
-    is never executed.
+    process_alert_row must take retriever metadata from the graph result
+    (RiskState.retriever_metadata) rather than calling _get_retriever().
+    Calling the accessor would force retriever initialization on the
+    'decide → skip → analyze' path, where retrieve() is never executed.
 
     This is a structural test: it inspects the source of process_alert_row
     without importing supplier_risk_agent (which has module-level side effects
@@ -75,5 +75,5 @@ def test_process_alert_row_does_not_call_get_retriever():
 
     assert "_get_retriever()" not in body, (
         "process_alert_row must not call _get_retriever() — "
-        "read _retriever directly so the skip path never forces retriever initialization"
+        "use retriever_metadata from graph state so the skip path never forces retriever initialization"
     )

@@ -71,7 +71,8 @@ SUPPLIER_ALIASES = {
 # ---- State ----
 class RiskState(TypedDict):
     alert_id: str
-    trace_id: str
+    thread_id: str  # durable logical workflow
+    trace_id: str  # one execution attempt of that workflow
     headline: str
     candidate_suppliers: List[str]
     context: str
@@ -79,6 +80,7 @@ class RiskState(TypedDict):
     alert: Optional[dict]
     is_valid: Optional[bool]
     trace_steps: List[dict]
+    retriever_metadata: Optional[dict]  # set by retrieve; None when retrieval is skipped
 
 
 def save_risk_state(risk_store) -> None:
@@ -551,12 +553,19 @@ def retrieve_context(state: RiskState) -> RiskState:
         query_parts.extend(suppliers)
     query = " ".join(query_parts)
 
-    result = _get_retriever().retrieve(query, suppliers)
+    retriever = _get_retriever()
+    result = retriever.retrieve(query, suppliers)
     print("-" * 50)
 
     return {
         **state,
         "context": result.context,
+        "retriever_metadata": {
+            "retriever_id": retriever.retriever_id,
+            "retriever_version": retriever.retriever_version,
+            "embedding_provider": retriever.embedding_provider,
+            "top_k": retriever.top_k,
+        },
         "trace_steps": record_trace_step(state["trace_steps"], "retrieve", t0),
     }
 
@@ -673,44 +682,49 @@ def route_after_validation(state: RiskState) -> str:
     return "end" if state.get("is_valid") else "fallback"
 
 # ---- Graph ----
-graph = StateGraph(RiskState)
+def build_app(checkpointer=None):
+    graph = StateGraph(RiskState)
 
-graph.add_node("infer", infer_suppliers)
-graph.add_node("decide", decide_tool_use)
-graph.add_node("retrieve", retrieve_context)
-graph.add_node("analyze", analyze_risk)
-graph.add_node("validate", validate_alert)
-graph.add_node("fallback", fallback_alert)
+    graph.add_node("infer", infer_suppliers)
+    graph.add_node("decide", decide_tool_use)
+    graph.add_node("retrieve", retrieve_context)
+    graph.add_node("analyze", analyze_risk)
+    graph.add_node("validate", validate_alert)
+    graph.add_node("fallback", fallback_alert)
 
-graph.set_entry_point("infer")
-graph.add_edge("infer", "decide")
-graph.add_conditional_edges(
-    "decide",
-    route_after_decision,
-    {
-        "retrieve": "retrieve",
-        "analyze": "analyze",
-    },
-)
-graph.add_edge("retrieve", "analyze")
-graph.add_edge("analyze", "validate")
-graph.add_conditional_edges(
-    "validate",
-    route_after_validation,
-    {
-        "end": END,
-        "fallback": "fallback",
-    },
-)
+    graph.set_entry_point("infer")
+    graph.add_edge("infer", "decide")
+    graph.add_conditional_edges(
+        "decide",
+        route_after_decision,
+        {
+            "retrieve": "retrieve",
+            "analyze": "analyze",
+        },
+    )
+    graph.add_edge("retrieve", "analyze")
+    graph.add_edge("analyze", "validate")
+    graph.add_conditional_edges(
+        "validate",
+        route_after_validation,
+        {
+            "end": END,
+            "fallback": "fallback",
+        },
+    )
 
-graph.add_edge("fallback", END)
+    graph.add_edge("fallback", END)
 
-app = graph.compile()
+    return graph.compile(checkpointer=checkpointer)
+
+
+app = build_app()
 
 
 def process_alert_row(row: dict, risk_store) -> dict:
     headline = row["headline"]
     alert_id = row.get("alert_id") or uuid.uuid4().hex
+    thread_id = row.get("thread_id") or f"thread-{uuid.uuid4().hex}"
     trace_id = uuid.uuid4().hex
 
     if not is_actionable_alert(headline):
@@ -749,17 +763,22 @@ def process_alert_row(row: dict, risk_store) -> dict:
         }
 
     t_run_start = time.time()
-    result = app.invoke({
-        "alert_id": alert_id,
-        "trace_id": trace_id,
-        "headline": headline,
-        "candidate_suppliers": [],
-        "context": "",
-        "tool_decision": None,
-        "alert": None,
-        "is_valid": None,
-        "trace_steps": [],
-    })
+    result = app.invoke(
+        {
+            "alert_id": alert_id,
+            "thread_id": thread_id,
+            "trace_id": trace_id,
+            "headline": headline,
+            "candidate_suppliers": [],
+            "context": "",
+            "tool_decision": None,
+            "alert": None,
+            "is_valid": None,
+            "trace_steps": [],
+            "retriever_metadata": None,
+        },
+        config={"configurable": {"thread_id": thread_id}},
+    )
     run_duration_ms = round((time.time() - t_run_start) * 1000, 1)
 
     alert = result["alert"]
@@ -770,7 +789,7 @@ def process_alert_row(row: dict, risk_store) -> dict:
         state=risk_store,
     )
 
-    _r = _retriever  # None when retrieve node was skipped; instance otherwise
+    retriever_metadata = result.get("retriever_metadata") or {}
     append_risk_trace({
         "alert_id": alert_id,
         "trace_id": trace_id,
@@ -785,10 +804,10 @@ def process_alert_row(row: dict, risk_store) -> dict:
         "change_type": change_type,
         "trace_steps": result.get("trace_steps", []),
         "retriever_metadata": {
-            "retriever_id": _r.retriever_id if _r is not None else None,
-            "retriever_version": _r.retriever_version if _r is not None else None,
-            "embedding_provider": _r.embedding_provider if _r is not None else None,
-            "top_k": _r.top_k if _r is not None else None,
+            "retriever_id": retriever_metadata.get("retriever_id"),
+            "retriever_version": retriever_metadata.get("retriever_version"),
+            "embedding_provider": retriever_metadata.get("embedding_provider"),
+            "top_k": retriever_metadata.get("top_k"),
             "latency_ms": next(
                 (s["duration_ms"] for s in result.get("trace_steps", []) if s["node_name"] == "retrieve"),
                 None,
