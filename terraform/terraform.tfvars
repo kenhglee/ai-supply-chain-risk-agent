@@ -1,1 +1,1 @@
-risk_agent_image_digest = "sha256:38683a3a524f70053fc0891b73874fb3b702be0995740779857c9a402ed44ec8"
+risk_agent_image_digest = "sha256:a0500bbef2e4f5d1939b2d7815b37d2faa2f0f9ed065cbb2e9d11c8cb0a7b224"
