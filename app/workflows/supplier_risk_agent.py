@@ -16,6 +16,8 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from app.ingestion.rss_ingestion import load_headlines_from_rss
 from app.retrieval.retriever import get_retriever
+from app.governance.authority import AGENT_SCOPE
+from app.integrations.servicenow_mock import create_servicenow_ticket
 from app.storage.risk_trace_store import append_risk_trace
 from app.storage.supplier_risk_state_store import (
     RiskStateStore,
@@ -82,6 +84,7 @@ class RiskState(TypedDict):
     is_valid: Optional[bool]
     trace_steps: List[dict]
     retriever_metadata: Optional[dict]  # set by retrieve; None when retrieval is skipped
+    action_result: Optional[dict]  # set by act (governed checkpointed graph only)
 
 
 def save_risk_state(risk_store) -> None:
@@ -682,8 +685,88 @@ def route_after_decision(state: RiskState) -> str:
 def route_after_validation(state: RiskState) -> str:
     return "end" if state.get("is_valid") else "fallback"
 
+# ---- Node 7: governed privileged action (checkpointed graph only) ----
+REVIEW_TICKET_ACTION = "open_review_ticket"
+REVIEW_TICKET_RISK_SCORE = {"High": 85, "Medium": 60, "Low": 30}
+
+
+def review_ticket_action_id(thread_id: str) -> str:
+    """Deterministic: a re-run of act maps to the same ledger item."""
+    return f"action#{thread_id}#{REVIEW_TICKET_ACTION}"
+
+
+def open_review_ticket(alert: dict, headline: str, action_id: str) -> dict:
+    """The side effect: a (mock) ServiceNow review ticket for a supplier alert."""
+    risk_level = alert.get("risk_level")
+    decision_type = "manual_review_required" if risk_level == "High" else "review_recommended"
+    ticket = create_servicenow_ticket(
+        {"event_type": "supplier_risk_review", "repository": None, "supplier": alert.get("supplier")},
+        {
+            "decision": decision_type,
+            "risk_score": REVIEW_TICKET_RISK_SCORE.get(risk_level, 50),
+            "reason": (
+                f"{alert.get('supplier')} {alert.get('risk_type')} risk ({risk_level}): \"{headline}\""
+            ),
+        },
+    )
+    return {**ticket, "correlation_id": action_id}
+
+
+def make_act_node(action_gate):
+    """act: open a review ticket through the action gate (authority + ledger).
+
+    Raises AuthorityDenied when authority refuses admission; the node then
+    produces no checkpoint, so the workflow stays at act and a later RESUME
+    re-runs only this node.
+    """
+    def act(state: RiskState) -> RiskState:
+        t0 = time.time()
+        alert = state["alert"]
+        action_id = review_ticket_action_id(state["thread_id"])
+        result = action_gate.execute(
+            action_id,
+            scope=AGENT_SCOPE,
+            context={
+                "action_type": REVIEW_TICKET_ACTION,
+                "thread_id": state["thread_id"],
+                "trace_id": state["trace_id"],
+                "executor_id": get_executor_id(),
+                "subject": {
+                    "alert_id": state["alert_id"],
+                    "supplier": alert.get("supplier"),
+                    "risk_type": alert.get("risk_type"),
+                    "risk_level": alert.get("risk_level"),
+                },
+            },
+            effect=lambda: open_review_ticket(alert, state["headline"], action_id),
+        )
+        return {
+            **state,
+            "action_result": result,
+            "trace_steps": record_trace_step(
+                state["trace_steps"], "act", t0,
+                decision="replayed" if result["replayed"] else "completed",
+            ),
+        }
+
+    return act
+
+
+def route_after_governed_validation(state: RiskState) -> str:
+    """Only a valid supplier-specific alert triggers the privileged action."""
+    if not state.get("is_valid"):
+        return "fallback"
+    return "act" if (state.get("alert") or {}).get("status") == "ok" else "end"
+
+
 # ---- Graph ----
-def build_app(checkpointer=None):
+def build_app(checkpointer=None, *, action_gate=None):
+    """Compile the risk graph.
+
+    With action_gate (the checkpointed lifecycle), validate routes valid "ok"
+    alerts through the governed act node. Without it (Phase 2 path) the
+    graph has no privileged action.
+    """
     graph = StateGraph(RiskState)
 
     graph.add_node("infer", infer_suppliers)
@@ -705,14 +788,27 @@ def build_app(checkpointer=None):
     )
     graph.add_edge("retrieve", "analyze")
     graph.add_edge("analyze", "validate")
-    graph.add_conditional_edges(
-        "validate",
-        route_after_validation,
-        {
-            "end": END,
-            "fallback": "fallback",
-        },
-    )
+    if action_gate is None:
+        graph.add_conditional_edges(
+            "validate",
+            route_after_validation,
+            {
+                "end": END,
+                "fallback": "fallback",
+            },
+        )
+    else:
+        graph.add_node("act", make_act_node(action_gate))
+        graph.add_conditional_edges(
+            "validate",
+            route_after_governed_validation,
+            {
+                "act": "act",
+                "end": END,
+                "fallback": "fallback",
+            },
+        )
+        graph.add_edge("act", END)
 
     graph.add_edge("fallback", END)
 
@@ -741,6 +837,7 @@ def initial_risk_state(alert_id: str, thread_id: str | None, trace_id: str, head
         "is_valid": None,
         "trace_steps": [],
         "retriever_metadata": None,
+        "action_result": None,
     }
 
 

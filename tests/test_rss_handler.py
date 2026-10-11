@@ -62,12 +62,12 @@ def stubs(monkeypatch):
         calls.pipeline.append(event)
         return {"alerts_processed": 1, "state_writes": 0}
 
-    def fake_start(row, *, checkpointer, risk_store, pause_before=None):
+    def fake_start(row, *, checkpointer, risk_store, action_gate=None, pause_before=None):
         calls.start.append({"row": row, "pause_before": pause_before,
                             "checkpointer": checkpointer, "risk_store": risk_store})
         return calls.start_outcome
 
-    def fake_resume(thread_id, *, checkpointer, risk_store):
+    def fake_resume(thread_id, *, checkpointer, risk_store, action_gate=None):
         calls.resume.append({"thread_id": thread_id, "checkpointer": checkpointer, "risk_store": risk_store})
         return calls.resume_outcome
 
@@ -148,6 +148,9 @@ def test_checkpoint_start_routes_with_pause_before_analyze(stubs):
         "state_written": False,
         "final_status": None,
         "supplier": None,
+        "action_id": None,
+        "action_status": None,
+        "authority_version": None,
         "executor_id": "stream-1",
         "request_id": "req-1",
     }

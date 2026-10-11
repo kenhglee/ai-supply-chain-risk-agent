@@ -26,6 +26,8 @@ pytestmark = pytest.mark.skipif(not MOTO_AVAILABLE, reason="moto not installed")
 
 # supplier_risk_agent builds its LLM clients at import time; no request is made.
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
+from app.governance.action_ledger import ActionLedger  # noqa: E402
+from app.governance.authority import AuthorityStore  # noqa: E402
 from app.storage import risk_trace_store  # noqa: E402
 from app.storage.checkpoint_store import DynamoCheckpointSaver  # noqa: E402
 from app.storage.supplier_risk_state_store import DynamoRiskStateStore  # noqa: E402
@@ -36,6 +38,8 @@ REGION = "us-east-1"
 CHECKPOINTS = "risk_agent_checkpoints"
 SUPPLIER_STATE = "supplier_risk_state"
 TRACES = "risk_traces"
+AUTHORITY = "risk_agent_authority"
+ACTIONS = "risk_agent_actions"
 HEADLINE = "TSMC halts production after earthquake in Taiwan"
 
 OK_ALERT = {
@@ -99,6 +103,13 @@ def _create_tables(boto3):
         AttributeDefinitions=[{"AttributeName": "trace_id", "AttributeType": "S"}],
         KeySchema=[{"AttributeName": "trace_id", "KeyType": "HASH"}],
     )
+    for table, key in ((AUTHORITY, "scope_id"), (ACTIONS, "action_id")):
+        client.create_table(
+            TableName=table,
+            BillingMode="PAY_PER_REQUEST",
+            AttributeDefinitions=[{"AttributeName": key, "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": key, "KeyType": "HASH"}],
+        )
 
 
 @pytest.fixture
@@ -110,6 +121,8 @@ def env(monkeypatch):
     monkeypatch.setenv("TRACE_STORE_BACKEND", "dynamodb")
     monkeypatch.setenv("RISK_TRACES_TABLE", TRACES)
     monkeypatch.setattr(risk_trace_store, "_store", None)
+    monkeypatch.setenv("AUTHORITY_TABLE", AUTHORITY)
+    monkeypatch.setenv("ACTIONS_TABLE", ACTIONS)
 
     triage = FakeLLM("retrieve")
     risk = FakeLLM(json.dumps(OK_ALERT))
@@ -122,8 +135,12 @@ def env(monkeypatch):
     with mock_aws():
         import boto3
         _create_tables(boto3)
+        authority = AuthorityStore(AUTHORITY, REGION)
+        authority.restore(reason="test grant", actor="pytest")
         resource = boto3.resource("dynamodb", region_name=REGION)
         yield SimpleNamespace(
+            authority=authority,
+            actions=resource.Table(ACTIONS),
             triage=triage,
             risk=risk,
             retriever=retriever,
@@ -135,10 +152,11 @@ def env(monkeypatch):
 
 
 def _new_executor():
-    """Fresh saver + risk store, as a new process would build them."""
+    """Fresh saver + risk store + action gate, as a new process would build them."""
     return {
         "checkpointer": DynamoCheckpointSaver(CHECKPOINTS, REGION),
         "risk_store": DynamoRiskStateStore(SUPPLIER_STATE, REGION),
+        "action_gate": ActionLedger(ACTIONS, AuthorityStore(AUTHORITY, REGION), REGION),
     }
 
 
@@ -209,7 +227,9 @@ def test_resume_with_new_executor_completes_without_rerunning(env):
     assert trace["executor_id"] == "stream-B"
     assert trace["change_type"] == "new_alert"
     assert trace["retriever_metadata"]["retriever_id"] == "fake_retriever"
-    assert _nodes(trace) == ["infer", "decide", "retrieve", "analyze", "validate"]
+    assert _nodes(trace) == ["infer", "decide", "retrieve", "analyze", "validate", "act"]
+    assert trace["action_status"] == "COMPLETED"
+    assert trace["authority_version"] == 1
 
 
 def test_resume_after_completion_is_noop(env):
@@ -290,5 +310,7 @@ def test_checkpointed_traces_carry_workflow_identity(env):
 
 
 def test_resume_accepts_no_workflow_input():
-    params = list(inspect.signature(risk_workflow.resume_workflow).parameters)
-    assert params == ["thread_id", "checkpointer", "risk_store"]
+    """thread_id is the only input; the rest are keyword-only dependencies."""
+    params = inspect.signature(risk_workflow.resume_workflow).parameters
+    assert list(params) == ["thread_id", "checkpointer", "risk_store", "action_gate"]
+    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for name, p in params.items() if name != "thread_id")

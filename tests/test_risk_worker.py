@@ -1,5 +1,6 @@
 """Container/CLI worker: argument handling, routing, and moto end-to-end
 interop with the Lambda handler (START in one executor, RESUME in the other)."""
+import io
 import json
 import os
 import sys
@@ -108,6 +109,29 @@ def test_resume_not_found_exits_3(stubs, capsys):
                             "change_type": None, "state_written": False, "final_status": None, "supplier": None}
     assert risk_worker.main(["resume", "--thread-id", THREAD_ID]) == risk_worker.EXIT_NOT_FOUND
     assert _stdout_json(capsys)["status"] == "not_found"
+
+
+def test_resume_authority_denied_exits_4(stubs, capsys):
+    stubs.resume_outcome = {"status": "authority_denied", "thread_id": THREAD_ID, "trace_id": "trace-3",
+                            "next": ["act"], "change_type": None, "state_written": False,
+                            "final_status": "ok", "supplier": "TSMC", "action_status": "DENIED"}
+    assert risk_worker.main(["resume", "--thread-id", THREAD_ID]) == risk_worker.EXIT_AUTHORITY_DENIED
+    out = _stdout_json(capsys)
+    assert out["next"] == ["act"]
+    assert out["action_status"] == "DENIED"
+
+
+def test_session_reads_commands_from_stdin_with_one_dependency_set(stubs, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        json.dumps({"start": HEADLINE}) + "\n" + json.dumps({"resume": THREAD_ID}) + "\n"
+    ))
+    assert risk_worker.main(["session"]) == 0
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [(line["action"], line["status"]) for line in lines] == [("start", "paused"), ("resume", "completed")]
+    assert stubs.deps == 1
+    assert stubs.start == [{"row": {"headline": HEADLINE}, "pause_before": ["analyze"]}]
+    assert stubs.resume == [THREAD_ID]
 
 
 def test_missing_checkpoint_table_is_configuration_error(monkeypatch):
