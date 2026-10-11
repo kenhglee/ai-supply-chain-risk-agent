@@ -18,6 +18,7 @@ if PROJECT_ROOT not in sys.path:
 # supplier_risk_agent builds its LLM clients at import time; no request is made.
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
 from handlers.rss_handler import handler  # noqa: E402
+from app.workflows import risk_workflow  # noqa: E402
 from app.workflows import supplier_risk_agent as agent  # noqa: E402
 from tests.test_risk_workflow import (  # noqa: E402,F401  (env is a pytest fixture)
     CHECKPOINTS,
@@ -89,8 +90,8 @@ def stubs(monkeypatch):
     monkeypatch.setattr(handler, "run_supplier_risk_flow", fake_pipeline)
     monkeypatch.setattr(handler, "start_workflow", fake_start)
     monkeypatch.setattr(handler, "resume_workflow", fake_resume)
-    monkeypatch.setattr(handler, "DynamoCheckpointSaver", FakeSaver)
-    monkeypatch.setattr(handler, "get_risk_store", fake_get_risk_store)
+    monkeypatch.setattr(risk_workflow, "DynamoCheckpointSaver", FakeSaver)
+    monkeypatch.setattr(risk_workflow, "get_risk_store", fake_get_risk_store)
     return calls
 
 
@@ -243,12 +244,12 @@ def test_start_then_resume_through_handler(env, monkeypatch):
 
     savers = []
 
-    class CountingSaver(handler.DynamoCheckpointSaver):
+    class CountingSaver(risk_workflow.DynamoCheckpointSaver):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             savers.append(self)
 
-    monkeypatch.setattr(handler, "DynamoCheckpointSaver", CountingSaver)
+    monkeypatch.setattr(risk_workflow, "DynamoCheckpointSaver", CountingSaver)
 
     monkeypatch.setenv("AWS_LAMBDA_LOG_STREAM_NAME", "stream-A")
     started = handler.lambda_handler(

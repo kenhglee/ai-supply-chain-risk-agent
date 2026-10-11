@@ -11,9 +11,13 @@ writing supplier state are not atomic: if the process dies after the graph
 reaches END but before finalize_completed_run writes state, RESUME reports
 already_completed and that state write is lost.
 """
+import os
+import re
 import time
 import uuid
 
+from app.storage.checkpoint_store import DynamoCheckpointSaver
+from app.storage.supplier_risk_state_store import get_risk_store
 from app.workflows.supplier_risk_agent import (
     STATE_WRITE_CHANGE_TYPES,
     build_app,
@@ -32,6 +36,29 @@ COMPLETED = "completed"
 ALREADY_COMPLETED = "already_completed"
 NOT_FOUND = "not_found"
 IGNORED = "ignored"
+
+# Shared by every executor adapter (Lambda handler, container worker).
+START_PAUSE_BEFORE = ["analyze"]
+THREAD_ID_PATTERN = re.compile(r"thread-[0-9a-f]{32}")
+OUTCOME_FIELDS = (
+    "status", "thread_id", "trace_id", "next", "change_type",
+    "state_written", "final_status", "supplier",
+)
+
+
+def checkpoint_dependencies_from_env() -> dict:
+    """Saver and risk store for one START/RESUME call, built fresh each time.
+
+    Continuity between executors comes only from DynamoDB + thread_id.
+    A missing CHECKPOINT_TABLE is a configuration error, not bad input.
+    """
+    table_name = os.environ.get("CHECKPOINT_TABLE")
+    if not table_name:
+        raise RuntimeError("CHECKPOINT_TABLE is not configured")
+    return {
+        "checkpointer": DynamoCheckpointSaver(table_name),
+        "risk_store": get_risk_store(),
+    }
 
 
 def _config(thread_id: str) -> dict:

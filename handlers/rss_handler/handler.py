@@ -1,14 +1,19 @@
 import logging
 import os
 import json
-import re
 
 logger = logging.getLogger()
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
-from app.storage.checkpoint_store import DynamoCheckpointSaver
-from app.storage.supplier_risk_state_store import get_risk_store
-from app.workflows.risk_workflow import NOT_FOUND, resume_workflow, start_workflow
+from app.workflows.risk_workflow import (
+    NOT_FOUND,
+    OUTCOME_FIELDS,
+    START_PAUSE_BEFORE,
+    THREAD_ID_PATTERN,
+    checkpoint_dependencies_from_env,
+    resume_workflow,
+    start_workflow,
+)
 from app.workflows.supplier_risk_agent import get_executor_id, run_supplier_risk_flow
 
 # ---- Checkpoint demo actions (Phase 3A3) ----
@@ -17,13 +22,6 @@ from app.workflows.supplier_risk_agent import get_executor_id, run_supplier_risk
 
 CHECKPOINT_START = "checkpoint_start"
 CHECKPOINT_RESUME = "checkpoint_resume"
-START_PAUSE_BEFORE = ["analyze"]
-THREAD_ID_PATTERN = re.compile(r"thread-[0-9a-f]{32}")
-
-_OUTCOME_FIELDS = (
-    "status", "thread_id", "trace_id", "next", "change_type",
-    "state_written", "final_status", "supplier",
-)
 
 
 class InvalidCheckpointRequest(ValueError):
@@ -71,17 +69,6 @@ def _parse_checkpoint_action(event: dict) -> tuple[str, str]:
     )
 
 
-def _checkpoint_dependencies() -> dict:
-    """Built fresh for every invocation: continuity comes only from DynamoDB + thread_id."""
-    table_name = os.environ.get("CHECKPOINT_TABLE")
-    if not table_name:
-        raise RuntimeError("CHECKPOINT_TABLE is not configured")
-    return {
-        "checkpointer": DynamoCheckpointSaver(table_name),
-        "risk_store": get_risk_store(),
-    }
-
-
 def _handle_checkpoint_action(event: dict, request_id: str | None) -> dict:
     try:
         action, value = _parse_checkpoint_action(event)
@@ -101,7 +88,7 @@ def _handle_checkpoint_action(event: dict, request_id: str | None) -> dict:
         "thread_id": value if action == CHECKPOINT_RESUME else None,
     }))
 
-    deps = _checkpoint_dependencies()
+    deps = checkpoint_dependencies_from_env()
     if action == CHECKPOINT_START:
         outcome = start_workflow({"headline": value}, pause_before=list(START_PAUSE_BEFORE), **deps)
     else:
@@ -109,7 +96,7 @@ def _handle_checkpoint_action(event: dict, request_id: str | None) -> dict:
 
     body = {
         "action": action,
-        **{field: outcome.get(field) for field in _OUTCOME_FIELDS},
+        **{field: outcome.get(field) for field in OUTCOME_FIELDS},
         "executor_id": get_executor_id(),
         "request_id": request_id,
     }
