@@ -6,6 +6,7 @@ import os
 import uuid
 import time
 import logging
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
@@ -71,7 +72,7 @@ SUPPLIER_ALIASES = {
 # ---- State ----
 class RiskState(TypedDict):
     alert_id: str
-    thread_id: str  # durable logical workflow
+    thread_id: Optional[str]  # durable logical workflow; None on the uncheckpointed Phase 2 path
     trace_id: str  # one execution attempt of that workflow
     headline: str
     candidate_suppliers: List[str]
@@ -721,76 +722,88 @@ def build_app(checkpointer=None):
 app = build_app()
 
 
-def process_alert_row(row: dict, risk_store) -> dict:
-    headline = row["headline"]
-    alert_id = row.get("alert_id") or uuid.uuid4().hex
-    thread_id = row.get("thread_id") or f"thread-{uuid.uuid4().hex}"
-    trace_id = uuid.uuid4().hex
+def get_executor_id() -> str:
+    """Process/environment that ran an attempt. Audit only: a warm Lambda
+    environment can run several attempts, so this is not an identity."""
+    return os.getenv("AWS_LAMBDA_LOG_STREAM_NAME") or f"{socket.gethostname()}:{os.getpid()}"
 
-    if not is_actionable_alert(headline):
-        append_risk_trace({
-            "alert_id": alert_id,
-            "trace_id": trace_id,
-            "headline": headline,
-            "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "run_duration_ms": 0,
-            "tool_decision": "skip",
-            "final_status": "inconclusive",
-            "supplier": None,
-            "risk_type": None,
-            "risk_level": None,
-            "change_type": "ignored",
-            "trace_steps": [],
-        })
-        return {
-            "alert_id": alert_id,
-            "trace_id": trace_id,
-            "trace_steps_count": 0,
-            "headline": headline,
-            "source": row.get("source", ""),
-            "status": row.get("status", ""),
-            "tool_decision": "skip",
-            "candidate_suppliers": "",
-            "final_status": "inconclusive",
-            "supplier": "",
-            "risk_type": "",
-            "risk_level": "",
-            "change_type": "ignored",
-            "change_message": "Headline appears informational rather than a concrete disruption signal.",
-            "impact": "No actionable supply disruption signal detected from the headline.",
-            "recommended_action": "Ignore for now or monitor for more specific operational disruption news.",
-            "relevant_supplier_context": "",
-        }
 
-    t_run_start = time.time()
-    result = app.invoke(
-        {
-            "alert_id": alert_id,
-            "thread_id": thread_id,
-            "trace_id": trace_id,
-            "headline": headline,
-            "candidate_suppliers": [],
-            "context": "",
-            "tool_decision": None,
-            "alert": None,
-            "is_valid": None,
-            "trace_steps": [],
-            "retriever_metadata": None,
-        },
-        config={"configurable": {"thread_id": thread_id}},
-    )
-    run_duration_ms = round((time.time() - t_run_start) * 1000, 1)
+def initial_risk_state(alert_id: str, thread_id: str | None, trace_id: str, headline: str) -> RiskState:
+    return {
+        "alert_id": alert_id,
+        "thread_id": thread_id,
+        "trace_id": trace_id,
+        "headline": headline,
+        "candidate_suppliers": [],
+        "context": "",
+        "tool_decision": None,
+        "alert": None,
+        "is_valid": None,
+        "trace_steps": [],
+        "retriever_metadata": None,
+    }
 
-    alert = result["alert"]
 
-    change_type, change_message = compare_and_update_risk_state(
-        alert=alert,
-        headline=headline,
-        state=risk_store,
-    )
-
-    retriever_metadata = result.get("retriever_metadata") or {}
+def record_ignored_alert(
+    row: dict,
+    *,
+    alert_id: str,
+    trace_id: str,
+    headline: str,
+    trace_extras: dict | None = None,
+) -> dict:
+    """Trace and enriched row for a headline filtered out before the graph."""
     append_risk_trace({
+        "alert_id": alert_id,
+        "trace_id": trace_id,
+        "headline": headline,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "run_duration_ms": 0,
+        "tool_decision": "skip",
+        "final_status": "inconclusive",
+        "supplier": None,
+        "risk_type": None,
+        "risk_level": None,
+        "change_type": "ignored",
+        "trace_steps": [],
+        **(trace_extras or {}),
+    })
+    return {
+        "alert_id": alert_id,
+        "trace_id": trace_id,
+        "trace_steps_count": 0,
+        "headline": headline,
+        "source": row.get("source", ""),
+        "status": row.get("status", ""),
+        "tool_decision": "skip",
+        "candidate_suppliers": "",
+        "final_status": "inconclusive",
+        "supplier": "",
+        "risk_type": "",
+        "risk_level": "",
+        "change_type": "ignored",
+        "change_message": "Headline appears informational rather than a concrete disruption signal.",
+        "impact": "No actionable supply disruption signal detected from the headline.",
+        "recommended_action": "Ignore for now or monitor for more specific operational disruption news.",
+        "relevant_supplier_context": "",
+    }
+
+
+def build_trace_record(
+    result: dict,
+    *,
+    alert_id: str,
+    trace_id: str,
+    headline: str,
+    t_run_start: float,
+    run_duration_ms: float,
+    change_type: str | None,
+    trace_extras: dict | None = None,
+) -> dict:
+    """Trace record for one graph attempt. result may be a paused state (alert None)."""
+    alert = result.get("alert") or {}
+    retriever_metadata = result.get("retriever_metadata") or {}
+    return {
         "alert_id": alert_id,
         "trace_id": trace_id,
         "headline": headline,
@@ -851,7 +864,44 @@ def process_alert_row(row: dict, risk_store) -> dict:
                 "runtime_overridden": _risk_runtime.runtime_overridden,
             },
         ],
-    })
+        **(trace_extras or {}),
+    }
+
+
+def finalize_completed_run(
+    row: dict,
+    result: dict,
+    risk_store,
+    *,
+    alert_id: str,
+    trace_id: str,
+    headline: str,
+    t_run_start: float,
+    run_duration_ms: float,
+    trace_extras: dict | None = None,
+) -> dict:
+    """Post-graph work for a completed run: supplier state update, trace, enriched row.
+
+    Must only be called when the graph has reached END; a paused run has no alert.
+    """
+    alert = result["alert"]
+
+    change_type, change_message = compare_and_update_risk_state(
+        alert=alert,
+        headline=headline,
+        state=risk_store,
+    )
+
+    append_risk_trace(build_trace_record(
+        result,
+        alert_id=alert_id,
+        trace_id=trace_id,
+        headline=headline,
+        t_run_start=t_run_start,
+        run_duration_ms=run_duration_ms,
+        change_type=change_type,
+        trace_extras=trace_extras,
+    ))
 
     return {
         "alert_id": alert_id,
@@ -872,6 +922,44 @@ def process_alert_row(row: dict, risk_store) -> dict:
         "recommended_action": alert.get("recommended_action", ""),
         "relevant_supplier_context": alert.get("relevant_supplier_context", ""),
     }
+
+
+def process_alert_row(row: dict, risk_store) -> dict:
+    """Phase 2 path: one uncheckpointed graph run per alert, start to END.
+
+    No durable workflow exists here, so there is no thread_id; trace_id is
+    the only identity. Checkpointed runs go through app.workflows.risk_workflow.
+    """
+    headline = row["headline"]
+    alert_id = row.get("alert_id") or uuid.uuid4().hex
+    trace_id = uuid.uuid4().hex
+    executor_id = get_executor_id()
+
+    if not is_actionable_alert(headline):
+        return record_ignored_alert(
+            row,
+            alert_id=alert_id,
+            trace_id=trace_id,
+            headline=headline,
+            trace_extras={"executor_id": executor_id},
+        )
+
+    t_run_start = time.time()
+    result = app.invoke(initial_risk_state(alert_id, None, trace_id, headline))
+    run_duration_ms = round((time.time() - t_run_start) * 1000, 1)
+
+    return finalize_completed_run(
+        row,
+        result,
+        risk_store,
+        alert_id=alert_id,
+        trace_id=trace_id,
+        headline=headline,
+        t_run_start=t_run_start,
+        run_duration_ms=run_duration_ms,
+        trace_extras={"executor_id": executor_id},
+    )
+
 
 def run_pipeline() -> dict:
     OUTPUT_MODE = os.getenv("OUTPUT_MODE", "csv")

@@ -47,6 +47,14 @@ class JsonlTraceStore:
 
 # ---- DynamoDB implementation ----
 
+# Optional top-level scalars, stored natively when present. thread_id,
+# workflow_event and executor_id link checkpointed workflow attempts.
+_OPTIONAL_SCALAR_FIELDS = (
+    "tool_decision", "final_status", "supplier", "risk_type", "risk_level",
+    "thread_id", "workflow_event", "executor_id",
+)
+
+
 class DynamoTraceStore:
     """
     Table schema:
@@ -72,7 +80,7 @@ class DynamoTraceStore:
             "store_backend": "dynamodb",
             "trace_steps": json.dumps(record.get("trace_steps") or []),
         }
-        for field in ("tool_decision", "final_status", "supplier", "risk_type", "risk_level"):
+        for field in _OPTIONAL_SCALAR_FIELDS:
             val = record.get(field)
             if val is not None:
                 item[field] = val
@@ -91,7 +99,7 @@ class DynamoTraceStore:
         for field in ("retriever_metadata", "prompt_metadata", "model_metadata"):
             if field in record:
                 record[field] = json.loads(record[field])
-        for field in ("tool_decision", "final_status", "supplier", "risk_type", "risk_level"):
+        for field in _OPTIONAL_SCALAR_FIELDS:
             if field not in record:
                 record[field] = None
         return record

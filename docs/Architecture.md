@@ -78,12 +78,14 @@ app/
     servicenow_mock.py        # Returns a fake ServiceNow CHANGE ticket dict
   storage/
     supplier_risk_state_store.py # Supplier risk state (RSS pipeline): RiskStateStore, CSV / DynamoDB backends
+    checkpoint_store.py       # DynamoCheckpointSaver: durable LangGraph checkpoints (checkpointed lifecycle only)
     risk_state_store.py       # GitHub decision ledger: appends / queries risk_decisions (JSONL / DynamoDB)
     risk_trace_store.py       # Risk trace audit log: appends / queries risk_traces (JSONL / DynamoDB); build_trace_explanation
     supplier_graph.json       # Knowledge graph: [source, relation, target] triples
     supplier_profiles.json    # Text profiles for FAISS vectorstore
   workflows/
-    supplier_risk_agent.py    # LangGraph agent (RSS pipeline)
+    supplier_risk_agent.py    # LangGraph agent (RSS pipeline); build_app(checkpointer=None)
+    risk_workflow.py          # Checkpointed START / RESUME lifecycle over the same graph
     github_risk_evaluator.py  # Rule-based risk scorer (GitHub pipeline)
 
 handlers/
@@ -386,6 +388,40 @@ Run with: `cd web && npm test`
 
 ---
 
+## Checkpointed Workflow Lifecycle
+
+`app/workflows/risk_workflow.py` runs the same graph (`build_app(checkpointer)`) with durable checkpoints so a workflow can pause in one process and continue in another. It is not wired into any handler yet; the Phase 2 path (`run_pipeline` → `process_alert_row`) is unchanged and uncheckpointed.
+
+**Identity**
+- `thread_id` (`thread-<uuid>`) identifies the durable workflow and is the checkpoint key.
+- `trace_id` identifies one execution attempt. START and every RESUME get a new one, so one thread has one trace record per attempt.
+
+**Operations** (both take an explicit `checkpointer` and `risk_store`; both invoke with `durability="sync"`)
+
+| Call | Behavior | Outcome `status` |
+|---|---|---|
+| `start_workflow(row, pause_before=None)` | New `thread_id` and `trace_id`, run until pause or END | `paused`, `completed`, or `ignored` (pre-filtered headline, no thread) |
+| `resume_workflow(thread_id)` | No checkpoint → stop. Already at END → stop. Otherwise stamp a new `trace_id` into state and `invoke(None)` | `not_found`, `already_completed`, `paused`, `completed` |
+
+RESUME takes no workflow input, so a completed thread can't be restarted by passing new input to `invoke`.
+
+**Settlement.** After each invoke, `app.get_state(config).next` decides the outcome before any business write:
+- **Non-empty `next`, paused.** No `compare_and_update_risk_state` call. A trace is written with `workflow_event="paused"` and `change_type=null`.
+- **Empty `next`, completed.** `finalize_completed_run` (shared with `process_alert_row`) updates supplier state and writes a trace with `workflow_event="started_completed"` or `"resumed_completed"`.
+
+**Checkpoint table** (`DynamoCheckpointSaver`): PK `thread_id`, SK `sk`.
+- Checkpoint items are `chk#{ns}#{checkpoint_id}` and hold the whole serialized checkpoint.
+- Pending writes are `wr#{ns}#{checkpoint_id}#{task_id}#{idx}`.
+- Values are serialized with LangGraph's serializer (msgpack) and stored as DynamoDB binary.
+- Reads are strongly consistent. The latest checkpoint is the highest `chk#` sort key, because checkpoint IDs are uuid6.
+- Only the sync API is implemented: `get_tuple`, `put`, `put_writes`, thread-scoped `list`, and `delete_thread`.
+
+**Guarantees and limits**
+- **Durable continuation with at-least-once node execution.** A node interrupted mid-run (for example an LLM call) runs again on resume.
+- **Not exactly-once between graph completion and business state.** If the process dies after the graph reaches END but before supplier state is written, the checkpoint already shows completion. RESUME then returns `already_completed` and that state write is lost.
+- **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent.
+- **`executor_id` is audit only** (`AWS_LAMBDA_LOG_STREAM_NAME`, or `host:pid` locally). A warm Lambda environment can run several attempts.
+
 ## Data Models and Storage
 
 ### LangGraph State (`RiskState`)
@@ -393,7 +429,8 @@ Run with: `cd web && npm test`
 ```python
 class RiskState(TypedDict):
     alert_id: str
-    trace_id: str
+    thread_id: Optional[str]  # durable logical workflow; None on the Phase 2 path
+    trace_id: str             # one execution attempt
     headline: str
     candidate_suppliers: List[str]
     context: str
@@ -401,6 +438,7 @@ class RiskState(TypedDict):
     alert: Optional[dict]
     is_valid: Optional[bool]
     trace_steps: List[dict]
+    retriever_metadata: Optional[dict]  # set by retrieve; None when skipped
 ```
 
 ### LLM Alert Output (from `analyze` node)
@@ -456,15 +494,23 @@ One JSON object per line, appended by `append_risk_trace`:
 
 For ignored alerts (pre-filter), `trace_steps` is `[]` and `run_duration_ms` is `0`.
 
+Optional fields:
+- `executor_id` is recorded on every run.
+- `thread_id` and `workflow_event` are recorded only by the checkpointed lifecycle (`start_workflow` / `resume_workflow`). `workflow_event` is `paused`, `started_completed` or `resumed_completed`.
+- The uncheckpointed Phase 2 path (`process_alert_row`) has no durable workflow, so it records neither field; `trace_id` is its only identity.
+
+For a resumed attempt, `trace_steps` is the cumulative list from checkpoint state, while `run_duration_ms` covers only that attempt.
+
 ### Persistence Concerns
 
-Three separate stores in `app/storage/`, each with its own data model and configuration:
+Separate stores in `app/storage/`, each with its own data model and configuration:
 
 | Store | Module | Holds | Configured by |
 |---|---|---|---|
 | Supplier risk state | `supplier_risk_state_store.py` | Current state per `(supplier, risk_type)` (RSS pipeline) | `RISK_STATE_BACKEND`, `RISK_STATE_FILE`, `RISK_STATE_TABLE` |
 | Decision ledger | `risk_state_store.py` | GitHub / software supply chain risk decisions | `DECISION_STORE_BACKEND`, `RISK_DECISIONS_TABLE` |
 | Risk traces | `risk_trace_store.py` | Per-run audit trace of the LangGraph agent | `TRACE_STORE_BACKEND`, `RISK_TRACES_TABLE` |
+| Workflow checkpoints | `checkpoint_store.py` | LangGraph execution progress per `thread_id` (checkpointed lifecycle only) | Passed in explicitly; no env wiring yet |
 
 Despite its name, `risk_state_store.py` is the GitHub decision ledger, not supplier risk state.
 

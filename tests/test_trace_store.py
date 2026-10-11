@@ -246,3 +246,27 @@ def test_dynamo_early_return_trace_metadata_fields_absent_after_readback(aws_cre
         assert result["supplier"] is None
         assert result["risk_type"] is None
         assert result["risk_level"] is None
+
+
+@moto_required
+def test_dynamo_workflow_fields_round_trip(aws_credentials):
+    with mock_aws():
+        _create_trace_table()
+        store = DynamoTraceStore("risk_traces", "us-east-1")
+        store.append({
+            **_make_trace("trace-1", "alert-1"),
+            "thread_id": "thread-A",
+            "workflow_event": "paused",
+            "executor_id": "stream-1",
+        })
+        store.append(_make_trace("trace-legacy", "alert-2"))
+
+        record = store.get_by_identifier("trace-1")
+        assert record["thread_id"] == "thread-A"
+        assert record["workflow_event"] == "paused"
+        assert record["executor_id"] == "stream-1"
+
+        legacy = store.get_by_identifier("trace-legacy")
+        assert legacy["thread_id"] is None
+        assert legacy["workflow_event"] is None
+        assert legacy["executor_id"] is None

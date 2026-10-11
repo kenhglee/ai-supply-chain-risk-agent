@@ -100,6 +100,14 @@ def _run(env, headline: str, alert: dict | None) -> dict:
     return agent.run_pipeline()
 
 
+def _assert_phase2_trace_identity(trace: dict) -> None:
+    """Uncheckpointed runs have an attempt identity but no durable workflow identity."""
+    assert trace["trace_id"]
+    assert trace["executor_id"]
+    assert trace.get("thread_id") is None
+    assert trace.get("workflow_event") is None
+
+
 def _items(env) -> list[dict]:
     return env.table.scan()["Items"]
 
@@ -131,6 +139,7 @@ def test_ok_alert_writes_supplier_state(lambda_env, caplog):
 
     assert lambda_env.traces[-1]["alert_id"] == "runtime-1"
     assert lambda_env.traces[-1]["change_type"] == "new_alert"
+    _assert_phase2_trace_identity(lambda_env.traces[-1])
 
     [log] = _completion_logs(caplog)
     assert log["alert_id"] == "runtime-1"
@@ -161,6 +170,7 @@ def test_inconclusive_alert_does_not_write_state(lambda_env, caplog):
     assert summary["state_writes"] == 0
     assert _items(lambda_env) == []
     assert lambda_env.traces[-1]["change_type"] == "inconclusive"
+    _assert_phase2_trace_identity(lambda_env.traces[-1])
 
     [log] = _completion_logs(caplog)
     assert log["analyzed_supplier"] is None
@@ -176,6 +186,7 @@ def test_non_actionable_headline_does_not_write_state(lambda_env, caplog):
     assert summary["state_writes"] == 0
     assert _items(lambda_env) == []
     assert lambda_env.traces[-1]["change_type"] == "ignored"
+    _assert_phase2_trace_identity(lambda_env.traces[-1])
 
     [log] = _completion_logs(caplog)
     assert log["final_status"] == "inconclusive"
