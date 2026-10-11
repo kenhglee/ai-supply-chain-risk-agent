@@ -23,9 +23,12 @@ resource "aws_lambda_function" "risk_agent" {
       TRACE_STORE_BACKEND = "dynamodb"
       RISK_TRACES_TABLE   = aws_dynamodb_table.risk_traces.name
 
-      LLM_PROVIDER     = "bedrock"
-      BEDROCK_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-      RUNTIME_DIR      = "/tmp"
+      CHECKPOINT_TABLE = aws_dynamodb_table.risk_agent_checkpoints.name
+
+      LLM_PROVIDER       = "bedrock"
+      BEDROCK_MODEL_ID   = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+      EMBEDDING_PROVIDER = "bedrock"
+      RUNTIME_DIR        = "/tmp"
 
       OUTPUT_MODE = "lambda"
     }

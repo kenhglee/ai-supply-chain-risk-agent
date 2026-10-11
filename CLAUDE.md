@@ -30,7 +30,7 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 
 | Variable | Default | Notes |
 |---|---|---|
-| `OPENAI_API_KEY` | — | Required for local RSS pipeline (also needed for FAISS embeddings even when `LLM_PROVIDER=bedrock`) |
+| `OPENAI_API_KEY` | — | Required for local RSS pipeline when `LLM_PROVIDER=openai` or `EMBEDDING_PROVIDER=openai` (FAISS default) |
 | `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
 | `OPENAI_MODEL` | `gpt-4o-mini` | |
 | `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | |
@@ -51,6 +51,8 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 | `RETRIEVER_PROVIDER` | `faiss` | `faiss` (default) or `bedrock_kb` |
 | `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
 | `BEDROCK_KB_TOP_K` | `4` | Number of KB results to request (bedrock_kb only) |
+| `EMBEDDING_PROVIDER` | `openai` | FAISS embeddings: `openai` (`OpenAIEmbeddings`) or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`, default AWS credential chain). Lambda sets `bedrock` |
+| `CHECKPOINT_TABLE` | — | DynamoDB table for LangGraph checkpoints (`risk_agent_checkpoints`). Required only for Lambda `checkpoint_start` / `checkpoint_resume` actions; the scheduled RSS path is not checkpointed |
 
 ## Architecture
 
@@ -99,7 +101,10 @@ It is a separate interaction layer intended for AI assistants and manual workflo
 
 ### 4. Lambda Handlers
 
-- `handlers/rss_handler/handler.py` — wraps the RSS pipeline; triggered by EventBridge on a schedule
+- `handlers/rss_handler/handler.py` — wraps the RSS pipeline; triggered by EventBridge on a schedule. Events with an `action` key are explicit checkpoint lifecycle requests instead (Phase 3A3 durability experiment):
+  - `{"action": "checkpoint_start", "headline": "..."}` → `start_workflow(..., pause_before=["analyze"])`, returns `status=paused`, `thread_id`, `trace_id`
+  - `{"action": "checkpoint_resume", "thread_id": "thread-<32 hex>"}` → `resume_workflow(thread_id)`; accepts no other input
+  - malformed/unknown → 400, unknown thread → 404; saver and stores are built per invocation (continuity is only DynamoDB + `thread_id`)
 - `handlers/github_webhook_handler/handler.py` — wraps the GitHub pipeline; exposed via Lambda Function URL; verifies HMAC signature before processing
 
 ### Data Flow

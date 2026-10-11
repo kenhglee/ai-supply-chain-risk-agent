@@ -134,7 +134,7 @@ cd web && npm run dev
 
 ### Trigger
 
-AWS EventBridge invokes `handlers/rss_handler/handler.py` on a schedule. Locally: `uv run python -m app.workflows.supplier_risk_agent`.
+AWS EventBridge invokes `handlers/rss_handler/handler.py` on a schedule. Events that carry an `action` key are routed to the checkpoint lifecycle instead (see [Lambda durability experiment](#lambda-durability-experiment-phase-3a3)); every other event runs the pipeline below. Locally: `uv run python -m app.workflows.supplier_risk_agent`.
 
 ### Request Flow
 
@@ -175,7 +175,7 @@ infer → decide ──retrieve──► analyze → validate ──end──►
 
 Each node records its own `started_at`, `ended_at`, `duration_ms`, and optional `decision` / `error` into `state["trace_steps"]` before returning.
 
-**Module-level initialization**: `supplier_risk_agent.py` instantiates the LLM and retriever at import time. `OPENAI_API_KEY` is required when `RETRIEVER_PROVIDER=faiss` (the default), because `OpenAIEmbeddings` is used to build the FAISS index. It is not required when `RETRIEVER_PROVIDER=bedrock_kb`.
+**Module-level initialization**: `supplier_risk_agent.py` instantiates the LLM and retriever at import time. The FAISS index (built lazily on the first `retrieve`) uses `EMBEDDING_PROVIDER`: `openai` (default; `OpenAIEmbeddings`, needs `OPENAI_API_KEY`) or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`, in-Region only, using the default AWS credential chain). The Lambda sets `bedrock` because it has no OpenAI key. Neither is used when `RETRIEVER_PROVIDER=bedrock_kb`.
 
 ### Risk State Change Types
 
@@ -390,7 +390,7 @@ Run with: `cd web && npm test`
 
 ## Checkpointed Workflow Lifecycle
 
-`app/workflows/risk_workflow.py` runs the same graph (`build_app(checkpointer)`) with durable checkpoints so a workflow can pause in one process and continue in another. It is not wired into any handler yet; the Phase 2 path (`run_pipeline` → `process_alert_row`) is unchanged and uncheckpointed.
+`app/workflows/risk_workflow.py` runs the same graph (`build_app(checkpointer)`) with durable checkpoints so a workflow can pause in one process and continue in another. The Lambda reaches it only through explicit `checkpoint_start` / `checkpoint_resume` actions; the Phase 2 path (`run_pipeline` → `process_alert_row`) is unchanged and uncheckpointed.
 
 **Identity**
 - `thread_id` (`thread-<uuid>`) identifies the durable workflow and is the checkpoint key.
@@ -421,6 +421,30 @@ RESUME takes no workflow input, so a completed thread can't be restarted by pass
 - **Not exactly-once between graph completion and business state.** If the process dies after the graph reaches END but before supplier state is written, the checkpoint already shows completion. RESUME then returns `already_completed` and that state write is lost.
 - **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent.
 - **`executor_id` is audit only** (`AWS_LAMBDA_LOG_STREAM_NAME`, or `host:pid` locally). A warm Lambda environment can run several attempts.
+- **Not handled yet:** checkpoint TTL/cleanup, batching checkpoint writes (one run is roughly 80 `PutItem` calls), a concurrency lease, and the audit gap when a resume fails after the new `trace_id` is stamped.
+
+### Lambda durability experiment (Phase 3A3)
+
+The RSS Lambda accepts two explicit actions in addition to its normal events:
+
+| Event | Effect | Response `statusCode` |
+|---|---|---|
+| `{"action": "checkpoint_start", "headline": "..."}` | `start_workflow({"headline": ...}, pause_before=["analyze"])` | 200 (`paused`, or `completed`/`ignored`) |
+| `{"action": "checkpoint_resume", "thread_id": "thread-<32 hex>"}` | `resume_workflow(thread_id)`. No other keys accepted: RESUME takes no workflow input | 200 (`completed`, `already_completed`, `paused`), 404 (`not_found`) |
+| any other `action`, missing/extra keys, blank headline, malformed `thread_id` | rejected before any work | 400 |
+
+The response body has `action`, `status`, `thread_id`, `trace_id`, `next`, `change_type`, `state_written`, `final_status`, `supplier`, `executor_id`, `request_id`. Logs: `checkpoint_action_start`, `checkpoint_action_complete`, `checkpoint_action_rejected`.
+
+- **Dependencies per invocation.** `DynamoCheckpointSaver(CHECKPOINT_TABLE)` and `get_risk_store()` are built fresh on every action, so continuity comes only from DynamoDB and `thread_id`. A missing `CHECKPOINT_TABLE` is a configuration error (the invocation fails); it is not a 4xx.
+- **Infrastructure.** Table `risk_agent_checkpoints` (on-demand billing, PK `thread_id`, SK `sk`, no GSI, no TTL). The Lambda role has `dynamodb:Query` and `dynamodb:PutItem` on that table only (`RiskCheckpointAccess`), plus `bedrock:InvokeModel` on `amazon.titan-embed-text-v2:0` in us-west-2.
+- **Experiment.** Invocation A runs `checkpoint_start` and the graph pauses before `analyze`. Invocation B runs `checkpoint_resume` with the returned `thread_id`. Evidence:
+  - checkpoint items exist for the thread;
+  - trace A has `workflow_event=paused` and trace B has `resumed_completed`;
+  - both traces share the `thread_id` but have different `trace_id`s;
+  - B's earlier-node timestamps match A's, so those nodes were not re-run;
+  - supplier state is written only after B.
+- **Executor identity.** Lambda may reuse a warm environment, so equal `executor_id`s don't weaken the result: RESUME reconstructs everything from DynamoDB.
+- **Invoke synchronously with client retries disabled** (for example `AWS_MAX_ATTEMPTS=1` and a long `--cli-read-timeout`). An asynchronous invoke or a client retry can produce a duplicate START thread or a concurrent RESUME, which this design does not guard against.
 
 ## Data Models and Storage
 
@@ -510,7 +534,7 @@ Separate stores in `app/storage/`, each with its own data model and configuratio
 | Supplier risk state | `supplier_risk_state_store.py` | Current state per `(supplier, risk_type)` (RSS pipeline) | `RISK_STATE_BACKEND`, `RISK_STATE_FILE`, `RISK_STATE_TABLE` |
 | Decision ledger | `risk_state_store.py` | GitHub / software supply chain risk decisions | `DECISION_STORE_BACKEND`, `RISK_DECISIONS_TABLE` |
 | Risk traces | `risk_trace_store.py` | Per-run audit trace of the LangGraph agent | `TRACE_STORE_BACKEND`, `RISK_TRACES_TABLE` |
-| Workflow checkpoints | `checkpoint_store.py` | LangGraph execution progress per `thread_id` (checkpointed lifecycle only) | Passed in explicitly; no env wiring yet |
+| Workflow checkpoints | `checkpoint_store.py` | LangGraph execution progress per `thread_id` (checkpointed lifecycle only) | `CHECKPOINT_TABLE` (Lambda checkpoint actions) |
 
 Despite its name, `risk_state_store.py` is the GitHub decision ledger, not supplier risk state.
 
@@ -570,6 +594,8 @@ Written by `app/storage/risk_state_store.py` (JSONL locally, or the `RISK_DECISI
 | `RETRIEVER_PROVIDER` | `faiss` | `faiss` or `bedrock_kb` |
 | `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
 | `BEDROCK_KB_TOP_K` | `4` | Number of results to request from the KB |
+| `EMBEDDING_PROVIDER` | `openai` | FAISS embeddings: `openai` or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`); Lambda uses `bedrock` |
+| `CHECKPOINT_TABLE` | — | LangGraph checkpoint table for Lambda `checkpoint_start` / `checkpoint_resume`; Lambda uses `risk_agent_checkpoints` |
 | `CORPUS_S3_BUCKET` | — | S3 bucket for supplier corpus (publish script) |
 | `CORPUS_S3_PREFIX` | `supplier-profiles/` | Key prefix within the corpus bucket |
 | `TRACE_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |

@@ -52,7 +52,8 @@ resource "aws_iam_role_policy" "bedrock_invoke" {
         "arn:aws:bedrock:us-west-2:${data.aws_caller_identity.current.account_id}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
         "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
-        "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+        "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+        "arn:aws:bedrock:us-west-2::foundation-model/amazon.titan-embed-text-v2:0"
       ]
     }]
   })
@@ -76,6 +77,23 @@ resource "aws_iam_role_policy" "risk_trace_access" {
         aws_dynamodb_table.risk_traces.arn,
         "${aws_dynamodb_table.risk_traces.arn}/index/alert-id-index"
       ]
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "risk_checkpoint_access" {
+  name = "RiskCheckpointAccess"
+  role = aws_iam_role.risk_agent_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "dynamodb:Query",
+        "dynamodb:PutItem"
+      ]
+      Resource = aws_dynamodb_table.risk_agent_checkpoints.arn
     }]
   })
 }
