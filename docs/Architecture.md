@@ -538,7 +538,7 @@ docker run --rm --platform linux/amd64 --hostname c1-docker-worker \
 **Conclusion.** A LangGraph workflow started in AWS Lambda was durably checkpointed, resumed to completion by a separate local Docker executor using only its `thread_id`, and afterwards recognized as completed by both Docker and a different Lambda executor, without repeating the business-state write.
 
 **What C1 does not show**
-- Kubernetes or EKS portability (not tested).
+- Kubernetes or EKS portability (not tested in C1; Kubernetes via kind is covered by C2; EKS remains untested).
 - Exactly-once execution.
 - Safe concurrent RESUME.
 - Least-privilege credentials for the Docker worker.
@@ -549,6 +549,75 @@ docker run --rm --platform linux/amd64 --hostname c1-docker-worker \
 - The window between graph completion and the supplier-state write: a crash there loses the write.
 - Concurrent RESUME of one thread is not protected.
 - The Docker worker used temporary `ken-ai-dev` credentials for portability testing, not a dedicated least-privilege workload identity.
+
+### Kubernetes runtime-disposability experiment (Phase 3C2)
+
+**Setup**
+- **Cluster:** local [kind](https://kind.sigs.k8s.io/), not EKS.
+- **Image:** the immutable C1 artifact. Commit `3b18c1a`, digest `sha256:a0500bbef2e4f5d1939b2d7815b37d2faa2f0f9ed065cbb2e9d11c8cb0a7b224`, the same digest that both the Lambda and the local Docker worker ran in C1. Lambda → Docker → Kubernetes therefore all executed one artifact. It was loaded into the cluster, not pulled from ECR. It predates Phase 3D, so the graph has no `act` node and traces end at `validate`.
+- **Worker:** each executor is a bare Pod running `python -m app.workers.risk_worker start|resume`.
+- **Configuration:** a ConfigMap built from `docker/worker.env`.
+- **Credentials:** temporary `ken-ai-dev` SSO credentials in a Kubernetes Secret, for plumbing only. This is not workload identity.
+- **Identity in traces:** the Pod hostname, so `executor_id` is `<pod>:1`.
+- **State:** all of it is outside the cluster, in DynamoDB (checkpoints, supplier state, traces). Continuity between Pods and clusters comes only from those tables and the `thread_id`.
+
+#### C2a: executor replacement
+
+Headline `TSMC halts wafer production after earthquake in Taiwan [C2-kind-demo-2026-10-11]`, thread `thread-ceb4cd45ee2a4a42bcc4146283b2c601`.
+
+1. **Pod A** (`risk-worker-a:1`) STARTed the workflow and paused before `analyze`, after `retrieve`. Trace `88cb2ad05fb64ddf98634865b0a96fc8`, `workflow_event=paused`.
+2. **Pod A was deleted** and verified gone.
+3. **A separately created Pod B** (`risk-worker-b:1`) received only the `thread_id` and resumed to `completed`. Trace `16c482a6f60d40a68ada12e2aa68b5d1`, `resumed_completed`, `change_type=suppressed`, TSMC / earthquake / High.
+4. **Pod C** then resumed the same thread and got `already_completed`, with no further business-state write and no new trace.
+
+| Node | Executor | Started | Ended |
+|---|---|---|---|
+| `infer` | Pod A | 2026-10-11T21:56:08.773Z | 21:56:08.773Z |
+| `decide` | Pod A | 21:56:09.316Z | 21:56:13.710Z |
+| `retrieve` | Pod A | 21:56:14.386Z | 21:56:23.769Z |
+| `analyze` | Pod B | 21:59:13.339Z | 21:59:16.747Z |
+| `validate` | Pod B | 21:59:17.027Z | — |
+
+- **Prefix kept:** Pod B's trace has Pod A's original `infer` / `decide` / `retrieve` timestamps, and Pod B ran only `analyze` / `validate`.
+- **Business state:** written only after Pod B completed.
+- **Thread totals:** 8 checkpoint items and 73 pending writes, with exactly two traces.
+
+#### C2+: whole-cluster destruction and recreation
+
+Headline `TSMC halts wafer production after earthquake in Taiwan [C2-cluster-demo-2026-10-11]`, thread `thread-789398d481b44d6eafdee4788cc6786c`.
+
+1. **In Cluster #1 (`risk-c2`), Pod D** (`risk-worker-d:1`) STARTed the workflow and checkpointed it before `analyze`. Trace `117e0943e29d4e87a2edd0df9e5bf8cf`, `paused`.
+2. **The entire cluster was deleted** and verified absent. That destroyed the initiating Pod, its namespace, ConfigMap and Secret, the Kubernetes API/control-plane state, and the cluster-local copy of the image.
+3. **A differently named Cluster #2 (`risk-c2-resume`) was created from scratch.** The same image digest was loaded, and runtime configuration and authentication were rebuilt. No Kubernetes state backup was restored.
+4. **Pod E** (`risk-worker-e:1`) received only the original `thread_id`. It restored the DynamoDB checkpoint and completed the workflow. Trace `86f8ea0c5d884be3ae106188349f906d`, `resumed_completed`, `change_type=suppressed`, TSMC / earthquake / High.
+
+| Node | Executor | Started | Ended |
+|---|---|---|---|
+| `infer` | Pod D, Cluster #1 | 2026-10-11T22:05:35.107Z | 22:05:35.107Z |
+| `decide` | Pod D, Cluster #1 | 22:05:35.286Z | 22:05:36.212Z |
+| `retrieve` | Pod D, Cluster #1 | 22:05:36.282Z | **22:05:42.103Z** |
+| *Cluster #1 destroyed; Cluster #2 created* | | | |
+| `analyze` | Pod E, Cluster #2 | **22:10:05.369Z** | 22:10:08.404Z |
+| `validate` | Pod E, Cluster #2 | 22:10:09.677Z | — |
+
+- **Prefix kept:** the completed trace keeps the pre-destruction `infer` / `decide` / `retrieve` timestamps and adds only the post-recreation `analyze` / `validate`.
+- **The gap between them (about 263 s)** spans the destruction and recreation of the cluster.
+- **Business state committed only after Cluster #2 resumed and completed the workflow:** `TSMC#earthquake` has `last_headline=…[C2-cluster-demo-2026-10-11]` and `last_seen_at=2026-10-11T22:10:11+00:00`.
+- **Thread totals:** 8 checkpoint items, 73 pending writes, two traces.
+
+**Conclusion.** A stateful LangGraph workflow survived complete destruction of the Kubernetes cluster that initiated it and was resumed to completion by a newly created cluster using only its durable workflow identity. The workflow's execution environment was disposable; its workflow and business state were external and durable.
+
+**Phase C vs Phase D.** Phase C shows the execution environment can disappear while durable workflow state survives. Phase D (below) shows the execution environment can stay alive while its authority is independently revoked. Deleting a Pod or a cluster is compute lifecycle. It neither revokes authority nor stops a workflow, because any executor with credentials can resume it.
+
+**What C2 does not show**
+- **EKS:** this was local kind.
+- **Workload identity:** temporary SSO credentials came from a Kubernetes Secret, for plumbing only.
+- **Mid-node crash recovery:** both handoffs happened at a durable pause before `analyze`. A force-kill during a node (C2b) is optional and parked.
+- **Exactly-once node execution:** execution is at-least-once.
+- **Safe concurrent RESUME.**
+- **SIGTERM / graceful-termination behavior.**
+- **ECR-native image pulling, or production networking, node or AZ failure.**
+- **Authority revocation:** Pod or cluster deletion is compute lifecycle; see Phase 3D.
 
 ### Runtime authority and governed actions (Phase 3D)
 
@@ -735,8 +804,12 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
 - [x] A1: separate `thread_id` / `trace_id`, `build_app(checkpointer)`, in-process interrupt/resume
 - [x] A2: `DynamoCheckpointSaver` and explicit START/RESUME lifecycle (proven under moto)
 - [x] A3: AWS Lambda START → pause → later Lambda RESUME
-- [x] C1: container runtime portability (Lambda START → local Docker RESUME, same image digest)
-- [ ] Kubernetes: run the worker as a pod, and resume after a pod restart or replacement
+- C. Container / Kubernetes experiment
+  - [x] C1: local Docker runtime portability (Lambda START → Docker RESUME, same image digest)
+  - [x] C2a: Kubernetes executor replacement (Pod A START → delete → Pod B RESUME → Pod C no-op)
+  - [x] C2+: whole-cluster destruction/recreation (`risk-c2` deleted → `risk-c2-resume` completes the workflow)
+  - [ ] C2b (optional, parked): force-kill mid-node / at-least-once behavior; not required to close Phase C
+  - [x] Same external state model preserved across Lambda, Docker and Kubernetes executors
 - [ ] Workload identity for the worker (least privilege, no developer credentials)
 - [x] 3D1: authority store, transactional action ledger, governed `act` node, fail-closed configuration, `session` worker (proven under moto)
 - [x] 3D2: `risk_agent_authority` and `risk_agent_actions` tables (Terraform)
