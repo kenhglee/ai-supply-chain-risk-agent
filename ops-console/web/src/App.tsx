@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import ActionQueue from "./ActionQueue";
 
 type Risk = {
   pk: string;
@@ -115,6 +116,7 @@ export default function App() {
           </p>
         </section>
       )}
+      <ActionQueue />
     </main>
   );
 }

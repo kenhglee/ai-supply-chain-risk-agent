@@ -129,3 +129,33 @@ section p:last-child {
   opacity: 0.6;
   cursor: wait;
 }
+
+.action-queue {
+  grid-column: 1 / -1;
+}
+
+.action-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(0, 2fr);
+  gap: 24px;
+}
+
+.action-layout h3 {
+  margin-top: 0;
+}
+
+dt {
+  margin-top: 16px;
+  font-weight: 600;
+}
+
+dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 700px) {
+  .action-layout {
+    grid-template-columns: 1fr;
+  }
+}

@@ -51,6 +51,39 @@ app.get("/api/risks", async (_request, reply) => {
   }
 });
 
+app.get("/api/actions", async (_request, reply) => {
+  try {
+    const actions: Record<string, unknown>[] = [];
+    let cursor: ScanCommandInput["ExclusiveStartKey"];
+
+    do {
+      const page = await db.send(
+        new ScanCommand({
+          TableName: "risk_agent_actions",
+          ExclusiveStartKey: cursor,
+        }),
+      );
+
+      actions.push(...(page.Items ?? []));
+      cursor = page.LastEvaluatedKey;
+    } while (cursor);
+
+    actions.sort((a, b) =>
+      String(b.created_at ?? "").localeCompare(
+        String(a.created_at ?? ""),
+      ),
+    );
+
+    return { actions, count: actions.length };
+  } catch (error) {
+    app.log.error(error, "Failed to load actions");
+
+    return reply.code(503).send({
+      error: "Action data is currently unavailable",
+    });
+  }
+});
+
 await app.listen({
   port: 3001,
   host: "127.0.0.1",
