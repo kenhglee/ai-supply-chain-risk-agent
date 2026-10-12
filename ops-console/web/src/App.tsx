@@ -14,11 +14,16 @@ export default function App() {
   const [selectedRisk, setSelectedRisk] = useState<Risk | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [refreshVersion, setRefreshVersion] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
 
     async function loadRisks() {
+
+      setLoading(true);
+      setError(null);
+
       try {
         const response = await fetch("/api/risks", {
           signal: controller.signal,
@@ -32,6 +37,11 @@ export default function App() {
           await response.json();
 
         setRisks(data.risks);
+        setSelectedRisk((current) =>
+          current
+            ? data.risks.find((risk) => risk.pk === current.pk) ?? null
+            : null,
+        );
       } catch (error) {
         if (controller.signal.aborted) return;
 
@@ -48,12 +58,22 @@ export default function App() {
     void loadRisks();
 
     return () => controller.abort();
-  }, []);
+  }, [refreshVersion]);
 
   return (
     <main>
       <h1>Agent Operations Console</h1>
-      <h2>Supplier risks</h2>
+      <div className="risk-toolbar">
+        <h2>Supplier risks</h2>
+        <button
+          className="refresh-button"
+          type="button"
+          disabled={loading}
+          onClick={() => setRefreshVersion((version) => version + 1)}
+        >
+          {loading ? "Loading…" : "Refresh"}
+        </button>
+      </div>
 
       {loading && <p role="status">Loading risks…</p>}
       {error && <p role="alert">{error}</p>}

@@ -107,3 +107,25 @@ section p:last-child {
     padding: 28px 16px;
   }
 }
+
+.risk-toolbar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.risk-toolbar h2 {
+  margin: 0;
+}
+
+.refresh-button {
+  width: auto;
+  padding: 8px 16px;
+}
+
+.refresh-button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
