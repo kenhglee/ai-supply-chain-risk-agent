@@ -53,6 +53,8 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 | `BEDROCK_KB_TOP_K` | `4` | Number of KB results to request (bedrock_kb only) |
 | `EMBEDDING_PROVIDER` | `openai` | FAISS embeddings: `openai` (`OpenAIEmbeddings`) or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`, default AWS credential chain). Lambda sets `bedrock` |
 | `CHECKPOINT_TABLE` | — | DynamoDB table for LangGraph checkpoints (`risk_agent_checkpoints`). Required only for Lambda `checkpoint_start` / `checkpoint_resume` actions; the scheduled RSS path is not checkpointed |
+| `AUTHORITY_TABLE` | — | Runtime authority table (`risk_agent_authority`). If this or `ACTIONS_TABLE` is unset, the checkpointed lifecycle denies every governed action (fail closed) |
+| `ACTIONS_TABLE` | — | Action ledger table (`risk_agent_actions`) |
 
 ## Architecture
 
@@ -71,6 +73,7 @@ infer → decide → [retrieve] → analyze → validate → [fallback] → END
 - **retrieve**: FAISS similarity search over `app/storage/supplier_profiles.json`
 - **analyze**: LLM call — returns structured JSON alert with supplier, risk_type, risk_level, impact
 - **validate**: checks required fields; routes to fallback on failure
+- **act** (checkpointed lifecycle only, `build_app(checkpointer, action_gate=...)`): governed privileged action (mock review ticket) for a valid `ok` alert, admitted only if the durable authority item `agent#supplier-risk-agent` is `ACTIVE` (atomic authority check + action-ledger claim). On denial the thread stays at `next=["act"]` and a later RESUME re-runs only `act`. The Phase 2 graph has no `act` node. See "Runtime authority and governed actions (Phase 3D)" in `docs/Architecture.md`; operator CLI: `python -m app.governance.authority_cli show|revoke|restore`
 
 **Important**: `supplier_risk_agent.py` has module-level initialization that runs at import time — it loads the graph JSON, builds the FAISS index (calling `OpenAIEmbeddings()`), and instantiates the LLM. `OPENAI_API_KEY` must be set even when using Bedrock as the LLM provider.
 
@@ -105,7 +108,7 @@ It is a separate interaction layer intended for AI assistants and manual workflo
   - `{"action": "checkpoint_start", "headline": "..."}` → `start_workflow(..., pause_before=["analyze"])`, returns `status=paused`, `thread_id`, `trace_id`
   - `{"action": "checkpoint_resume", "thread_id": "thread-<32 hex>"}` → `resume_workflow(thread_id)`; accepts no other input
   - malformed/unknown → 400, unknown thread → 404; saver and stores are built per invocation (continuity is only DynamoDB + `thread_id`)
-- `app/workers/risk_worker.py` — runtime-neutral equivalent for containers or plain Python: `python -m app.workers.risk_worker start --headline "..."` / `resume --thread-id thread-<32 hex>`. It uses the same `risk_workflow` lifecycle and `docker/worker.env` (Lambda env mirror, no credentials). In the Lambda image, run it with `--entrypoint python`. Phase 3C1 proved Lambda START → local Docker RESUME on one image digest (see `docs/Architecture.md`)
+- `app/workers/risk_worker.py` — runtime-neutral equivalent for containers or plain Python: `python -m app.workers.risk_worker start --headline "..."` / `resume --thread-id thread-<32 hex>`. It uses the same `risk_workflow` lifecycle and `docker/worker.env` (Lambda env mirror, no credentials). In the Lambda image, run it with `--entrypoint python`. Phase 3C1 proved Lambda START → local Docker RESUME on one image digest (see `docs/Architecture.md`). `session` runs one long-lived process that reads `{"start": ...}` / `{"resume": ...}` JSON lines from stdin; exit code 4 means `authority_denied`
 - `handlers/github_webhook_handler/handler.py` — wraps the GitHub pipeline; exposed via Lambda Function URL; verifies HMAC signature before processing
 
 ### Data Flow

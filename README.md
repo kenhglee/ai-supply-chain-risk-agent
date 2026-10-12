@@ -943,6 +943,7 @@ The `/api/traces/{identifier}/explanation` endpoint also includes this informati
 | End-to-end LangGraph run with `RETRIEVER_PROVIDER=bedrock_kb` | Passed — full `infer → decide → retrieve → analyze → validate` path executed |
 | `OPENAI_API_KEY` not required on Bedrock KB path | Confirmed — workflow ran without it when `LLM_PROVIDER=bedrock` and `RETRIEVER_PROVIDER=bedrock_kb` |
 | Container runtime portability (Phase 3C1): Lambda START → local Docker RESUME | Passed — same image digest (`sha256:a0500bbe…`). Docker resumed `thread-fa78851119384563a725219cee7707c4` from its `thread_id` alone, ran only `analyze → validate`, and wrote supplier state once. Repeat RESUMEs from Docker and from a different Lambda executor returned `already_completed`. Details in `docs/Architecture.md` |
+| Runtime authority revoke/restore (Phase 3D3): one long-lived Docker executor | Passed. One container and process (`executor_id=c512d0a1cec3:1`, `restarts=0`) ran T1's governed action under ACTIVE v1. After an external revoke (REVOKED v2), T2 was denied at `act` with no ticket and no supplier-state change, and the thread stayed at `next=["act"]`. After an external restore (ACTIVE v3), resuming T2 from its `thread_id` ran only `act`: one claim, one ticket, then the supplier-state write. A repeat RESUME was a no-op. Not shown: separation of duties, IAM-level enforcement, exactly-once execution. Details in `docs/Architecture.md` |
 
 Trace record from the end-to-end run confirmed:
 

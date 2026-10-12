@@ -88,7 +88,11 @@ app/
     risk_workflow.py          # Checkpointed START / RESUME lifecycle over the same graph
     github_risk_evaluator.py  # Rule-based risk scorer (GitHub pipeline)
   workers/
-    risk_worker.py            # Runtime-neutral START / RESUME CLI for containers and plain Python
+    risk_worker.py            # Runtime-neutral START / RESUME / session CLI for containers and plain Python
+  governance/
+    authority.py              # Durable runtime authority (ACTIVE / REVOKED, versioned) per scope
+    action_ledger.py          # Action ledger + gate: transactional authority check and claim; fail-closed gate
+    authority_cli.py          # Operator CLI: show / revoke / restore
 
 handlers/
   rss_handler/handler.py           # Lambda entry point for RSS pipeline
@@ -395,24 +399,27 @@ Run with: `cd web && npm test`
 
 ## Checkpointed Workflow Lifecycle
 
-`app/workflows/risk_workflow.py` runs the same graph (`build_app(checkpointer)`) with durable checkpoints so a workflow can pause in one process and continue in another. The Lambda reaches it only through explicit `checkpoint_start` / `checkpoint_resume` actions; the Phase 2 path (`run_pipeline` → `process_alert_row`) is unchanged and uncheckpointed.
+`app/workflows/risk_workflow.py` runs the graph with durable checkpoints so a workflow can pause in one process and continue in another. It compiles the governed variant, `build_app(checkpointer, action_gate=...)`, which adds the privileged `act` node after `validate` (see [Runtime authority and governed actions](#runtime-authority-and-governed-actions-phase-3d)). The Lambda reaches it only through explicit `checkpoint_start` / `checkpoint_resume` actions. The Phase 2 path (`run_pipeline` → `process_alert_row`) is unchanged: it is uncheckpointed and has no `act` node.
 
 **Identity**
 - `thread_id` (`thread-<uuid>`) identifies the durable workflow and is the checkpoint key.
 - `trace_id` identifies one execution attempt. START and every RESUME get a new one, so one thread has one trace record per attempt.
 
-**Operations** (both take an explicit `checkpointer` and `risk_store`; both invoke with `durability="sync"`)
+**Operations** (both take an explicit `checkpointer` and `risk_store`, plus a keyword-only `action_gate` dependency; both invoke with `durability="sync"`)
 
 | Call | Behavior | Outcome `status` |
 |---|---|---|
-| `start_workflow(row, pause_before=None)` | New `thread_id` and `trace_id`, run until pause or END | `paused`, `completed`, or `ignored` (pre-filtered headline, no thread) |
-| `resume_workflow(thread_id)` | No checkpoint → stop. Already at END → stop. Otherwise stamp a new `trace_id` into state and `invoke(None)` | `not_found`, `already_completed`, `paused`, `completed` |
+| `start_workflow(row, pause_before=None)` | New `thread_id` and `trace_id`, run until pause or END | `paused`, `completed`, `authority_denied`, or `ignored` (pre-filtered headline, no thread) |
+| `resume_workflow(thread_id)` | No checkpoint → stop. Already at END → stop. Otherwise stamp a new `trace_id` into state and `invoke(None)` | `not_found`, `already_completed`, `paused`, `completed`, `authority_denied` |
 
-RESUME takes no workflow input, so a completed thread can't be restarted by passing new input to `invoke`.
+RESUME takes no workflow input, so a completed thread can't be restarted by passing new input to `invoke`. Omitting `action_gate` doesn't skip governance: it denies every privileged action (fail closed).
 
 **Settlement.** After each invoke, `app.get_state(config).next` decides the outcome before any business write:
 - **Non-empty `next`, paused.** No `compare_and_update_risk_state` call. A trace is written with `workflow_event="paused"` and `change_type=null`.
-- **Empty `next`, completed.** `finalize_completed_run` (shared with `process_alert_row`) updates supplier state and writes a trace with `workflow_event="started_completed"` or `"resumed_completed"`.
+- **Empty `next`, completed.** `finalize_completed_run` (shared with `process_alert_row`) updates supplier state and writes a trace with `workflow_event="started_completed"` or `"resumed_completed"`, including the action fields when `act` ran.
+- **`act` refused by authority.** The invoke raises `AuthorityDenied`. No business write happens, the thread stays at `next=["act"]`, and a trace is written with `workflow_event="authority_denied"`.
+
+Outcomes also carry `action_id`, `action_status` and `authority_version` (all `null` when no governed action was reached).
 
 **Checkpoint table** (`DynamoCheckpointSaver`): PK `thread_id`, SK `sk`.
 - Checkpoint items are `chk#{ns}#{checkpoint_id}` and hold the whole serialized checkpoint.
@@ -424,7 +431,7 @@ RESUME takes no workflow input, so a completed thread can't be restarted by pass
 **Guarantees and limits**
 - **Durable continuation with at-least-once node execution.** A node interrupted mid-run (for example an LLM call) runs again on resume.
 - **Not exactly-once between graph completion and business state.** If the process dies after the graph reaches END but before supplier state is written, the checkpoint already shows completion. RESUME then returns `already_completed` and that state write is lost.
-- **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent.
+- **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent. (The action ledger does stop the governed action itself from being claimed twice; see Phase 3D.)
 - **`executor_id` is audit only** (`AWS_LAMBDA_LOG_STREAM_NAME`, or `host:pid` locally). A warm Lambda environment can run several attempts.
 - **Not handled yet:** checkpoint TTL/cleanup, batching checkpoint writes (one run is roughly 80 `PutItem` calls), a concurrency lease, and the audit gap when a resume fails after the new `trace_id` is stamped.
 
@@ -438,7 +445,9 @@ The RSS Lambda accepts two explicit actions in addition to its normal events:
 | `{"action": "checkpoint_resume", "thread_id": "thread-<32 hex>"}` | `resume_workflow(thread_id)`. No other keys accepted: RESUME takes no workflow input | 200 (`completed`, `already_completed`, `paused`), 404 (`not_found`) |
 | any other `action`, missing/extra keys, blank headline, malformed `thread_id` | rejected before any work | 400 |
 
-The response body has `action`, `status`, `thread_id`, `trace_id`, `next`, `change_type`, `state_written`, `final_status`, `supplier`, `executor_id`, `request_id`. Logs: `checkpoint_action_start`, `checkpoint_action_complete`, `checkpoint_action_rejected`.
+The response body has `action`, `status`, `thread_id`, `trace_id`, `next`, `change_type`, `state_written`, `final_status`, `supplier`, `action_id`, `action_status`, `authority_version`, `executor_id`, `request_id`. An `authority_denied` outcome is also a 200. Logs: `checkpoint_action_start`, `checkpoint_action_complete`, `checkpoint_action_rejected`.
+
+The handler code includes the Phase 3D gate, but the **deployed** Lambda still runs the pre-3D image (`sha256:a0500bbe…`, no `act` node). Its role and environment have no access to the governance tables. A Lambda built from current code would therefore deny every governed action (fail closed) until those are added.
 
 - **Dependencies per invocation.** `DynamoCheckpointSaver(CHECKPOINT_TABLE)` and `get_risk_store()` are built fresh on every action, so continuity comes only from DynamoDB and `thread_id`. A missing `CHECKPOINT_TABLE` is a configuration error (the invocation fails); it is not a 4xx.
 - **Infrastructure.** Table `risk_agent_checkpoints` (on-demand billing, PK `thread_id`, SK `sk`, no GSI, no TTL). The Lambda role has `dynamodb:Query` and `dynamodb:PutItem` on that table only (`RiskCheckpointAccess`), plus `bedrock:InvokeModel` on `amazon.titan-embed-text-v2:0` in us-west-2.
@@ -458,9 +467,10 @@ The response body has `action`, `status`, `thread_id`, `trace_id`, `next`, `chan
 ```
 python -m app.workers.risk_worker start  --headline "..."
 python -m app.workers.risk_worker resume --thread-id thread-<32 hex>   # no other input accepted
+python -m app.workers.risk_worker session                              # Phase 3D: long-lived, commands on stdin
 ```
 
-It prints one JSON outcome line and exits with 0 (success), 2 (invalid arguments) or 3 (`not_found`).
+`start` and `resume` print one JSON outcome line and exit with 0 (success), 2 (invalid arguments), 3 (`not_found`) or 4 (`authority_denied`, added in Phase 3D). `session` is described under Phase 3D.
 
 Running it from the Lambda image needs an entrypoint override, because the image's default entrypoint is Lambda's bootstrap script:
 
@@ -540,6 +550,184 @@ docker run --rm --platform linux/amd64 --hostname c1-docker-worker \
 - Concurrent RESUME of one thread is not protected.
 - The Docker worker used temporary `ken-ai-dev` credentials for portability testing, not a dedicated least-privilege workload identity.
 
+### Runtime authority and governed actions (Phase 3D)
+
+The checkpointed workflow can perform one privileged action, and an operator can govern it through durable state outside the executor. **Revoking authority is not killing compute.** The executor keeps running. Its next attempt to perform a privileged action is refused, and the workflow stays durably parked at that action until authority is restored.
+
+#### State separation
+
+Each concern has its own durable store. None of them is derived from another, and none lives in the executor:
+
+| Concern | Store | Key | Written by |
+|---|---|---|---|
+| Workflow progress | `risk_agent_checkpoints` (`DynamoCheckpointSaver`) | `thread_id` + `sk` | LangGraph, after every node |
+| Business state | `supplier_risk_state` (`RiskStateStore`) | `{supplier}#{risk_type}` | `finalize_completed_run`, only after the graph reaches END |
+| Action lifecycle and idempotency | `risk_agent_actions` (`app/governance/action_ledger.py`) | `action_id` | The `act` node, through the action gate |
+| Authority | `risk_agent_authority` (`app/governance/authority.py`) | `scope_id` | The operator only (`authority_cli`); the agent only reads it |
+| Audit | `risk_traces` (`risk_trace_store.py`) | `trace_id` | One record per execution attempt, including denials |
+
+#### Governed-action boundary
+
+The checkpointed graph adds one node, `act`, between `validate` and END:
+
+```
+… → analyze → validate ──ok + valid──► act → END
+                       ├──inconclusive──► END
+                       └──invalid──► fallback → END
+```
+
+- **Only `build_app(checkpointer, action_gate=...)` has `act`.** The module-level Phase 2 graph is unchanged and performs no privileged action.
+- **`act` opens a review ticket** for a valid supplier-specific alert. It uses the mock ServiceNow `create_servicenow_ticket`, so there is no external system of record.
+- **The action ID is deterministic:** `action#{thread_id}#open_review_ticket`. A re-run of `act`, after a denial or a crash, maps to the same ledger item. The ticket's `correlation_id` equals the action ID.
+- **A denial produces no checkpoint for `act`.** `act` raises `AuthorityDenied`, so LangGraph saves no output from it, and the latest checkpoint keeps `next=("act",)`. Earlier nodes are not re-run. A later RESUME, by any executor and given only the `thread_id`, runs just `act`.
+- **Supplier state is written only after `act` succeeds and the graph reaches END.** A denied workflow therefore leaves business state untouched.
+
+#### Authority table (`risk_agent_authority`)
+
+**Item shape:** `{scope_id, status: ACTIVE | REVOKED, version, reason, updated_by, updated_at}`. The agent's scope is fixed in code as `agent#supplier-risk-agent`; an executor can't choose its own scope through configuration.
+
+**Changes and reads**
+- **Who changes it:** only the operator CLI.
+  ```
+  python -m app.governance.authority_cli show
+  python -m app.governance.authority_cli revoke  --reason "..." [--actor NAME]
+  python -m app.governance.authority_cli restore --reason "..." [--actor NAME]
+  ```
+- **Versioning:** every change increments `version` with a conditional `UpdateItem`.
+- **`restore` also serves as the initial grant:** it creates the item at version 1.
+- **`revoke` never creates an item:** revoking an unknown scope is an error.
+- **Reads** are strongly consistent `GetItem`s, made at every privileged action rather than cached per process.
+
+**A missing item means not authorized.** The table is deliberately not seeded by Terraform, so a later `terraform apply` can never undo an operator's revocation.
+
+#### Action ledger (`risk_agent_actions`)
+
+**Statuses**
+- `DENIED`: admission refused; the action can be admitted later.
+- `IN_FLIGHT`: claimed; the effect may or may not have happened.
+- `COMPLETED`: the effect is done and its result recorded.
+
+**Admission is one DynamoDB transaction** (`TransactWriteItems`):
+1. A `ConditionCheck` that the authority item is `ACTIVE` **at the version just read**.
+2. An `Update` that moves the action to `IN_FLIGHT` (incrementing `attempt_count`), allowed only if the action is new or `DENIED`.
+
+"Authority allowed it" and "this attempt claimed it" are therefore one atomic decision. A revocation between the authority read and the transaction cancels the claim. If authority was revoked and restored in that gap, admission retries against the newer version. The admitting `authority_version` is recorded on the action.
+
+**After admission**
+- The effect runs.
+- `complete()` sets `COMPLETED` together with the effect's result, conditional on the item still being `IN_FLIGHT` and claimed by the same `trace_id`.
+
+**Refusals and replays**
+- **Revoked or missing authority:** the action is recorded as `DENIED` (`denied_authority_status`, `denied_authority_version`, `denied_count`, `denied_by_trace_id`, `denied_executor`), and `AuthorityDenied` is raised. Denial never downgrades an `IN_FLIGHT` or `COMPLETED` item. These denial fields are kept when the action is later admitted.
+- **Already `COMPLETED`:** the stored result is returned (`replayed=true`) and the effect does not run again.
+- **Already `IN_FLIGHT`:** `ActionInFlight` is raised. An earlier claim never completed and needs reconciliation, which is not implemented, so the action is not re-executed.
+
+#### Fail-closed configuration
+
+- **Missing governance tables:** `checkpoint_dependencies_from_env()` builds the gate from `AUTHORITY_TABLE` and `ACTIONS_TABLE`. If either is unset, it returns a gate that denies every action with status `UNCONFIGURED`.
+- **No gate passed to the lifecycle:** `start_workflow` / `resume_workflow` with no `action_gate` deny in the same way.
+- **Why:** skipping the action instead would let an unconfigured executor bypass authority.
+- **Missing authority item:** denied with status `MISSING`.
+
+#### Revocation semantics
+
+- **Revocation is prospective.** It governs the *next* admission. An effect already admitted (`IN_FLIGHT`) is not interrupted and is recorded with the version that admitted it.
+- **Revocation does not stop compute.** Ungated work, such as `analyze`'s Bedrock call, still runs under revoked authority; only the privileged action is refused.
+- **Terminating the executor is not a kill switch.** C1/C2 showed that any new executor can resume a workflow from its `thread_id`. Authority, not process lifetime, decides whether the action happens.
+
+#### Executor interfaces
+
+- **`risk_worker session`** is a long-lived executor. One process reads commands from stdin, one JSON object per line (`{"start": "<headline>"}` or `{"resume": "thread-…"}`), and prints one outcome line per command until EOF. Malformed lines produce an `error` line without ending the session. Dependencies are built once per session, so authority is shown to be re-read per action rather than cached per process.
+- **`risk_worker start|resume`** exits with 4 on `authority_denied`.
+- **The Lambda handler** returns `authority_denied` as a 200.
+
+#### Infrastructure (`terraform/governance.tf`)
+
+- **Tables:** `risk_agent_authority` (PK `scope_id`) and `risk_agent_actions` (PK `action_id`), both on-demand billing, with no GSI, streams or TTL.
+- **No IAM change:** the Lambda role has no access to either table.
+- **Container wiring:** the container worker gets `AUTHORITY_TABLE` and `ACTIONS_TABLE` as runtime `-e` overrides; `docker/worker.env` does not contain them.
+
+#### Live experiment (Phase 3D3)
+
+**Claim.** A single live agent executor was permitted to perform a governed action under ACTIVE authority, denied a subsequent action after authority was externally revoked without stopping or restarting the executor, and then resumed the denied workflow from the action boundary after authority was externally restored. Workflow progress, authority state, action state, and business state remained independently durable.
+
+*Setup*
+
+| Item | Value |
+|---|---|
+| Run ID | `3D3-20261011T224648Z` (evidence kept outside the repo) |
+| Image | `risk-agent-3d3:6118769`, `sha256:8ff23cd319095ae81f1425663c648bed2c4ad0872798a04215dbe21cfed59161`, linux/amd64. Built from `6118769`, whose application code is the 3D1 commit `9adf6cc`. Local only: not pushed, not deployed |
+| Executor P | One `docker run -i … --entrypoint python <image> -m app.workers.risk_worker session` with `--env-file docker/worker.env`, plus `-e AUTHORITY_TABLE=risk_agent_authority -e ACTIONS_TABLE=risk_agent_actions` |
+| P's credentials | Temporary `ken-ai-dev` credentials passed by name only |
+| Driving P | Commands written as single JSON lines to a named pipe. A separate holder process kept the pipe open; it was not part of the executor evidence |
+| Operator | `authority_cli`, run from a separate host process with its own `ken-ai-dev` SSO session; it never touched P |
+| Lambda | Not invoked; image digest `sha256:a0500bbe…` unchanged before and after |
+
+*Sequence*
+
+| Step | Actor | Result |
+|---|---|---|
+| Seed | Operator | MISSING v0 → **ACTIVE v1** (`2026-10-11T22:50:00.188Z`) |
+| T1 START | P | `thread-6c64dae4e23948e3b2e9f4865fb835f1`: `paused`, `next=["analyze"]`, 5 checkpoints |
+| T1 RESUME | P | `completed`, action `COMPLETED` under **v1**, ticket `MOCK-CHG-F85F1219`, `state_written=true` (`suppressed`). Checkpoints 5 → 9 (`update`, `analyze`, `validate`, `act`) |
+| Revoke | Operator | ACTIVE v1 → **REVOKED v2** (`2026-10-12T00:48:54.256Z`). P unchanged before and after |
+| T2 START | P | `thread-4fc91cb5fd9447d6b99ab6b5f1d49070`: `paused`, `next=["analyze"]`, 5 checkpoints |
+| T2 RESUME | P | **`authority_denied`**, `next=["act"]`, action `DENIED` at **v2**, `state_written=false`. Checkpoints 5 → 8 (`update`, `analyze`, `validate`; no `act`). A separate read-only process confirmed `next=('act',)` with no `action_result` |
+| Restore | Operator | REVOKED v2 → **ACTIVE v3** (`2026-10-12T00:51:09.249Z`). P unchanged before and after |
+| T2 RESUME | P | `completed`, action `COMPLETED` under **v3**, ticket `MOCK-CHG-0D74B150`, `state_written=true`. Checkpoints 8 → **10** (`update`, `act` only) |
+| T2 RESUME (repeat) | P | `already_completed`, `state_written=false`. No change anywhere |
+| EOF | Holder closed | P exited with code 0 at `2026-10-12T00:53:49.916Z` |
+
+*Same-executor evidence*
+- **Container:** `c512d0a1cec3…`, host PID `94888`, started `2026-10-12T00:44:49.444Z`, `restarts=0`. It contained exactly one process (`python -m app.workers.risk_worker session`) from the first command to EOF.
+- **Snapshots:** identical before and after every transition.
+- **Executor identity:** all six responses and every ledger and trace record carry `executor_id=c512d0a1cec3:1` (Docker's default hostname is unique per container; Python ran as PID 1).
+- **Health:** no error lines; stderr was empty.
+
+*Supplier state (`TSMC#earthquake`, consistent reads)*
+
+| Snapshot | `last_headline` | `last_seen_at` |
+|---|---|---|
+| Before T2, after T1 | `… [3D3-20261011T224648Z-T1]` | `2026-10-12T00:47:19+00:00` |
+| After the v2 denial | **Identical item** (empty sorted full-item diff) | |
+| After the v3 resume | `… [3D3-20261011T224648Z-T2]` | `2026-10-12T00:51:19+00:00` |
+| After the repeat RESUME | Identical to the previous row | |
+
+Supplementary: the number of items whose `last_headline` equals the T2 headline was 0 after the denial and 1 after the v3 resume.
+
+*T2 traces* (all three carry T2's `thread_id`)
+- **`7a0290e5…`:** `paused`; steps `infer`, `decide`, `retrieve`.
+- **`a66ef86b…`:** `authority_denied`, `authority_status=REVOKED`, `authority_version=2`, `action_status=DENIED`; steps through `validate`, no `act`.
+- **`472983ad…`:** `resumed_completed`, `authority_version=3`. Its `infer`…`validate` steps are identical to the denial trace's, timestamps included (`analyze` at 00:49:15.627, `validate` at 00:49:18.185). **Only `act`** (00:51:18.187) started after the trace's `created_at` (00:51:18.097).
+- **The repeat RESUME** created no trace: 3 for T2, and 18 in the whole table, both unchanged.
+
+*T2 action ledger item*
+- `status=COMPLETED`, `attempt_count=1`, `authority_version=3`, `claimed_by_trace_id=472983ad…`.
+- The retained denial record is byte-identical to its post-denial state: `denied_count=1`, `denied_authority_status=REVOKED`, `denied_authority_version=2`, `denied_by_trace_id=a66ef86b…`.
+- `effect.ticket_id=MOCK-CHG-0D74B150`, with `correlation_id` equal to the action ID.
+- After the repeat RESUME the item was byte-identical, including `updated_at`. The ledger holds exactly two actions with two distinct tickets.
+
+*Exactly one effect.* The mock ticket has no external record, so the evidence is the ledger plus the claim-before-effect structure:
+- The effect runs only after the transaction claims the action.
+- `attempt_count=1` means exactly one claim.
+- `COMPLETED`, with the effect's own ticket ID, means that claim's effect ran.
+- A completed item can't be claimed again.
+
+*Operational notes*
+- **Credential lifetime:** P's credentials were checked for at least 45 minutes remaining. Fresh role credentials last about an hour, and P can't refresh them without restarting. The run took about 9 minutes.
+- **Cleanup:** after the run, the container (and its stored environment) was removed. A fresh Terraform plan showed no changes, and the governance items, checkpoints and traces were kept as evidence.
+
+**What 3D3 does not show**
+- **Separation of duties.** The operator and the executor both used `ken-ai-dev` (AdministratorAccess), so the executor could have restored its own authority.
+- **IAM-level enforcement.** Authority is enforced in application code; the executor's credentials could reach the tables or a ticketing API directly.
+- **Revocation of an already-admitted action.** Revocation takes effect at the next admission.
+- **Exactly-once execution.** At most one claim per `action_id` is enforced. A crash between the effect and `complete()` leaves the action `IN_FLIGHT`, with no recovery.
+- **Compensation.** A completed effect stays completed after revocation.
+- **Safe concurrent RESUME.** Two executors could still both run `analyze` and both write supplier state.
+- **Protection against stale images.** An executor running pre-3D code (no `act` node), such as the deployed Lambda, could complete a governed thread without any authority check. This was not exercised.
+- **Workload identity or EKS.** Not covered.
+- **An external system of record for the effect.**
+
 ### Phase 3 status
 
 Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
@@ -550,7 +738,11 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
 - [x] C1: container runtime portability (Lambda START → local Docker RESUME, same image digest)
 - [ ] Kubernetes: run the worker as a pod, and resume after a pod restart or replacement
 - [ ] Workload identity for the worker (least privilege, no developer credentials)
-- [ ] Kill switch / authority revocation
+- [x] 3D1: authority store, transactional action ledger, governed `act` node, fail-closed configuration, `session` worker (proven under moto)
+- [x] 3D2: `risk_agent_authority` and `risk_agent_actions` tables (Terraform)
+- [x] 3D3: live revoke/restore against one long-lived Docker executor (ACTIVE v1 allowed → REVOKED v2 denied at `act` → ACTIVE v3 resumed, only `act` ran → repeat RESUME no-op)
+- [x] 3D4: Phase 3D documentation (reviewed)
+- [ ] Separation of duties and IAM-level enforcement of authority (operator vs agent principals)
 
 ## Data Models and Storage
 
@@ -569,6 +761,7 @@ class RiskState(TypedDict):
     is_valid: Optional[bool]
     trace_steps: List[dict]
     retriever_metadata: Optional[dict]  # set by retrieve; None when skipped
+    action_result: Optional[dict]       # set by act (governed checkpointed graph only)
 ```
 
 ### LLM Alert Output (from `analyze` node)
@@ -626,7 +819,8 @@ For ignored alerts (pre-filter), `trace_steps` is `[]` and `run_duration_ms` is 
 
 Optional fields:
 - `executor_id` is recorded on every run.
-- `thread_id` and `workflow_event` are recorded only by the checkpointed lifecycle (`start_workflow` / `resume_workflow`). `workflow_event` is `paused`, `started_completed` or `resumed_completed`.
+- `thread_id` and `workflow_event` are recorded only by the checkpointed lifecycle (`start_workflow` / `resume_workflow`). `workflow_event` is `paused`, `started_completed`, `resumed_completed` or `authority_denied`.
+- `action_id`, `action_status` and `authority_version` are recorded when a governed action was reached. `authority_status` (`REVOKED`, `MISSING`, `UNCONFIGURED`) is recorded on `authority_denied` traces.
 - The uncheckpointed Phase 2 path (`process_alert_row`) has no durable workflow, so it records neither field; `trace_id` is its only identity.
 
 For a resumed attempt, `trace_steps` is the cumulative list from checkpoint state, while `run_duration_ms` covers only that attempt.
@@ -641,6 +835,8 @@ Separate stores in `app/storage/`, each with its own data model and configuratio
 | Decision ledger | `risk_state_store.py` | GitHub / software supply chain risk decisions | `DECISION_STORE_BACKEND`, `RISK_DECISIONS_TABLE` |
 | Risk traces | `risk_trace_store.py` | Per-run audit trace of the LangGraph agent | `TRACE_STORE_BACKEND`, `RISK_TRACES_TABLE` |
 | Workflow checkpoints | `checkpoint_store.py` | LangGraph execution progress per `thread_id` (checkpointed lifecycle only) | `CHECKPOINT_TABLE` (Lambda checkpoint actions) |
+| Runtime authority | `app/governance/authority.py` | Operator-controlled `ACTIVE` / `REVOKED` state per scope, versioned | `AUTHORITY_TABLE` |
+| Action ledger | `app/governance/action_ledger.py` | Lifecycle and idempotency of governed side effects per `action_id` | `ACTIONS_TABLE` |
 
 Despite its name, `risk_state_store.py` is the GitHub decision ledger, not supplier risk state.
 
@@ -702,6 +898,8 @@ Written by `app/storage/risk_state_store.py` (JSONL locally, or the `RISK_DECISI
 | `BEDROCK_KB_TOP_K` | `4` | Number of results to request from the KB |
 | `EMBEDDING_PROVIDER` | `openai` | FAISS embeddings: `openai` or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`); Lambda uses `bedrock` |
 | `CHECKPOINT_TABLE` | — | LangGraph checkpoint table for Lambda `checkpoint_start` / `checkpoint_resume`; Lambda uses `risk_agent_checkpoints` |
+| `AUTHORITY_TABLE` | — | Runtime authority table (`risk_agent_authority`). If it or `ACTIONS_TABLE` is unset, the checkpointed lifecycle denies every governed action (fail closed) |
+| `ACTIONS_TABLE` | — | Action ledger table (`risk_agent_actions`) |
 | `CORPUS_S3_BUCKET` | — | S3 bucket for supplier corpus (publish script) |
 | `CORPUS_S3_PREFIX` | `supplier-profiles/` | Key prefix within the corpus bucket |
 | `TRACE_STORE_BACKEND` | `jsonl` | `jsonl` (local/dev) or `dynamodb` (Lambda) |
