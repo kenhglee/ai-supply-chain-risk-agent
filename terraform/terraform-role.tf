@@ -114,6 +114,43 @@ resource "aws_iam_role_policy" "terraform_deployment" {
           }
         }
       },
+      # Phase 3E. ARNs are built from names, not resource references, so this
+      # statement can be applied (by an admin, targeted) before the worker role
+      # exists. Deliberately absent: iam:AttachRolePolicy / iam:DetachRolePolicy
+      # on the worker role (attaching the Deny policy is the operator's runtime
+      # switch, not a deployment action) and iam:PassRole (no service uses the role).
+      {
+        Sid    = "ManageBedrockWorkerRole"
+        Effect = "Allow"
+        Action = [
+          "iam:GetRole",
+          "iam:CreateRole",
+          "iam:DeleteRole",
+          "iam:UpdateRole",
+          "iam:UpdateAssumeRolePolicy",
+          "iam:ListRolePolicies",
+          "iam:GetRolePolicy",
+          "iam:PutRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:ListAttachedRolePolicies",
+          "iam:ListInstanceProfilesForRole"
+        ]
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.bedrock_worker_role_name}"
+      },
+      {
+        Sid    = "ManageBedrockClaudeDenyPolicy"
+        Effect = "Allow"
+        Action = [
+          "iam:CreatePolicy",
+          "iam:GetPolicy",
+          "iam:GetPolicyVersion",
+          "iam:ListPolicyVersions",
+          "iam:CreatePolicyVersion",
+          "iam:DeletePolicyVersion",
+          "iam:DeletePolicy"
+        ]
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/${local.bedrock_claude_deny_name}"
+      },
       {
         Sid    = "InspectTerraformDeploymentRole"
         Effect = "Allow"
