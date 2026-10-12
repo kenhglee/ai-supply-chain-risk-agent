@@ -93,6 +93,10 @@ app/
     authority.py              # Durable runtime authority (ACTIVE / REVOKED, versioned) per scope
     action_ledger.py          # Action ledger + gate: transactional authority check and claim; fail-closed gate
     authority_cli.py          # Operator CLI: show / revoke / restore
+    policy.py                 # Phase 3F: policy schema, capability catalog, plan, materializer, latest pointer
+    policy_cli.py             # Phase 3F materializer CLI: validate / plan / apply / status / repair
+
+policies/                     # Phase 3F declarative policy versions (intent only; never read at runtime)
 
 handlers/
   rss_handler/handler.py           # Lambda entry point for RSS pipeline
@@ -632,7 +636,7 @@ Each concern has its own durable store. None of them is derived from another, an
 | Workflow progress | `risk_agent_checkpoints` (`DynamoCheckpointSaver`) | `thread_id` + `sk` | LangGraph, after every node |
 | Business state | `supplier_risk_state` (`RiskStateStore`) | `{supplier}#{risk_type}` | `finalize_completed_run`, only after the graph reaches END |
 | Action lifecycle and idempotency | `risk_agent_actions` (`app/governance/action_ledger.py`) | `action_id` | The `act` node, through the action gate |
-| Authority | `risk_agent_authority` (`app/governance/authority.py`) | `scope_id` | The operator only (`authority_cli`); the agent only reads it |
+| Authority | `risk_agent_authority` (`app/governance/authority.py`) | `scope_id` | Emergency item `agent#…`: the operator only (`authority_cli`). Since Phase 3F the table also holds materialized policy (`policy#…`, `policymat#…`), written only by the policy materializer. The agent only reads it |
 | Audit | `risk_traces` (`risk_trace_store.py`) | `trace_id` | One record per execution attempt, including denials |
 
 #### Governed-action boundary
@@ -678,7 +682,8 @@ The checkpointed graph adds one node, `act`, between `validate` and END:
 
 **Admission is one DynamoDB transaction** (`TransactWriteItems`):
 1. A `ConditionCheck` that the authority item is `ACTIVE` **at the version just read**.
-2. An `Update` that moves the action to `IN_FLIGHT` (incrementing `attempt_count`), allowed only if the action is new or `DENIED`.
+2. *(Added in Phase 3F)* A `ConditionCheck` that the materialized policy item `policy#<agent>#<capability>` has `effect = allow` **at the policy version and hash just read**. A missing or malformed item denies (`POLICY_MISSING` / `POLICY_INVALID`). See [Policy-as-code authority](#policy-as-code-authority-phase-3f).
+3. An `Update` that moves the action to `IN_FLIGHT` (incrementing `attempt_count`), allowed only if the action is new or `DENIED`. The claim also records `policy_version` and `policy_sha256`.
 
 "Authority allowed it" and "this attempt claimed it" are therefore one atomic decision. A revocation between the authority read and the transaction cancels the claim. If authority was revoked and restored in that gap, admission retries against the newer version. The admitting `authority_version` is recorded on the action.
 
@@ -916,6 +921,139 @@ All four Bedrock denials carry AWS's own text:
 - **Deterministic IAM propagation time.** Only upper bounds were observed (≤ 17.1 s and ≤ 12.0 s).
 - **Replacing the Phase 3D application-level action gate.** The two are independent layers.
 
+### Policy-as-code authority (Phase 3F)
+
+Phases 3D and 3E each added one runtime switch at one boundary. Phase 3F adds **declarative, versioned, capability-specific policy intent**. A materializer compiles it into the enforcement boundary that can actually enforce each capability. There is **no universal agent policy and no single on/off switch**: each capability is governed only by the layers that apply to it.
+
+```
+effective authority for capability C
+  = applicable platform ceiling(s) for C
+  ∩ materialized policy for C
+  ∩ applicable emergency control(s) for C
+```
+
+Not every capability has all three layers:
+
+| Capability | Boundary | Platform ceiling | Materialized policy | Emergency control |
+|---|---|---|---|---|
+| `open_review_ticket` | Application (action admission) | Code: the `act` node exists on the checkpointed graph | `policy#supplier-risk-agent#open_review_ticket` item (`allow` / `deny`) | `agent#supplier-risk-agent` item (`ACTIVE` / `REVOKED`, 3D) |
+| `claude_inference` | AWS IAM (Bedrock) | `RiskAgentGovernedWorkerRole` inline Claude Allow | Attachment of `RiskAgentPolicyClaudeDeny` (attached means deny) | Attachment of `RiskAgentBedrockClaudeDeny` (3E) |
+| `titan_embeddings` | AWS IAM | **Deny**: Titan is outside the governed worker's capability ceiling (no Titan permission is granted) | Not materializable; an `allow` is rejected as beyond the ceiling | — |
+
+#### Policy, catalog and validation (`app/governance/policy.py`)
+- **Policy document** (JSON, `policies/supplier-risk-agent.v<N>.json`):
+  ```json
+  {"policy_version": 3, "subject": "agent/supplier-risk-agent",
+   "capabilities": {"open_review_ticket": "deny", "claude_inference": "allow"}}
+  ```
+  - Exactly these three keys.
+  - `policy_version` is a positive integer.
+  - Effects are `allow` or `deny`.
+  - **A capability absent from the policy is denied.**
+- **Capability catalog** (code, not policy): maps each capability to its boundary, its platform ceiling and its materialization target. That keeps ARNs and table keys out of the policy file.
+- **Rejected before any state change:**
+  - malformed JSON, or missing or extra keys;
+  - an unknown subject or capability, or an unsupported effect;
+  - an `allow` beyond the capability's ceiling;
+  - an unreadable source;
+  - a version that is not greater than the latest completed materialization.
+- **Content hash:** `sha256:` over the canonical JSON (independent of key order and whitespace). Every materialized item, record, admission and denial carries the version and the hash.
+
+#### Policy source vs runtime state
+**The policy file is intent only; it is never read at runtime.** Enforcement points consume only materialized state:
+- **Application:** the `policy#…` item, checked by a `ConditionCheck` in the same DynamoDB transaction as the action claim (see the Action ledger above). There is no policy read followed by an unguarded claim.
+- **AWS:** the attachment state of the policy-layer Deny, enforced by IAM on every Bedrock request.
+
+Editing or deleting the file has no effect until it is materialized.
+
+#### Materialization (`app/governance/policy_cli.py validate | plan | apply | status | repair`)
+- **`plan`** lists per-capability changes and ordered steps. **Broadening is judged per capability:** any deny or absent → allow is broadening, including a newly introduced capability set to allow, regardless of how many capabilities are allowed in total. `apply` refuses a broadening without `--approve-broadening`, **before any write**.
+- **Tighten-first ordering:** all tightenings at every boundary first, then application re-stamps (unchanged effect, new version and hash), then broadenings last.
+  - A failure part-way leaves the system no less restrictive than either version.
+  - This is **ordering, not atomicity**: the application and IAM changes are separate operations.
+- **Durable records:** each versioned record `policymat#supplier-risk-agent#v<version>` goes `started` → `completed`, or `failed` with the steps that completed. Each step records its phase, operation, timestamp and, for IAM steps, the policy ARN and the AWS RequestId (an idempotent detach that finds nothing attached records none).
+- **Latest-completed pointer** `policymat#supplier-risk-agent#latest`:
+  - It records `policy_version`, `policy_sha256` and `materialization_key`, and is the materializer's **only** way to discover the current baseline (`GetItem`).
+  - It advances only after the versioned record is `completed`, with a conditional write: it never moves backwards; the same version and hash is an idempotent retry; the same version with a different hash is rejected. A failed materialization never advances it.
+  - **Fails closed** on a missing pointer next to existing policy items, a malformed pointer, or a pointer to a missing, non-completed or hash-mismatched record.
+  - **Crash between `completed` and the pointer update:** detected as `PointerBehind` (reported by `status`; any *different* version is blocked) and repaired by `repair` (advances the pointer without re-running steps) or by re-applying exactly that version and hash.
+- **Why not a DynamoDB Scan:** finding the latest record by scanning was rejected because `dynamodb:Scan` does not support the `dynamodb:LeadingKeys` condition. The materializer could then have read the whole authority table, emergency item included, instead of only its namespace. The pointer keeps the materializer to namespace-restricted `GetItem` / `PutItem`.
+- **Versions only move forward:** a rollback is a new version with the old content, never a reused number.
+
+#### Infrastructure and least privilege (`terraform/policy_governance.tf`)
+- **`RiskAgentGovernedWorkerRole`** (the runtime principal for this phase):
+  - the Claude Haiku `bedrock:InvokeModel` ceiling;
+  - `GetItem` / `ConditionCheckItem` on the authority table, only for the keys `agent#supplier-risk-agent` and `policy#supplier-risk-agent#open_review_ticket`;
+  - `GetItem` / `UpdateItem` on the actions table, only for `action#probe-*`;
+  - no IAM permissions, no Titan, no other tables.
+  - These DynamoDB actions were derived from the code (`tests/test_governance_iam_requirements.py`), not guessed.
+- **`RiskAgentPolicyClaudeDeny`:** the policy-layer explicit Deny of `bedrock:InvokeModel` / `InvokeModelWithResponseStream` on the Claude ARNs. **Terraform owns the document, never the attachment.** It is distinct from the emergency `RiskAgentBedrockClaudeDeny`.
+- **`RiskAgentPolicyMaterializerRole`:**
+  - `GetItem` / `PutItem` on the authority table, only for `policy#supplier-risk-agent#*` and `policymat#supplier-risk-agent#*`. No Scan or Query, and no access to the emergency item.
+  - `ListAttachedRolePolicies` on the governed worker.
+  - `AttachRolePolicy` / `DetachRolePolicy` on the governed worker **only when `iam:PolicyARN` equals `RiskAgentPolicyClaudeDeny`**. That condition key is supported for both actions per the AWS Service Reference, and was verified with the IAM policy simulator and live in F2c.
+  - It therefore can't touch the emergency Deny, other roles, inline policies, its own permissions or `PassRole`.
+- **Deploy-role extension:** `TerraformDeploymentRole` can define these objects but has no attach/detach or `PassRole` for them, the same pattern as 3E. A one-time admin bootstrap applied the extension.
+- **Idle cost:** $0 (IAM objects and on-demand DynamoDB items only).
+
+#### Live experiment (Phase 3F / F2c)
+
+| Item | Value |
+|---|---|
+| Run | `F2C-20261012T021653Z` (evidence kept outside the repo) |
+| Code | `8ff0fd8e5ce476d524e828c0b2889f8a3239b51d` |
+| Executor P | One long-lived probe process: PID `26946`, one STS session `assumed-role/RiskAgentGovernedWorkerRole/f2c-20261012t021653z-worker`, fingerprint `sha256:5101adebb15a6cd4`. Never restarted or re-credentialed; 25 commands (20 Claude probes, 5 `act` admissions); exit status 0 (captured directly) |
+| Materializer | `RiskAgentPolicyMaterializerRole`, one short-lived session per step |
+| Operator | SSO admin, used **only** for the emergency Deny |
+| Emergency DynamoDB item | `agent#supplier-risk-agent` stayed ACTIVE v3 throughout (never written) |
+| Policy hashes | v1 `0e1b91d2…`, v2 `8b07bcb1…`, v3 `893b1083…`, v4 `574bfcfd…` |
+
+| Step | Policy state | P's `act` (`open_review_ticket`) | P's Claude probe |
+|---|---|---|---|
+| **Before any policy** | none; no Deny attached | **DENIED, `POLICY_MISSING`** | **OK**: only the IAM ceiling applies until the policy layer is materialized |
+| **v1** (allow, allow), broadening approved | ticket allow v1; policy Deny detached | **COMPLETED citing v1 / `0e1b91d2`** | OK |
+| **v2** (deny, deny), tightening, no approval needed | ticket deny v2; policy Deny **attached** (`AttachRolePolicy` RequestId `bc5d2d1d-…`) | **DENIED, `POLICY_DENY`, citing v2 / `8b07bcb1`** | One OK during propagation, then **explicit-deny `AccessDeniedException` ×3 naming `RiskAgentPolicyClaudeDeny`** |
+| **v3 without approval** | **refused before any write**: pointer, item and attachment stayed v2 | — | — |
+| **v3** (deny, allow), broadening approved | ticket deny v3; policy Deny **detached** (RequestId `3be56b13-…`) | **DENIED citing v3 / `893b1083`** | **OK ×3** |
+| **Emergency Deny attached by the operator** (v3 unchanged) | v3; emergency Deny attached | — | Two OK during propagation, then **AccessDenied ×3 naming `RiskAgentBedrockClaudeDeny`** |
+| **Materializer tries to detach the emergency Deny** (one attempt) | — | — | **`AccessDenied`** for the materializer (RequestId `e0c1c72b-…`); still attached |
+| **Emergency Deny detached by the operator** | v3 | — | Two denials during propagation, then **OK ×3** |
+| **Invalid ceiling** (Titan `allow`) validate / plan / apply | **rejected, exit 2**: no new record; pointer v3; no IAM change | — | — |
+| **v4** (allow, allow; v1-equivalent content), broadening approved | ticket allow v4; pointer v4 | **COMPLETED citing v4 / `574bfcfd`** | OK |
+
+**Key results**
+- **Same policy version, two boundaries.** Policy v2 caused independently observable denial at both the application admission boundary and the AWS Bedrock boundary for the same live executor and session. Both outcomes are attributable to the same policy version and hash: the application denial cites v2 / `8b07bcb1`, and the v2 materialization record links that version and hash to the `AttachRolePolicy` RequestId behind the Bedrock denial (CloudTrail corroborates).
+- **Capability-specific authorization.** A single policy, v3, simultaneously denied `open_review_ticket` and allowed `claude_inference`. That is capability-specific authorization, not a global on/off switch for the agent.
+- **Emergency precedence.** While v3 allowed Claude, an independently controlled emergency IAM Deny still revoked Claude authority. The policy materializer could not remove that emergency control.
+- **Ceiling and approval.** A policy can't exceed the platform ceiling, and broadening requires explicit approval.
+
+**Propagation.** Observed upper bounds from the IAM change to the first observed new state: policy Deny attached ≤ 16.1 s; policy Deny detached ≤ 20.0 s; emergency Deny attached ≤ 10.2 s; emergency Deny detached ≤ 8.1 s.
+- **Old-state behavior was seen after both attaches and detaches:** successes continued briefly after an attach, and denials after a detach.
+- **Materialization is therefore not instantaneous across boundaries.** These figures are observational upper bounds, not guarantees.
+
+**CloudTrail** (at inspection time)
+- **IAM (us-east-1):** every materializer and operator `AttachRolePolicy` / `DetachRolePolicy` appears under the expected session, as does the materializer's refused attempt on the emergency Deny.
+- **Bedrock `Converse` (us-west-2):** 16 of P's 20 calls had been delivered, so not all are claimed as observed.
+
+**Final state:**
+- policy v4 (both allow);
+- both Deny policies detached (`AttachmentCount=0`);
+- emergency item ACTIVE v3;
+- all policy, materialization and action evidence kept;
+- Terraform: no changes.
+
+**Not proven**
+- **Cross-boundary atomicity.** Materialization is ordered tighten-first and recorded, but application and IAM changes are separate operations, and propagation windows were observed.
+- **Organizational separation of duties.** The materializer, operator and worker are distinct IAM roles, but the same human assumed all of them from one SSO admin session.
+- **Application-layer emergency precedence, live.** F2c exercised the emergency **IAM** Deny only. The DynamoDB emergency item stayed ACTIVE; its precedence over a policy allow is tested offline only.
+- **Interruption of an in-flight action or Bedrock request.**
+- **Exactly-once side effects.** At most one claim per `action_id`; the effect is a mock ticket with no external record.
+- **Deterministic IAM propagation time.** Only upper bounds were observed, and old-state behavior went both ways.
+- **Workload identity or EKS.** The roles were assumed from an SSO admin session on a laptop.
+- **Universal Bedrock governance.** Only the Claude Haiku inference profile and its foundation models are governed. Titan is outside the worker's ceiling, not policy-governed.
+- **The policy source file as an enforcement point.** Enforcement uses only materialized state.
+- **The full LangGraph workflow under policy.** The probe's `act` exercises the admission gate directly. The workflow integration of the same gate was proven under moto (F2a) and, for the emergency layer only, live in 3D3.
+
 ### Phase 3 status
 
 Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
@@ -943,6 +1081,12 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] Restore authority (operator detaches the Deny)
   - [x] Same executor/session successfully invokes Claude again
   - [x] Terraform remains independent of runtime switch state
+- F. Policy-as-code
+  - [x] F1: architecture (capability-specific intent materialized per boundary; no universal policy engine)
+  - [x] F2a: policy schema, capability catalog, validation, broadening detection, tighten-first materializer, second admission `ConditionCheck` (offline)
+  - [x] F2b: governed worker, policy-layer Deny and least-privilege materializer (Terraform); latest-completed pointer instead of Scan
+  - [x] F2c: live v1 → v2 → v3 → emergency override → invalid ceiling → v4, one executor and session across both boundaries
+  - [x] F2d: Phase 3F documentation
 - [ ] Separation of duties and IAM-level enforcement of authority (operator vs agent principals)
 
 ## Data Models and Storage
@@ -1037,6 +1181,7 @@ Separate stores in `app/storage/`, each with its own data model and configuratio
 | Risk traces | `risk_trace_store.py` | Per-run audit trace of the LangGraph agent | `TRACE_STORE_BACKEND`, `RISK_TRACES_TABLE` |
 | Workflow checkpoints | `checkpoint_store.py` | LangGraph execution progress per `thread_id` (checkpointed lifecycle only) | `CHECKPOINT_TABLE` (Lambda checkpoint actions) |
 | Runtime authority | `app/governance/authority.py` | Operator-controlled `ACTIVE` / `REVOKED` state per scope, versioned | `AUTHORITY_TABLE` |
+| Materialized policy | `app/governance/policy.py` | Per-capability policy items, versioned materialization records, and the latest-completed pointer (same table, `policy#` / `policymat#` keys) | `AUTHORITY_TABLE` |
 | Action ledger | `app/governance/action_ledger.py` | Lifecycle and idempotency of governed side effects per `action_id` | `ACTIONS_TABLE` |
 
 Despite its name, `risk_state_store.py` is the GitHub decision ledger, not supplier risk state.
