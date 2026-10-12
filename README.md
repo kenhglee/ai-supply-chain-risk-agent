@@ -185,7 +185,8 @@ handlers/
     └── handler.py
 
 scripts/
-└── integration_bedrock_kb.py  # live integration test for BedrockKBRetriever
+├── integration_bedrock_kb.py  # live integration test for BedrockKBRetriever
+└── bedrock_authority_probe.py # Phase 3E: command-driven Bedrock IAM authority probe
 
 mcp_server.py         # MCP server exposing risk tools
 
@@ -945,6 +946,7 @@ The `/api/traces/{identifier}/explanation` endpoint also includes this informati
 | Container runtime portability (Phase 3C1): Lambda START → local Docker RESUME | Passed — same image digest (`sha256:a0500bbe…`). Docker resumed `thread-fa78851119384563a725219cee7707c4` from its `thread_id` alone, ran only `analyze → validate`, and wrote supplier state once. Repeat RESUMEs from Docker and from a different Lambda executor returned `already_completed`. Details in `docs/Architecture.md` |
 | Kubernetes runtime disposability (Phase 3C2, local kind) | Passed, on the same C1 image digest (`sha256:a0500bbe…`). **C2a:** Pod A paused `thread-ceb4cd45…` before `analyze` and was deleted. Pod B resumed it from its `thread_id` alone, ran only `analyze → validate`, and wrote supplier state; Pod C returned `already_completed`. **C2+:** Pod D paused `thread-789398d4…` in cluster `risk-c2`, and the whole cluster was destroyed. Pod E in a newly created cluster, `risk-c2-resume`, completed the workflow from the DynamoDB checkpoint. Pre-destruction timestamps were kept, with a ~263 s gap before `analyze`. Not shown: EKS, workload identity, mid-node crash recovery, exactly-once, concurrent RESUME, SIGTERM handling. Details in `docs/Architecture.md` |
 | Runtime authority revoke/restore (Phase 3D3): one long-lived Docker executor | Passed. One container and process (`executor_id=c512d0a1cec3:1`, `restarts=0`) ran T1's governed action under ACTIVE v1. After an external revoke (REVOKED v2), T2 was denied at `act` with no ticket and no supplier-state change, and the thread stayed at `next=["act"]`. After an external restore (ACTIVE v3), resuming T2 from its `thread_id` ran only `act`: one claim, one ticket, then the supplier-state write. A repeat RESUME was a no-op. Not shown: separation of duties, IAM-level enforcement, exactly-once execution. Details in `docs/Architecture.md` |
+| Bedrock IAM authority revoke/restore (Phase 3E3): one long-lived probe process | Passed. PID 8985, session `RiskAgentBedrockWorkerRole/e3-20261012t012355z`, fingerprint `sha256:d64a56f65773063c`, all unchanged throughout. Claude Converse succeeded ×3. After the operator attached `RiskAgentBedrockClaudeDeny`: AWS explicit-deny `AccessDeniedException` ×3. The worker's own `iam:DetachRolePolicy` was denied, and Claude stayed denied. After the operator detached the Deny: ok ×3. `terraform plan` showed no changes while revoked. Propagation upper bounds ≤ 17.1 s / ≤ 12.0 s. Not shown: organizational separation of duties, in-flight request interruption, session revocation, workload identity. Details in `docs/Architecture.md` ("Bedrock IAM authority experiment (Phase 3E)") |
 
 Trace record from the end-to-end run confirmed:
 

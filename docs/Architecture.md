@@ -797,6 +797,125 @@ Supplementary: the number of items whose `last_headline` equals the T2 headline 
 - **Workload identity or EKS.** Not covered.
 - **An external system of record for the effect.**
 
+### Bedrock IAM authority experiment (Phase 3E)
+
+Phase 3D enforced authority at an **application** boundary: the `act` node consults a DynamoDB authority item. Phase 3E moves authority onto a real **AWS IAM / service** boundary. A live executor invokes Bedrock, loses that permission through IAM, gets a genuine AWS `AccessDeniedException`, regains it, and invokes Bedrock again. It is never terminated, restarted or given new credentials.
+
+#### Runtime identity and the switch (`terraform/bedrock_worker.tf`)
+
+| Object | Definition |
+|---|---|
+| `RiskAgentBedrockWorkerRole` | Dedicated runtime identity. Trust: this account's `AWSReservedSSO_AdministratorAccess_*` role (`aws:PrincipalArn`, ArnLike); `MaxSessionDuration` 3600 s |
+| Inline `BedrockClaudeInvoke` (its only permission) | Allow `bedrock:InvokeModel` on the Claude Haiku 4.5 inference profile (`us.anthropic.claude-haiku-4-5-20251001-v1:0`, us-west-2) and the three foundation-model ARNs it routes to (us-east-1, us-east-2, us-west-2). No IAM, DynamoDB, Titan or other Bedrock permission |
+| `RiskAgentBedrockClaudeDeny` (customer-managed policy) | Explicit Deny of `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on exactly the same four ARNs |
+
+**Who owns what**
+- **Terraform owns the mechanism:** the role, its Allow, and the Deny policy document.
+- **Terraform deliberately does not own the switch position.** It has no attachment resource, so a `terraform apply` can never undo a revocation, nor quietly restore one.
+- **The operator owns the switch.** Attaching the Deny to the role (`iam:AttachRolePolicy`) revokes; detaching it (`iam:DetachRolePolicy`) restores.
+
+**Who can flip the switch**
+- **The worker can't attach or detach its own Deny,** because its role has no IAM permissions at all.
+- **The deploy role can't either.** It manages the role and the policy, but its extension (`ManageBedrockWorkerRole` / `ManageBedrockClaudeDenyPolicy` in `terraform-role.tf`, applied once by an admin) excludes `iam:AttachRolePolicy`, `iam:DetachRolePolicy` and `iam:PassRole`.
+
+**Why an explicit Deny:** it overrides any Allow. AWS's own error message names both the denied session and the Deny policy. Identity-policy changes apply to role sessions **already issued** (after IAM propagation), so the executor's existing credentials are governed without being replaced.
+
+#### Probe (`scripts/bedrock_authority_probe.py`)
+
+- **One process, one session:** a command-driven, long-lived process with one boto3 session, one `bedrock-runtime` client and one `sts` client.
+- **One command, one request:** each stdin line `{"probe": "<label>"}` sends exactly one Converse request (prompt "Reply with OK.", `maxTokens=5`, `temperature=0`) and prints one JSON line.
+- **Retries disabled:** `total_max_attempts=1`, so every authorization result is a single request. (botocore's `max_attempts` key counts retries, so `max_attempts=1` would allow two attempts.)
+- **Start and end records:** PID, parent PID, hostname, start time; the STS caller identity; and a credential fingerprint, `sha256:` of the access key ID. Credentials are never printed.
+- **Each probe record:**
+  - the sequence number, label, PID and fingerprint;
+  - the outcome, `ok`, `denied` or `error`, with the AWS error code and message and whether it names an explicit deny;
+  - the RequestId, HTTP status, latency and token usage.
+- **Bad input and exit:** a malformed command sends no request; EOF ends the session.
+- **Tests:** offline, in `tests/test_bedrock_authority_probe.py` (botocore Stubber).
+- **How it ran in E3:** as a host process under `env -i`, with only `PATH`, `AWS_DEFAULT_REGION`, the worker session's three credential variables, and `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` set to `/dev/null`. No admin credentials or profiles were reachable.
+
+#### Live experiment (Phase 3E3)
+
+| Item | Value |
+|---|---|
+| Run | `E3-20261012T012355Z` (evidence kept outside the repo) |
+| Commit | `f4c6224f0f9401bcd7dbe6f6ee5ef6de496f8789` |
+| Executor P | PID `8985` |
+| Session | `arn:aws:sts::714781437949:assumed-role/RiskAgentBedrockWorkerRole/e3-20261012t012355z` |
+| Credential fingerprint | `sha256:d64a56f65773063c` |
+| Operator | `ken-ai-dev` (`AWSReservedSSO_AdministratorAccess…`), a separate principal |
+| Feeding P | Commands arrived through a named pipe; the holder process kept it open and is not executor evidence |
+
+```
+Claude OK ×3
+     ↓
+operator attaches explicit Deny
+     ↓
+Claude AccessDenied ×3
+     ↓
+worker attempts self-detach → AccessDenied
+     ↓
+Claude still AccessDenied
+     ↓
+operator detaches Deny
+     ↓
+Claude OK ×3
+```
+
+| Time (UTC, 2026-10-12) | Actor | Event | Result |
+|---|---|---|---|
+| 01:24:35.106 | P | Start record | Worker session, fingerprint `d64a56f6…` |
+| 01:24:58.473 / :59.502 / 01:25:00.534 | P | `baseline-1..3` | **ok** ×3 (HTTP 200) |
+| **01:26:49.793** | Operator | `AttachRolePolicy`, attaching the Deny (completed) | `AttachmentCount=1` |
+| ~01:27 | Deploy role | `terraform plan` while revoked | **No changes** |
+| **01:27:06.930** / :07.455 / :07.987 | P | `revoke-1..3` | **AccessDeniedException**, explicit deny ×3 (HTTP 403) |
+| **01:29:40.813** | One-shot process with P's exact credentials (same session and fingerprint) | `iam:DetachRolePolicy` on its own role | **AccessDenied** ("no identity-based policy allows the iam:DetachRolePolicy action"). The Deny stayed attached |
+| **01:29:53.878** | P | `post-selfdetach-1` | Still **AccessDeniedException**, explicit deny |
+| **01:31:30.490** | Operator | `DetachRolePolicy`, detaching the Deny (completed) | Attached `[]`, `AttachmentCount=0` |
+| **01:31:42.468** / :43.515 / **01:31:44.559** | P | `restore-1..3` | **ok** ×3 |
+| **01:31:53.370** | P | EOF → end record | Same PID, session ARN and fingerprint; 10 probes |
+
+All four Bedrock denials carry AWS's own text:
+
+> User: arn:aws:sts::714781437949:assumed-role/RiskAgentBedrockWorkerRole/e3-20261012t012355z is not authorized to perform: bedrock:InvokeModel on resource: arn:aws:bedrock:us-west-2:714781437949:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0 with an explicit deny in an identity-based policy: arn:aws:iam::714781437949:policy/RiskAgentBedrockClaudeDeny
+
+**Same-executor evidence.**
+- Every probe line, plus the start and end records, carries PID `8985` and fingerprint `sha256:d64a56f65773063c`.
+- The start and end identities are the same session ARN.
+- P ran continuously for 438.3 s with one process; it never restarted and never re-assumed or refreshed credentials.
+- The self-detach attempt came from a separate process holding P's exact credentials: same `GetCallerIdentity` session, same fingerprint.
+
+**Propagation.**
+- Attach → first observed denial: **≤ 17.1 s**.
+- Detach → first observed success: **≤ 12.0 s**.
+- In both directions the first probe after the change already showed the new state. These are observational upper bounds, not measured IAM propagation latency. No success was seen after the attach, and no denial after the detach.
+
+**Terraform and runtime state.**
+- With the Deny attached, a read-only `terraform plan` reported **No changes**, and so did a fresh plan after restore.
+- Terraform governs whether the authority mechanism exists and how it is configured: the role, the Allow, the Deny document. The operator-controlled attachment is the runtime authority state, outside Terraform's ownership.
+
+**CloudTrail corroboration**, as found at inspection time:
+- **IAM events (us-east-1):** the operator's `AttachRolePolicy` (RequestId `99963ffb-…`) and `DetachRolePolicy` (`f4e54c90-…`), and the worker session's failed `DetachRolePolicy` (`f8ed9baf-…`, `AccessDenied`).
+- **Bedrock runtime (us-west-2):** `Converse` events under the worker session with RequestIds matching P's records. **7 of the 10 had arrived** when checked: the 3 baseline successes and the 4 `AccessDenied`. The 3 restored calls had not yet been delivered, so they are not claimed as observed in CloudTrail.
+
+**Evidence limitation.** P printed its clean `end` record, which the probe emits only immediately before returning exit code 0. P's own process exit status was not captured independently, though: the launcher's `wait` observed the status of the pipeline's `tee` stage. If the harness is reused it should record P's exit status directly. This experiment claims no more than that P reached its end record.
+
+**Proven**
+- One live executor and one unchanged STS session successfully invoked Claude.
+- External IAM revocation caused genuine AWS explicit-deny failures, attributed to that session and naming the Deny policy, without stopping the executor or invalidating its credentials.
+- Those same credentials could not restore their own Bedrock authority (`iam:DetachRolePolicy` was denied).
+- External restoration returned that same executor and session to successful Claude invocation.
+- Terraform did not own or undo the switch: the plan showed no changes while the Deny was attached and after it was removed.
+
+**Not proven**
+- **Organizational separation of duties.** The same human held the operator admin role.
+- **Interrupting an in-flight Bedrock request.** Each request was authorized when it started; none was in progress at a transition.
+- **STS credential or session revocation.** The session stayed valid throughout; only its permissions changed.
+- **All-Bedrock or model-independent revocation.** The Deny covers the Claude Haiku inference profile and its foundation models only.
+- **EKS or workload identity.** The role was assumed from an SSO admin session on a laptop.
+- **Deterministic IAM propagation time.** Only upper bounds were observed (≤ 17.1 s and ≤ 12.0 s).
+- **Replacing the Phase 3D application-level action gate.** The two are independent layers.
+
 ### Phase 3 status
 
 Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
@@ -815,6 +934,15 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
 - [x] 3D2: `risk_agent_authority` and `risk_agent_actions` tables (Terraform)
 - [x] 3D3: live revoke/restore against one long-lived Docker executor (ACTIVE v1 allowed → REVOKED v2 denied at `act` → ACTIVE v3 resumed, only `act` ran → repeat RESUME no-op)
 - [x] 3D4: Phase 3D documentation (reviewed)
+- E. Bedrock governance
+  - [x] Dedicated least-privilege Bedrock runtime identity (`RiskAgentBedrockWorkerRole`)
+  - [x] Normal Claude invocation
+  - [x] Revoke governed Claude authority through IAM (operator attaches `RiskAgentBedrockClaudeDeny`)
+  - [x] Genuine AWS explicit-deny `AccessDeniedException`
+  - [x] Worker cannot restore its own authority (`iam:DetachRolePolicy` denied)
+  - [x] Restore authority (operator detaches the Deny)
+  - [x] Same executor/session successfully invokes Claude again
+  - [x] Terraform remains independent of runtime switch state
 - [ ] Separation of duties and IAM-level enforcement of authority (operator vs agent principals)
 
 ## Data Models and Storage
