@@ -1,0 +1,9 @@
+{
+  "policy_version": 4,
+  "subject": "agent/supplier-risk-agent",
+  "capabilities": {
+    "open_review_ticket": "allow",
+    "claude_inference": "allow",
+    "titan_embeddings": "allow"
+  }
+}

@@ -172,7 +172,10 @@ def test_admission_is_pinned_to_the_authority_version_read(env, ledger, monkeypa
 def test_in_flight_action_is_not_reexecuted(env, ledger):
     """A claim whose executor died before completion needs reconciliation."""
     effect = Effect()
-    ledger._transact_claim(ACTION_ID, scope=AGENT_SCOPE, version=1, context=_context("dead-trace"))
+    ledger._transact_claim(
+        ACTION_ID, scope=AGENT_SCOPE, authority=ledger.authority.get(),
+        policy=ledger.policies.get("policy#supplier-risk-agent#open_review_ticket"), context=_context("dead-trace"),
+    )
 
     with pytest.raises(ActionInFlight, match="dead-trace"):
         ledger.execute(ACTION_ID, scope=AGENT_SCOPE, context=_context("trace-2"), effect=effect)

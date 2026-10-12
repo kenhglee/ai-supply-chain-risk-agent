@@ -1,0 +1,8 @@
+{
+  "policy_version": 2,
+  "subject": "agent/supplier-risk-agent",
+  "capabilities": {
+    "open_review_ticket": "deny",
+    "claude_inference": "deny"
+  }
+}

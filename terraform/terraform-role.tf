@@ -151,6 +151,44 @@ resource "aws_iam_role_policy" "terraform_deployment" {
         ]
         Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/${local.bedrock_claude_deny_name}"
       },
+      # Phase 3F, same pattern as 3E: define the governed worker, the
+      # materializer and the policy-layer Deny; never attach/detach the Deny
+      # (the materializer's runtime switch) and never pass either role.
+      {
+        Sid    = "ManagePolicyGovernanceRoles"
+        Effect = "Allow"
+        Action = [
+          "iam:GetRole",
+          "iam:CreateRole",
+          "iam:DeleteRole",
+          "iam:UpdateRole",
+          "iam:UpdateAssumeRolePolicy",
+          "iam:ListRolePolicies",
+          "iam:GetRolePolicy",
+          "iam:PutRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:ListAttachedRolePolicies",
+          "iam:ListInstanceProfilesForRole"
+        ]
+        Resource = [
+          "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.governed_worker_role_name}",
+          "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.policy_materializer_name}"
+        ]
+      },
+      {
+        Sid    = "ManagePolicyClaudeDeny"
+        Effect = "Allow"
+        Action = [
+          "iam:CreatePolicy",
+          "iam:GetPolicy",
+          "iam:GetPolicyVersion",
+          "iam:ListPolicyVersions",
+          "iam:CreatePolicyVersion",
+          "iam:DeletePolicyVersion",
+          "iam:DeletePolicy"
+        ]
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/${local.policy_claude_deny_name}"
+      },
       {
         Sid    = "InspectTerraformDeploymentRole"
         Effect = "Allow"

@@ -34,13 +34,26 @@ class AuthorityDenied(RuntimeError):
     """A privileged action was refused because of external authority state."""
 
     def __init__(self, scope: str, status: str, version: int | None,
-                 reason: str | None = None, action_id: str | None = None) -> None:
-        super().__init__(f"authority for {scope} is {status} (version {version}): action {action_id} denied")
+                 reason: str | None = None, action_id: str | None = None, *,
+                 layer: str = "emergency", authority_status: str | None = None,
+                 authority_version: int | None = None, policy_status: str | None = None,
+                 policy_version: int | None = None, policy_sha256: str | None = None) -> None:
+        super().__init__(f"{layer} denied action {action_id}: {status} (version {version})")
         self.scope = scope
+        # status/version describe the denying layer: the emergency authority
+        # item when it denies, otherwise the materialized policy item.
         self.status = status
         self.version = version
         self.reason = reason
         self.action_id = action_id
+        self.layer = layer
+        self.authority_status = authority_status if authority_status is not None else (
+            status if layer == "emergency" else None)
+        self.authority_version = authority_version if authority_version is not None else (
+            version if layer == "emergency" else None)
+        self.policy_status = policy_status
+        self.policy_version = policy_version
+        self.policy_sha256 = policy_sha256
 
 
 def _now() -> str:

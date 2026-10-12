@@ -54,6 +54,7 @@ _OPTIONAL_SCALAR_FIELDS = (
     "tool_decision", "final_status", "supplier", "risk_type", "risk_level",
     "thread_id", "workflow_event", "executor_id",
     "action_id", "action_status", "authority_status", "authority_version",
+    "denied_layer", "policy_version", "policy_sha256",
 )
 
 
@@ -97,8 +98,9 @@ class DynamoTraceStore:
         record = dict(item)
         if "run_duration_ms" in record:
             record["run_duration_ms"] = float(record["run_duration_ms"])
-        if record.get("authority_version") is not None:
-            record["authority_version"] = int(record["authority_version"])
+        for field in ("authority_version", "policy_version"):
+            if record.get(field) is not None:
+                record[field] = int(record[field])
         record["trace_steps"] = json.loads(record.get("trace_steps", "[]"))
         for field in ("retriever_metadata", "prompt_metadata", "model_metadata"):
             if field in record:

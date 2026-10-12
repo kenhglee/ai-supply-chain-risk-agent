@@ -92,6 +92,12 @@ def _action_fields(values: dict | None) -> dict:
     }
 
 
+def _policy_fields(values: dict | None) -> dict:
+    """Trace-only: the materialized policy version/hash that admitted the action."""
+    result = (values or {}).get("action_result") or {}
+    return {"policy_version": result.get("policy_version"), "policy_sha256": result.get("policy_sha256")}
+
+
 def _outcome(status: str, *, thread_id, trace_id, next_nodes=(), values=None,
              change_type=None, action=None) -> dict:
     alert = (values or {}).get("alert") or {}
@@ -142,7 +148,8 @@ def _settle(app, thread_id: str, trace_id: str, risk_store, *,
         headline=values["headline"],
         t_run_start=t_run_start,
         run_duration_ms=run_duration_ms,
-        trace_extras={**trace_extras, **_action_fields(values), "workflow_event": completed_event},
+        trace_extras={**trace_extras, **_action_fields(values), **_policy_fields(values),
+                      "workflow_event": completed_event},
     )
     return _outcome(COMPLETED, thread_id=thread_id, trace_id=trace_id,
                     values=values, change_type=enriched["change_type"])
@@ -155,7 +162,7 @@ def _denied(app, thread_id: str, trace_id: str, denial: AuthorityDenied, *, t_ru
     action = {
         "action_id": denial.action_id,
         "action_status": "DENIED",
-        "authority_version": denial.version,
+        "authority_version": denial.authority_version,
     }
     append_risk_trace(build_trace_record(
         snapshot.values,
@@ -170,6 +177,9 @@ def _denied(app, thread_id: str, trace_id: str, denial: AuthorityDenied, *, t_ru
             "executor_id": get_executor_id(),
             "workflow_event": AUTHORITY_DENIED,
             "authority_status": denial.status,
+            "denied_layer": denial.layer,
+            "policy_version": denial.policy_version,
+            "policy_sha256": denial.policy_sha256,
             **action,
         },
     ))

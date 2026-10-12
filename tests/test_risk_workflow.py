@@ -28,6 +28,7 @@ pytestmark = pytest.mark.skipif(not MOTO_AVAILABLE, reason="moto not installed")
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
 from app.governance.action_ledger import ActionLedger  # noqa: E402
 from app.governance.authority import AuthorityStore  # noqa: E402
+from app.governance.policy import PolicyStore, materialize, parse_policy  # noqa: E402
 from app.storage import risk_trace_store  # noqa: E402
 from app.storage.checkpoint_store import DynamoCheckpointSaver  # noqa: E402
 from app.storage.supplier_risk_state_store import DynamoRiskStateStore  # noqa: E402
@@ -41,6 +42,10 @@ TRACES = "risk_traces"
 AUTHORITY = "risk_agent_authority"
 ACTIONS = "risk_agent_actions"
 HEADLINE = "TSMC halts production after earthquake in Taiwan"
+POLICY_V1 = parse_policy(
+    '{"policy_version": 1, "subject": "agent/supplier-risk-agent",'
+    ' "capabilities": {"open_review_ticket": "allow", "claude_inference": "allow"}}'
+)
 
 OK_ALERT = {
     "status": "ok",
@@ -112,6 +117,19 @@ def _create_tables(boto3):
         )
 
 
+class _NoopIam:
+    """IAM policy layer stand-in for fixtures that don't exercise IAM."""
+
+    def policy_arn(self, cap):
+        return f"arn:aws:iam::123456789012:policy/{cap.deny_policy_name}"
+
+    def attach(self, cap):
+        return None
+
+    def detach(self, cap):
+        return None
+
+
 @pytest.fixture
 def env(monkeypatch):
     for var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SECURITY_TOKEN", "AWS_SESSION_TOKEN"):
@@ -137,6 +155,10 @@ def env(monkeypatch):
         _create_tables(boto3)
         authority = AuthorityStore(AUTHORITY, REGION)
         authority.restore(reason="test grant", actor="pytest")
+        # Materialized policy v1 (item + completed record + latest pointer):
+        # open_review_ticket allowed. IAM steps are irrelevant here.
+        materialize(POLICY_V1, store=PolicyStore(AUTHORITY, REGION), iam=_NoopIam(), actor="pytest",
+                    approve_broadening=True)
         resource = boto3.resource("dynamodb", region_name=REGION)
         yield SimpleNamespace(
             authority=authority,

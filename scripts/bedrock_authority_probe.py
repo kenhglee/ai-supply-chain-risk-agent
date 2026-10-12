@@ -13,6 +13,11 @@ USAGE
 
     stdin, one JSON object per line:
         {"probe": "<label>"}     one Converse request; label is free text
+        {"act": "<label>"}       one governed open_review_ticket admission
+                                 through ActionLedger (Phase 3F): emergency
+                                 authority + materialized policy + claim in one
+                                 DynamoDB transaction, mock ticket effect.
+                                 No Converse request.
     blank lines are ignored; anything else gets an invalid_command line and
     no request. EOF ends the session (exit 0).
 
@@ -34,6 +39,8 @@ CREDENTIALS
 ENV
     AWS_DEFAULT_REGION   default us-west-2
     BEDROCK_MODEL_ID     default us.anthropic.claude-haiku-4-5-20251001-v1:0
+    AUTHORITY_TABLE, ACTIONS_TABLE   for act; if unset, every act is denied
+                                     (fail closed, UNCONFIGURED)
 """
 import hashlib
 import json
@@ -41,7 +48,9 @@ import os
 import socket
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import boto3
 from botocore.config import Config
@@ -62,6 +71,9 @@ CLIENT_CONFIG = Config(
     connect_timeout=10,
     read_timeout=60,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ACT_CAPABILITY = "open_review_ticket"
 
 EXIT_OK = 0
 EXIT_NO_IDENTITY = 2
@@ -147,21 +159,90 @@ def converse_once(bedrock, model_id: str) -> dict:
     }
 
 
-def parse_command(line: str) -> str:
-    """Return the probe label for {"probe": "<label>"}; raise ValueError otherwise."""
+def parse_command(line: str) -> tuple[str, str]:
+    """Return (command, label) for {"probe": "<label>"} or {"act": "<label>"}; raise ValueError otherwise."""
     try:
         command = json.loads(line)
     except json.JSONDecodeError as exc:
         raise ValueError(f"not JSON: {exc.msg}") from exc
-    if not isinstance(command, dict) or set(command) != {"probe"}:
-        raise ValueError('expected exactly {"probe": "<label>"}')
-    label = command["probe"]
+    if not isinstance(command, dict) or len(command) != 1 or not set(command) <= {"probe", "act"}:
+        raise ValueError('expected exactly {"probe": "<label>"} or {"act": "<label>"}')
+    [(name, label)] = command.items()
     if not isinstance(label, str):
-        raise ValueError("probe label must be a string")
-    return label
+        raise ValueError(f"{name} label must be a string")
+    return name, label
 
 
-def run(lines, *, bedrock, sts, fingerprint, model_id: str, region: str, out) -> int:
+def build_gate_from_env():
+    """ActionLedger from AUTHORITY_TABLE / ACTIONS_TABLE, or a fail-closed gate."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from app.governance.action_ledger import action_gate_from_env
+    return action_gate_from_env()
+
+
+def act_once(gate, *, action_id: str, thread_id: str, executor_id: str) -> dict:
+    """Exactly one governed admission attempt for open_review_ticket; never raises."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from app.governance.action_ledger import ActionInFlight
+    from app.governance.authority import AGENT_SCOPE, AuthorityDenied
+    from app.integrations.servicenow_mock import create_servicenow_ticket
+
+    def effect() -> dict:
+        ticket = create_servicenow_ticket(
+            {"event_type": "governance_probe", "repository": None},
+            {"decision": "review_recommended", "risk_score": 50, "reason": f"policy probe {action_id}"},
+        )
+        return {**ticket, "correlation_id": action_id}
+
+    started = _now()
+    t0 = time.monotonic()
+    try:
+        result = gate.execute(
+            action_id,
+            scope=AGENT_SCOPE,
+            context={"action_type": ACT_CAPABILITY, "thread_id": thread_id, "trace_id": uuid.uuid4().hex,
+                     "executor_id": executor_id, "subject": {"probe": True}},
+            effect=effect,
+        )
+        fields = {
+            "outcome": "ok",
+            "action_status": result["status"],
+            "replayed": result["replayed"],
+            "authority_version": result.get("authority_version"),
+            "policy_version": result.get("policy_version"),
+            "policy_sha256": result.get("policy_sha256"),
+            "ticket_id": (result.get("effect") or {}).get("ticket_id"),
+        }
+    except AuthorityDenied as denial:
+        fields = {
+            "outcome": "denied",
+            "action_status": "DENIED",
+            "denied_layer": denial.layer,
+            "denial_status": denial.status,
+            "authority_status": denial.authority_status,
+            "authority_version": denial.authority_version,
+            "policy_status": denial.policy_status,
+            "policy_version": denial.policy_version,
+            "policy_sha256": denial.policy_sha256,
+        }
+    except ActionInFlight as exc:
+        fields = {"outcome": "error", "error_code": "ActionInFlight", "error_message": str(exc)}
+    except (ClientError, BotoCoreError) as exc:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code", type(exc).__name__)
+        fields = {"outcome": "error", "error_code": code, "error_message": str(exc)}
+    return {
+        "action_id": action_id,
+        "capability": ACT_CAPABILITY,
+        "started_at": started,
+        "ended_at": _now(),
+        "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+        **fields,
+    }
+
+
+def run(lines, *, bedrock, sts, fingerprint, model_id: str, region: str, out, gate=None) -> int:
     def emit(record: dict) -> None:
         print(json.dumps(record), file=out, flush=True)
 
@@ -185,28 +266,36 @@ def run(lines, *, bedrock, sts, fingerprint, model_id: str, region: str, out) ->
         "retries": RETRIES,
     })
 
-    seq = 0
+    seq = probes = acts = 0
+    # Unique per run() so act action_ids never collide with an earlier session's
+    # (a collision would correctly replay that session's COMPLETED action).
+    session_tag = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
     for line in lines:
         line = line.strip()
         if not line:
             continue
         try:
-            label = parse_command(line)
+            command, label = parse_command(line)
         except ValueError as exc:
             emit({"event": "invalid_command", "at": _now(), "error": str(exc)})
             continue
         seq += 1
-        emit({
-            "event": "probe",
-            "seq": seq,
-            "label": label,
-            "pid": os.getpid(),
-            "credential_fingerprint": fingerprint(),
-            "model_id": model_id,
-            **converse_once(bedrock, model_id),
-        })
+        base = {"seq": seq, "label": label, "pid": os.getpid(), "credential_fingerprint": fingerprint()}
+        if command == "probe":
+            probes += 1
+            emit({"event": "probe", **base, "model_id": model_id, **converse_once(bedrock, model_id)})
+        else:
+            acts += 1
+            if gate is None:
+                gate = build_gate_from_env()
+            emit({"event": "act", **base, **act_once(
+                gate,
+                action_id=f"action#probe-{session_tag}-{seq}#{ACT_CAPABILITY}",
+                thread_id=f"probe-{session_tag}",
+                executor_id=f"{socket.gethostname()}:{os.getpid()}",
+            )})
 
-    end = {"event": "end", "at": _now(), "process": process_identity(), "probes": seq,
+    end = {"event": "end", "at": _now(), "process": process_identity(), "probes": probes, "acts": acts,
            "credential_fingerprint": fingerprint()}
     try:
         end["identity"] = caller_identity(sts)
