@@ -202,3 +202,17 @@ dd {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+.restore-button {
+  width: auto;
+  justify-self: start;
+  padding: 10px 18px;
+  background: #176b45;
+  border-color: #176b45;
+  color: white;
+}
+
+.restore-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

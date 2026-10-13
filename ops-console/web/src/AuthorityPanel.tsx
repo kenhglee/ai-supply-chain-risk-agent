@@ -88,6 +88,39 @@ export default function AuthorityPanel() {
         }
     }
 
+    async function restoreAuthority() {
+        setRevoking(true);
+        setRevokeMessage(null);
+
+        try {
+            const response = await fetch("/api/authority/restore", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ reason: reason.trim() }),
+            });
+
+            if (!response.ok) {
+            throw new Error(
+                "Could not confirm restoration. Refresh authority before retrying.",
+            );
+            }
+
+            setRevokeMessage(
+            "Restoration command completed. Fetching the authority record…",
+            );
+            setReason("");
+            setRefreshVersion((version) => version + 1);
+        } catch (error) {
+            setRevokeMessage(
+            error instanceof Error ? error.message : "Restoration request failed",
+            );
+        } finally {
+            setRevoking(false);
+        }
+    }
+
   return (
     <section className="authority-panel">
       <div className="risk-toolbar">
@@ -134,7 +167,7 @@ export default function AuthorityPanel() {
       )}
 
       <div className="authority-controls">
-        <label htmlFor="revoke-reason">Revocation reason</label>
+        <label htmlFor="revoke-reason">Authority change reason</label>
         <input
             id="revoke-reason"
             type="text"
@@ -142,7 +175,7 @@ export default function AuthorityPanel() {
             value={reason}
             onChange={(event) => setReason(event.target.value)}
             disabled={revoking}
-            placeholder="Why should agent authority be revoked?"
+            placeholder="Reason for revoking or restoring authority"
         />
 
         <button
@@ -158,6 +191,20 @@ export default function AuthorityPanel() {
             onClick={() => void revokeAuthority()}
         >
             {revoking ? "Revoking…" : "Revoke authority"}
+        </button>
+        <button
+            className="restore-button"
+            type="button"
+            disabled={
+                revoking ||
+                loading ||
+                error !== null ||
+                authority?.status !== "REVOKED" ||
+                !reason.trim()
+            }
+            onClick={() => void restoreAuthority()}
+            >
+            Restore authority
         </button>
 
         {revokeMessage && <p role="status">{revokeMessage}</p>}

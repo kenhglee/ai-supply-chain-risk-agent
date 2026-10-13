@@ -182,6 +182,69 @@ app.post<{ Body: { reason: string } }>(
   },
 );
 
+app.post<{ Body: { reason: string } }>(
+  "/api/authority/restore",
+  {
+    schema: {
+      body: {
+        type: "object",
+        required: ["reason"],
+        additionalProperties: false,
+        properties: {
+          reason: {
+            type: "string",
+            minLength: 1,
+            maxLength: 500,
+          },
+        },
+      },
+    },
+  },
+  async (request, reply) => {
+    const reason = request.body.reason.trim();
+
+    if (!reason) {
+      return reply.code(400).send({
+        error: "A restoration reason is required",
+      });
+    }
+
+    try {
+      await execFileAsync(
+        pythonPath,
+        [
+          "-m",
+          "app.governance.authority_cli",
+          "restore",
+          "--reason",
+          reason,
+          "--actor",
+          "operator-ken",
+        ],
+        {
+          cwd: projectRoot,
+          env: {
+            ...process.env,
+            AUTHORITY_TABLE: "risk_agent_authority",
+            AWS_DEFAULT_REGION: process.env.AWS_REGION ?? "us-west-2",
+          },
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+        },
+      );
+
+      return { message: "Restoration command completed" };
+    } catch (error) {
+      app.log.error(error, "Restoration command failed");
+
+      return reply.code(503).send({
+        error:
+          "Could not confirm restoration. Refresh authority before retrying.",
+      });
+    }
+  },
+);
+
 await app.listen({
   port: 3001,
   host: "127.0.0.1",
