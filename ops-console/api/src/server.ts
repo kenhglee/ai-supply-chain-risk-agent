@@ -245,6 +245,41 @@ app.post<{ Body: { reason: string } }>(
   },
 );
 
+app.post("/api/actions/mock", async (_request, reply) => {
+  try {
+    const { stdout } = await execFileAsync(
+      pythonPath,
+      ["-m", "scripts.console_action_probe"],
+      {
+        cwd: projectRoot,
+        env: {
+          ...process.env,
+          AUTHORITY_TABLE: "risk_agent_authority",
+          ACTIONS_TABLE: "risk_agent_actions",
+          AWS_DEFAULT_REGION: process.env.AWS_REGION ?? "us-west-2",
+        },
+        timeout: 60_000,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+
+    const result = JSON.parse(stdout.trim());
+
+    if (!["ok", "denied", "error"].includes(result.outcome)) {
+      throw new Error("Unexpected mock action result");
+    }
+
+    return { result };
+  } catch (error) {
+    app.log.error(error, "Mock action request failed");
+
+    return reply.code(503).send({
+      error:
+        "Could not confirm the mock action outcome. Refresh actions before retrying.",
+    });
+  }
+});
+
 await app.listen({
   port: 3001,
   host: "127.0.0.1",

@@ -216,3 +216,12 @@ dd {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+.mock-action-panel {
+  grid-column: 1 / -1;
+}
+
+.mock-action-panel button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}

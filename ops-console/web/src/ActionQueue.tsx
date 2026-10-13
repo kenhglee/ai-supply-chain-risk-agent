@@ -19,7 +19,15 @@ type AgentAction = {
   };
 };
 
-export default function ActionQueue() {
+type ActionQueueProps = {
+  refreshVersion: number;
+  onRefresh: () => void;
+};
+
+export default function ActionQueue({
+  refreshVersion,
+  onRefresh,
+}: ActionQueueProps) {
   const [actions, setActions] = useState<AgentAction[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -29,6 +37,8 @@ export default function ActionQueue() {
     const controller = new AbortController();
 
     async function loadActions() {
+      setLoading(true);
+      setError(null);
       try {
         const response = await fetch("/api/actions", {
           signal: controller.signal,
@@ -53,7 +63,7 @@ export default function ActionQueue() {
 
     void loadActions();
     return () => controller.abort();
-  }, []);
+  }, [refreshVersion]);
 
   const selectedAction = actions.find(
     (action) => action.action_id === selectedId,
@@ -61,10 +71,23 @@ export default function ActionQueue() {
 
   return (
     <section className="action-queue">
-      <h2>Action queue</h2>
+      <div className="risk-toolbar">
+        <h2>Action queue</h2>
+        <button
+            className="refresh-button"
+            type="button"
+            disabled={loading}
+            onClick={onRefresh}
+        >
+            {loading ? "Loading…" : "Refresh actions"}
+        </button>
+       </div>
 
       {loading && <p role="status">Loading actions…</p>}
       {error && <p role="alert">{error}</p>}
+      {error && actions.length > 0 && (
+        <p>Showing the last successfully fetched actions.</p>
+      )}
       {!loading && !error && actions.length === 0 && (
         <p>No actions found.</p>
       )}

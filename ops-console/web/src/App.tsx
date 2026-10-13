@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import ActionQueue from "./ActionQueue";
 import AuthorityPanel from "./AuthorityPanel";
+import MockActionPanel from "./MockActionPanel";
 
 type Risk = {
   pk: string;
@@ -17,6 +18,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const [actionsRefreshVersion, setActionsRefreshVersion] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -118,7 +120,15 @@ export default function App() {
         </section>
       )}
       <AuthorityPanel />
-      <ActionQueue />
+      <MockActionPanel
+        onActionFinished={() =>
+          setActionsRefreshVersion((version) => version + 1)
+        }
+      />
+      <ActionQueue
+        refreshVersion={actionsRefreshVersion}
+        onRefresh={() => setActionsRefreshVersion((version) => version + 1)}
+      />
     </main>
   );
 }
