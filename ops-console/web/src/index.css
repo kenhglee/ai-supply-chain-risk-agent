@@ -159,3 +159,46 @@ dd {
     grid-template-columns: 1fr;
   }
 }
+
+.authority-panel {
+  grid-column: 1 / -1;
+}
+
+.authority-controls {
+  display: grid;
+  gap: 12px;
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px solid #d4dce8;
+}
+
+.authority-controls label {
+  font-weight: 600;
+}
+
+.authority-controls input {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #d4dce8;
+  border-radius: 8px;
+  font: inherit;
+}
+
+.authority-controls input:focus-visible {
+  outline: 3px solid #4263eb;
+  outline-offset: 2px;
+}
+
+.revoke-button {
+  width: auto;
+  justify-self: start;
+  background: #b42318;
+  border-color: #b42318;
+  color: white;
+  padding: 10px 18px;
+}
+
+.revoke-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

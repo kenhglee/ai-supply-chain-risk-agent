@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import ActionQueue from "./ActionQueue";
+import AuthorityPanel from "./AuthorityPanel";
 
 type Risk = {
   pk: string;
@@ -116,6 +117,7 @@ export default function App() {
           </p>
         </section>
       )}
+      <AuthorityPanel />
       <ActionQueue />
     </main>
   );
