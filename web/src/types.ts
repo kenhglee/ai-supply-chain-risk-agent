@@ -24,6 +24,7 @@ export const TraceSummarySchema = z.object({
   trace_id: z.string().nullable(),
   headline: z.string().nullable(),
   final_status: z.string().nullable(),
+  workflow_event: z.string().nullable().optional(),
   created_at: z.string().nullable(),
   run_duration_ms: z.number().nullable(),
 });
@@ -42,6 +43,7 @@ export const TraceDetailSchema = z.object({
   trace_id: z.string().nullable(),
   headline: z.string().nullable(),
   final_status: z.string().nullable(),
+  workflow_event: z.string().nullable().optional(),
   created_at: z.string().nullable(),
   run_duration_ms: z.number().nullable(),
   tool_decision: z.string().nullable(),

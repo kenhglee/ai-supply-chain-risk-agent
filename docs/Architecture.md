@@ -469,7 +469,7 @@ The handler code includes the Phase 3D gate, but the **deployed** Lambda still r
 **Worker.** `app/workers/risk_worker.py` is a thin command-line adapter over the same lifecycle the Lambda handler uses. It shares `START_PAUSE_BEFORE`, `THREAD_ID_PATTERN`, `OUTCOME_FIELDS` and `checkpoint_dependencies_from_env()` from `risk_workflow.py`; it duplicates no workflow logic.
 
 ```
-python -m app.workers.risk_worker start  --headline "..."
+python -m app.workers.risk_worker start  --headline "..." [--pause-before validate]   # DR1: pause after analysis
 python -m app.workers.risk_worker resume --thread-id thread-<32 hex>   # no other input accepted
 python -m app.workers.risk_worker session                              # Phase 3D: long-lived, commands on stdin
 ```
@@ -1054,6 +1054,62 @@ Editing or deleting the file has no effect until it is materialized.
 - **The policy source file as an enforcement point.** Enforcement uses only materialized state.
 - **The full LangGraph workflow under policy.** The probe's `act` exercises the admission gate directly. The workflow integration of the same gate was proven under moto (F2a) and, for the emergency layer only, live in 3D3.
 
+### Durable resume after analysis (DR1)
+
+**Claim.** Process A ran retrieval and model inference, and the completed analysis was checkpointed. Process A then exited. A fresh process B resumed the same `thread_id` and reached END: the governed mock action and the supplier-state write both completed. B made no retrieval, embedding or model call.
+
+**Change.** `risk_worker start --pause-before {analyze,validate}` (default `analyze`). With `validate`, START pauses after `analyze`'s checkpoint is written (`durability="sync"`). The edge `analyze → validate` is unconditional, so this is "interrupt after analysis". The Lambda handler and `session` keep `START_PAUSE_BEFORE = ["analyze"]`; their contract is unchanged.
+
+**Harness.** `scripts/durable_resume_proof.py run` (environment from `docker/worker.env`, plus `AUTHORITY_TABLE` / `ACTIONS_TABLE`):
+1. A: `python -m app.workers.risk_worker start --pause-before validate` as a subprocess, waited to exit.
+2. Between the processes, the orchestrator reads DynamoDB directly: the checkpoint, the supplier-state row, the action-ledger item and A's trace.
+3. B: `durable_resume_proof.py guarded-resume`, a new interpreter. Before the unmodified `risk_worker resume` runs, it installs tripwires that record and raise on:
+   - the triage and risk LLM objects
+   - the retriever accessors and `build_embeddings`
+   - every httpx request (the OpenAI / Bifrost transport)
+   - any botocore call to `bedrock-runtime` / `bedrock-agent-runtime`
+
+   It also logs every AWS call as `service:operation`.
+4. The orchestrator evaluates the acceptance checks and writes the evidence. The host name and STS session name are redacted.
+
+The same tripwires are covered under moto by `tests/test_risk_workflow.py`: pause before `validate` then resume without hits, plus a control that pauses before `analyze` and trips on `risk_analysis.invoke`.
+
+**Run `DR1-20261030T232053Z`** (evidence: [`docs/evidence/DR1-20261030T232053Z.json`](evidence/DR1-20261030T232053Z.json)). Credentials: `ken-ai-dev` SSO (`AWSReservedSSO_AdministratorAccess_*`), us-west-2. Bedrock Claude Haiku 4.5 and Titan v2 embeddings (FAISS). Every table was DynamoDB.
+
+| Field | Process A (START) | Process B (RESUME) |
+|---|---|---|
+| `thread_id` | `thread-8361be60fab04942b210bdeb148fb75e` | same |
+| `trace_id` | `42ac4f6a12d94b7e8612045d0388d3a1` | `6cb1827a5a7c447d9274e4c031eddc3c` |
+| PID / `executor_id` | `37149` / `<host>:37149` | `37262` / `<host>:37262` |
+| Lifetime (UTC) | 23:20:56.848 → 23:21:11.568, exit 0 | 23:21:17.269 → 23:21:23.568, exit 0 |
+| Nodes run | `infer, decide, retrieve, analyze` | `validate, act` |
+| Outcome | `paused`, `next=["validate"]`, `final_status=ok` | `completed`, `change_type=suppressed`, `state_written=true` |
+
+- **Between processes:**
+  - The checkpoint is at step 4, with pending `branch:to:validate`. It holds 240 characters of retrieved context, retriever metadata, and the alert `TSMC / earthquake / High`; `is_valid` is not yet set.
+  - The supplier-state row is unchanged by A.
+  - There is no action-ledger item.
+  - A's trace has `workflow_event=paused`, and trace consumers display it as "paused (workflow not completed)".
+- **Process B:**
+  - Tripwire hits: none.
+  - AWS calls: 49. Of these, 48 were DynamoDB and one was `sso:GetRoleCredentials`, the profile's credential resolution. There were no Bedrock calls.
+  - B's trace carries the four analysis steps unchanged from A's checkpoint, all started before B existed; `analyze` started at 23:21:05.082. B's own `validate` started at 23:21:20.188.
+- **Final state:**
+  - Checkpoint at step 7 with `next=[]`.
+  - Action `action#thread-8361…#open_review_ticket` is `COMPLETED`, `attempt_count=1`, claimed by B's `trace_id`, admitted under authority v9 and policy v4 (`sha256:574bfcfd…`), ticket `MOCK-CHG-7452FE4D`.
+  - The `TSMC#earthquake` row has `last_seen_at=23:21:23`, written by B.
+- **Governance at run time** (read-only preflight):
+  - Authority `agent#supplier-risk-agent` was `ACTIVE`, version 9.
+  - Materialized policy v4 was in sync and allowed `open_review_ticket`.
+  - Nothing was changed.
+
+**Superseded run `DR1-20261030T231953Z`** ([evidence](evidence/DR1-20261030T231953Z.json)). Its workflow executed fully: A paused, B completed, a ticket was created and the state row was written. The no-inference check failed only because its allowlist admitted DynamoDB alone, and B called `sso:GetRoleCredentials`. No tripwire fired and no Bedrock call was made. The check now admits exactly that one credential operation, and the experiment was re-run. That earlier write is why the accepted run reports `suppressed` rather than `new_alert`.
+
+**Not shown:**
+- **Kill during a node.** A exited at a durable pause. A process killed during `analyze` would re-run it on resume (at-least-once; C2b remains parked).
+- **Least-privilege identity.** `RiskAgentGovernedWorkerRole` cannot reach the checkpoint, state or trace tables, and its ledger access is limited to `action#probe-*`. The IAM-boundary capabilities (`claude_inference`, `titan_embeddings`) therefore did not govern this executor; only the application-level `act` gate did.
+- **CSV business state, concurrent RESUME, `IN_FLIGHT` reconciliation:** out of scope.
+
 ### Phase 3 status
 
 Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
@@ -1088,6 +1144,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] F2c: live v1 → v2 → v3 → emergency override → invalid ceiling → v4, one executor and session across both boundaries
   - [x] F2d: Phase 3F documentation
 - [ ] Separation of duties and IAM-level enforcement of authority (operator vs agent principals)
+- [x] DR1: two-process resume after checkpointed analysis; no retrieval, embedding or model call on resume (`DR1-20261030T232053Z`)
 
 ## Data Models and Storage
 

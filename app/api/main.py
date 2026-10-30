@@ -30,6 +30,7 @@ def list_traces():
             "trace_id": r.get("trace_id"),
             "headline": r.get("headline"),
             "final_status": r.get("final_status"),
+            "workflow_event": r.get("workflow_event"),
             "created_at": r.get("created_at"),
             "run_duration_ms": r.get("run_duration_ms"),
         }

@@ -4,6 +4,7 @@ Runs the real compiled graph with fake LLMs/retriever. Invocation boundaries
 are simulated by discarding the saver/graph and constructing new ones: only
 the thread_id and the (moto) tables carry over.
 """
+import importlib.util
 import inspect
 import json
 import os
@@ -254,6 +255,68 @@ def test_resume_with_new_executor_completes_without_rerunning(env):
     assert trace["authority_version"] == 1
 
 
+def _load_proof_script():
+    """scripts/durable_resume_proof.py: its tripwires are the ones the two-process proof uses."""
+    spec = importlib.util.spec_from_file_location(
+        "durable_resume_proof", os.path.join(PROJECT_ROOT, "scripts", "durable_resume_proof.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_pause_before_validate_resumes_without_retrieval_or_inference(env):
+    """Analysis is checkpointed at START; RESUME runs only validate and act."""
+    env.monkeypatch.setenv("AWS_LAMBDA_LOG_STREAM_NAME", "stream-A")
+    started = risk_workflow.start_workflow(
+        {"headline": HEADLINE, "alert_id": "alert-1"}, pause_before=["validate"], **_new_executor())
+
+    assert started["status"] == "paused"
+    assert started["next"] == ["validate"]
+    assert started["final_status"] == "ok"  # the saved analysis, not a completed outcome
+    assert started["state_written"] is False
+    assert _calls(env) == (1, 1, 1)
+    assert env.supplier_state.scan()["Items"] == []
+    assert env.actions.scan()["Items"] == []
+    paused_trace = _trace(started["trace_id"])
+    assert paused_trace["workflow_event"] == "paused"
+    assert _nodes(paused_trace) == ["infer", "decide", "retrieve", "analyze"]
+
+    # New executor: every retrieval, embedding and model entry point is a tripwire.
+    tripwires = _load_proof_script().install_resume_tripwires(env.monkeypatch.setattr)
+    env.monkeypatch.setenv("AWS_LAMBDA_LOG_STREAM_NAME", "stream-B")
+    outcome = risk_workflow.resume_workflow(started["thread_id"], **_new_executor())
+
+    assert tripwires.hits == []
+    assert {call.split(":")[0] for call in tripwires.aws_calls} == {"dynamodb"}
+    assert _calls(env) == (1, 1, 1)
+    assert outcome["status"] == "completed"
+    assert outcome["thread_id"] == started["thread_id"]
+    assert outcome["trace_id"] != started["trace_id"]
+    assert outcome["change_type"] == "new_alert"
+    assert outcome["action_status"] == "COMPLETED"
+    [item] = env.supplier_state.scan()["Items"]
+    assert item["pk"] == "TSMC#earthquake"
+
+    trace = _trace(outcome["trace_id"])
+    assert trace["executor_id"] == "stream-B"
+    assert trace["workflow_event"] == "resumed_completed"
+    assert _nodes(trace) == ["infer", "decide", "retrieve", "analyze", "validate", "act"]
+    assert trace["trace_steps"][:4] == paused_trace["trace_steps"]
+
+
+def test_resume_tripwires_fire_when_analysis_is_not_checkpointed(env):
+    """Control: paused before analyze, RESUME must call the risk model and trips."""
+    started = _start_paused(env)
+    proof = _load_proof_script()
+    tripwires = proof.install_resume_tripwires(env.monkeypatch.setattr)
+
+    with pytest.raises(proof.TripwireError, match="risk_analysis"):
+        risk_workflow.resume_workflow(started["thread_id"], **_new_executor())
+
+    assert tripwires.hits == ["model risk_analysis.invoke"]
+    assert env.supplier_state.scan()["Items"] == []
+
+
 def test_resume_after_completion_is_noop(env):
     started = _start_paused(env)
     completed = risk_workflow.resume_workflow(started["thread_id"], **_new_executor())
@@ -336,3 +399,14 @@ def test_resume_accepts_no_workflow_input():
     params = inspect.signature(risk_workflow.resume_workflow).parameters
     assert list(params) == ["thread_id", "checkpointer", "risk_store", "action_gate"]
     assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for name, p in params.items() if name != "thread_id")
+
+
+def test_proof_evidence_redacts_host_and_sts_session():
+    text = json.dumps({
+        "executor_id": "build-host.local:123",
+        "caller_arn": "arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_Admin_abc/someone@example.com",
+    })
+    redacted = _load_proof_script().redact_evidence_text(text, hostname="build-host.local")
+    assert "build-host.local" not in redacted and "someone" not in redacted
+    assert "<host>:123" in redacted
+    assert "assumed-role/AWSReservedSSO_Admin_abc/<session>" in redacted

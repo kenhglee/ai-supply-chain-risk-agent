@@ -8,6 +8,18 @@ from boto3.dynamodb.conditions import Key
 
 _STORE_PATH = Path(__file__).parent / "risk_traces.jsonl"
 
+# Checkpointed attempts that stopped before END. Their alert (if any) is an
+# intermediate analysis result, not a completed outcome.
+INCOMPLETE_WORKFLOW_EVENTS = frozenset({"paused", "authority_denied"})
+
+
+def trace_display_status(record: dict) -> str:
+    """Status to show for a trace; never the alert status of an unfinished workflow."""
+    event = record.get("workflow_event")
+    if event in INCOMPLETE_WORKFLOW_EVENTS:
+        return f"{event} (workflow not completed)"
+    return record.get("final_status") or "(unknown)"
+
 
 # ---- JSONL implementation ----
 
@@ -197,7 +209,7 @@ def build_trace_explanation(record: dict) -> str:
     trace_id = record.get("trace_id") or "(unknown)"
     short_trace = trace_id[:12] + "..." if len(trace_id) > 12 else trace_id
     headline = record.get("headline") or "(none)"
-    final_status = record.get("final_status") or "(unknown)"
+    status = trace_display_status(record)
     supplier = record.get("supplier") or "(none)"
     risk_type = record.get("risk_type") or "(none)"
     risk_level = record.get("risk_level") or "(none)"
@@ -209,7 +221,7 @@ def build_trace_explanation(record: dict) -> str:
         f"Alert {alert_id}  (trace: {short_trace})",
         f"Headline: {headline}",
         "",
-        f"Status:      {final_status}",
+        f"Status:      {status}",
         f"Supplier:    {supplier}",
         f"Risk type:   {risk_type}",
         f"Risk level:  {risk_level}",

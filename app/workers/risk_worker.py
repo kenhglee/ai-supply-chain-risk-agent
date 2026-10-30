@@ -3,11 +3,14 @@
 Runs START or RESUME from any ordinary Python process or container, using the
 same lifecycle as the Lambda handler (app.workflows.risk_workflow):
 
-    python -m app.workers.risk_worker start --headline "..."
+    python -m app.workers.risk_worker start --headline "..." [--pause-before {analyze,validate}]
     python -m app.workers.risk_worker resume --thread-id thread-<32 hex>
     python -m app.workers.risk_worker session
 
-start/resume print one JSON outcome line to stdout. Exit codes: 0 success,
+start pauses before analyze by default (the Lambda contract); with
+--pause-before validate it pauses once analysis is checkpointed, so RESUME
+runs no retrieval or model inference. start/resume print one JSON outcome
+line to stdout. Exit codes: 0 success,
 2 invalid arguments, 3 unknown thread, 4 authority denied. A missing
 CHECKPOINT_TABLE raises (non-zero). Dependencies are built fresh per run;
 continuity is DynamoDB + thread_id.
@@ -39,6 +42,9 @@ EXIT_INVALID = 2
 EXIT_NOT_FOUND = 3
 EXIT_AUTHORITY_DENIED = 4
 
+# START pause points: before analysis (default, same as Lambda) or after it.
+PAUSE_BEFORE_CHOICES = ("analyze", "validate")
+
 
 def _headline(value: str) -> str:
     if not value.strip():
@@ -58,6 +64,8 @@ def _parser() -> argparse.ArgumentParser:
 
     start = commands.add_parser("start", help=f"start a new workflow, pausing before {START_PAUSE_BEFORE}")
     start.add_argument("--headline", required=True, type=_headline)
+    start.add_argument("--pause-before", choices=PAUSE_BEFORE_CHOICES, default=START_PAUSE_BEFORE[0],
+                       help="node to pause before (default: %(default)s)")
 
     # RESUME takes only the workflow identity; no new workflow input.
     resume = commands.add_parser("resume", help="resume an existing workflow by thread_id")
@@ -67,9 +75,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run(command: str, value: str, deps: dict) -> dict:
+def _run(command: str, value: str, deps: dict, pause_before: list[str] = START_PAUSE_BEFORE) -> dict:
     if command == "start":
-        outcome = start_workflow({"headline": value}, pause_before=list(START_PAUSE_BEFORE), **deps)
+        outcome = start_workflow({"headline": value}, pause_before=list(pause_before), **deps)
     else:
         outcome = resume_workflow(value, **deps)
     return {
@@ -125,8 +133,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "session":
         return run_session(sys.stdin, deps)
 
-    value = args.headline if args.command == "start" else args.thread_id
-    result = _run(args.command, value, deps)
+    if args.command == "start":
+        result = _run("start", args.headline, deps, pause_before=[args.pause_before])
+    else:
+        result = _run("resume", args.thread_id, deps)
     print(json.dumps(result))
     if result["status"] == NOT_FOUND:
         return EXIT_NOT_FOUND

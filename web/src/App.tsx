@@ -2,11 +2,11 @@ import { useEffect, useState } from 'react';
 import './App.css';
 import { fetchTraces, fetchTraceDetail, fetchExplanation } from './api';
 import type { TraceSummary, TraceDetail, TraceStep } from './types';
+import { traceBadge } from './status';
 
-function statusClass(status: string | null): string {
-  if (status === 'ok') return 'badge badge-ok';
-  if (status === 'inconclusive') return 'badge badge-inconclusive';
-  return 'badge badge-unknown';
+function StatusBadge({ finalStatus, workflowEvent }: { finalStatus: string | null; workflowEvent?: string | null }) {
+  const badge = traceBadge(finalStatus, workflowEvent);
+  return <span className={badge.className}>{badge.label}</span>;
 }
 
 function formatDate(iso: string | null): string {
@@ -41,7 +41,7 @@ function TraceList({ traces, selectedId, onSelect }: TraceListProps) {
           >
             <div className="trace-item-top">
               <span className="alert-id">{t.alert_id ?? '—'}</span>
-              <span className={statusClass(t.final_status)}>{t.final_status ?? 'unknown'}</span>
+              <StatusBadge finalStatus={t.final_status} workflowEvent={t.workflow_event} />
             </div>
             <div className="trace-item-meta">
               <span>{t.run_duration_ms != null ? `${t.run_duration_ms}ms` : '—'}</span>
@@ -80,7 +80,7 @@ function TraceDetailPanel({ detail, explanation, explanationLoading }: TraceDeta
         <dd>{detail.alert_id ?? '—'}</dd>
 
         <dt>status</dt>
-        <dd><span className={statusClass(detail.final_status)}>{detail.final_status ?? 'unknown'}</span></dd>
+        <dd><StatusBadge finalStatus={detail.final_status} workflowEvent={detail.workflow_event} /></dd>
 
         <dt>supplier</dt>
         <dd>{detail.supplier ?? '—'}</dd>

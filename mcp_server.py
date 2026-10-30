@@ -7,6 +7,7 @@ from app.storage.risk_state_store import (
     save_risk_decision,
 )
 from app.storage.risk_trace_store import get_risk_trace_by_identifier as _get_risk_trace
+from app.storage.risk_trace_store import trace_display_status
 from app.workflows.github_risk_evaluator import evaluate_github_event_risk as _evaluate_risk
 
 mcp = FastMCP("supply-chain-risk")
@@ -137,7 +138,7 @@ def _build_explanation(record: dict) -> str:
     trace_id = record.get("trace_id") or "(unknown)"
     short_trace = trace_id[:12] + "..." if len(trace_id) > 12 else trace_id
     headline = record.get("headline") or "(none)"
-    final_status = record.get("final_status") or "(unknown)"
+    status = trace_display_status(record)
     supplier = record.get("supplier") or "(none)"
     risk_type = record.get("risk_type") or "(none)"
     risk_level = record.get("risk_level") or "(none)"
@@ -149,7 +150,7 @@ def _build_explanation(record: dict) -> str:
         f"Alert {alert_id}  (trace: {short_trace})",
         f"Headline: {headline}",
         "",
-        f"Status:      {final_status}",
+        f"Status:      {status}",
         f"Supplier:    {supplier}",
         f"Risk type:   {risk_type}",
         f"Risk level:  {risk_level}",

@@ -119,6 +119,30 @@ def test_build_trace_explanation_with_steps():
     assert "analyze" in explanation  # slowest node
 
 
+@pytest.mark.parametrize("event", ["paused", "authority_denied"])
+def test_build_trace_explanation_unfinished_workflow_is_not_shown_as_alert_status(event):
+    record = _make_trace()
+    record["final_status"] = "ok"
+    record["workflow_event"] = event
+    explanation = build_trace_explanation(record)
+    assert f"Status:      {event} (workflow not completed)" in explanation
+    assert "Status:      ok" not in explanation
+
+
+@pytest.mark.parametrize("event", ["paused", "authority_denied"])
+def test_mcp_explanation_unfinished_workflow_is_not_shown_as_alert_status(event):
+    mcp_server = pytest.importorskip("mcp_server")
+    record = {**_make_trace(), "final_status": "ok", "workflow_event": event}
+    assert f"Status:      {event} (workflow not completed)" in mcp_server._build_explanation(record)
+
+
+def test_build_trace_explanation_completed_workflow_shows_alert_status():
+    record = _make_trace()
+    record["final_status"] = "ok"
+    record["workflow_event"] = "resumed_completed"
+    assert "Status:      ok" in build_trace_explanation(record)
+
+
 # ---- DynamoDB (requires moto) ----
 
 try:

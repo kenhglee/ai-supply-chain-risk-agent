@@ -68,6 +68,9 @@ def stubs(monkeypatch):
     ["start"],
     ["start", "--headline", "   "],
     ["start", "--headline", HEADLINE, "--thread-id", THREAD_ID],
+    ["start", "--headline", HEADLINE, "--pause-before", "act"],
+    ["start", "--headline", HEADLINE, "--pause-before", ""],
+    ["resume", "--thread-id", THREAD_ID, "--pause-before", "validate"],
     ["resume"],
     ["resume", "--thread-id", "thread-123"],
     ["resume", "--thread-id", "thread-" + "B" * 32],
@@ -92,6 +95,18 @@ def test_start_pauses_before_analyze(stubs, capsys):
     assert out["next"] == ["analyze"]
     assert out["executor_id"] == agent.get_executor_id()
     assert "request_id" not in out
+
+
+def test_start_can_pause_after_analysis(stubs, capsys):
+    assert risk_worker.main(["start", "--headline", HEADLINE, "--pause-before", "validate"]) == 0
+
+    assert stubs.start == [{"row": {"headline": HEADLINE}, "pause_before": ["validate"]}]
+    assert _stdout_json(capsys)["status"] == "paused"
+
+
+def test_default_pause_matches_lambda_contract():
+    assert risk_worker._parser().parse_args(["start", "--headline", HEADLINE]).pause_before == "analyze"
+    assert handler.START_PAUSE_BEFORE == ["analyze"]
 
 
 def test_resume_receives_only_thread_id(stubs, capsys):
@@ -163,6 +178,22 @@ def test_worker_start_then_worker_resume(e2e, monkeypatch, capsys):
     assert resumed["status"] == "completed"
     assert resumed["thread_id"] == started["thread_id"]
     assert resumed["trace_id"] != started["trace_id"]
+    assert (e2e.triage.calls, e2e.retriever.calls, e2e.risk.calls) == (1, 1, 1)
+
+
+@pytest.mark.skipif(not MOTO_AVAILABLE, reason="moto not installed")
+def test_worker_start_after_analysis_then_worker_resume(e2e, monkeypatch, capsys):
+    monkeypatch.delenv("AWS_LAMBDA_LOG_STREAM_NAME", raising=False)
+    assert risk_worker.main(["start", "--headline", HEADLINE, "--pause-before", "validate"]) == 0
+    started = _stdout_json(capsys)
+    assert (started["status"], started["next"]) == ("paused", ["validate"])
+    assert (e2e.triage.calls, e2e.retriever.calls, e2e.risk.calls) == (1, 1, 1)
+
+    monkeypatch.setattr(agent, "_retriever", None)
+    assert risk_worker.main(["resume", "--thread-id", started["thread_id"]]) == 0
+    resumed = _stdout_json(capsys)
+    assert resumed["status"] == "completed"
+    assert resumed["state_written"] is True
     assert (e2e.triage.calls, e2e.retriever.calls, e2e.risk.calls) == (1, 1, 1)
 
 
