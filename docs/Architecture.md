@@ -1236,6 +1236,45 @@ Snapshots taken now record the stored step (`pending_analyze_step`), and the ver
 
 Transport-level holds and in-flight termination are deferred.
 
+### Concurrent resume reproduction (local)
+
+`tests/test_concurrent_resume.py` runs each worker as a separate process (`tests/race_harness.py`) against one persistent SQLite database. Gate files force each interleaving, and each scenario first checks from the event log and the database that the interleaving happened. The gates are bounded waits, and child processes are always killed at the end of a test.
+
+**SQLite stand-ins and how they differ from DynamoDB.** The stand-ins copy the production write rules:
+- checkpoints are written unconditionally, and the latest is the highest uuid6 ID;
+- regular pending writes are first-write-wins; special writes (error, interrupt) overwrite;
+- supplier state is read, then put unconditionally;
+- the action claim follows `ActionLedger` (absent or `DENIED` → `IN_FLIGHT`; `COMPLETED` replays; `IN_FLIGHT` raises `ActionInFlight`).
+
+What they don't reproduce:
+- SQLite serializes writers with one lock; DynamoDB evaluates conditions per item. These tests show only the interleavings the gates force, not storage-level timing.
+- The claim is one SQLite transaction, not `TransactWriteItems`, and authority and policy aren't modelled.
+- Every read is consistent. There is no throttling, retrying or partial transaction failure.
+
+**Observed today.** These tests pass by asserting the unsafe behavior:
+
+| Scenario | Interleaving | Observed |
+|---|---|---|
+| R1 double analysis | Both workers inside `analyze`, executing from the same checkpoint | Two inferences. B's pending writes were dropped by first-write-wins, but B continued with its own alert. The checkpoint history forked at step 4. A opened the ticket on High; B then assessed its Medium alert as `downgraded` and wrote the row as Medium |
+| R2 action in flight | B reaches `act` while A is inside the effect | One effect. B ended with an unhandled `ActionInFlight` (exit 1, no trace), and its `__error__` write sits on its own fork |
+| R3 divergent replay | Both assessed `new_alert` before either acted; A acts and finalizes first | B "completed" by replaying A's High action, then finalized its own Medium analysis (`downgraded`). The ticket says High; the business row says Medium |
+| R4 double finalization | Identical analyses; ordered finalization | One effect, two finalizations (`new_alert`, then `suppressed`), two `resumed_completed` traces, a forked history |
+| X1 cross-thread | Two threads for the same risk, both assessed before either acted | Two action IDs, two tickets. The histories are linear: this is not a same-thread race |
+
+Strict xfails record the future requirements, kept separate from the observations:
+- a single execution per thread under concurrent resume, and no checkpoint fork;
+- action contention reported as an outcome;
+- the action and the business state come from one analysis;
+- a single finalization per thread;
+- separately from per-thread ownership, one ticket per business change across threads.
+
+**Also found while building it.** When a worker crossed its resumability check but loaded the checkpoint after the other worker had progressed, the result depended on timing:
+- the late worker reapplied the other's stored `analyze` writes;
+- in one ordering it then ran no further nodes;
+- `_settle` reported the other worker's newest checkpoint as its own outcome (`paused`, next `act`).
+
+The harness now places its barrier inside `analyze`, so the scenarios are deterministic. That late-load behavior is recorded, but not yet explained or covered by a test.
+
 ### Phase 3 status
 
 Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
