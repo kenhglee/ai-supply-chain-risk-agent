@@ -11,6 +11,10 @@ survive SIGKILL:
                        request id and token usage, like Bedrock Converse.
 
     python tests/c2b_local_child.py <c2b_analysis_kill args...>     (env C2B_DIR)
+
+C2B_OWNED=1 runs the owned lifecycle instead, on the SQLite stand-ins of
+tests/race_harness.py (lease, fenced saver, finalization, fenced action gate,
+write-once traces); C2B_LEASE_TTL_MS sets the lease TTL.
 """
 import json
 import os
@@ -130,6 +134,9 @@ def main(argv: list[str]) -> int:
     retriever = FakeRetriever()
     agent._get_retriever = lambda: retriever
 
+    if os.environ.get("C2B_OWNED") == "1":
+        return driver.main(argv, deps_factory=_owned_deps(base), require_bedrock=False)
+
     def deps():
         # The C2b local tests characterize the unfenced lifecycle's crash recovery
         # (explicit baseline); owned recovery is covered in tests/test_ownership_processes.py.
@@ -139,6 +146,28 @@ def main(argv: list[str]) -> int:
                 "unfenced_baseline": True}
 
     return driver.main(argv, deps_factory=deps, require_bedrock=False)
+
+
+def _owned_deps(base: Path):
+    from app.storage import risk_trace_store
+    from app.workflows.risk_workflow import Ownership
+    from tests import race_harness as h
+
+    db = base / "owned.sqlite"
+    if not db.exists():
+        h.init_db(db)
+        with h.connect(db) as conn:  # prior TSMC/earthquake High: the alert assesses suppressed
+            conn.execute("INSERT OR REPLACE INTO supplier_state VALUES (?,?)", ("TSMC#earthquake", json.dumps(
+                {"supplier": "TSMC", "risk_type": "earthquake", "current_risk_level": "High",
+                 "last_headline": "earlier headline", "last_seen_at": "2026-01-01T00:00:00+00:00"})))
+    risk_trace_store._store = h.SqliteTraceStore(db)
+    ttl_ms = int(os.environ.get("C2B_LEASE_TTL_MS", "120000"))
+
+    def deps():
+        return {"checkpointer": h.FencedSqliteCheckpointSaver(db), "risk_store": h.SqliteRiskStateStore(db),
+                "action_gate": h.SqliteActionGate(db),
+                "ownership": Ownership(h.SqliteLeaseStore(db, ttl_ms), h.SqliteFinalStore(db))}
+    return deps
 
 
 if __name__ == "__main__":

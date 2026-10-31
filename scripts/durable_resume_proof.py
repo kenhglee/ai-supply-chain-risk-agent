@@ -18,6 +18,10 @@ Two groups of acceptance checks, both required:
           (new_alert, escalated). A suppressed or downgraded run passes only
           if it created no ledger item.
 
+  ownership  (owned lifecycle) A created the thread's lease at epoch 1, B
+          resumed at epoch 2, and B's trace, the final marker and the
+          released lease are all at epoch 2.
+
 --expect-action required|skipped additionally fails the run unless the
 assessed change is (or is not) action-eligible, e.g. to insist on covering
 action execution; auto (default) accepts either.
@@ -289,6 +293,15 @@ def run(headline: str, env_file: Path, out: Path | None, expect_action: str = "a
     ledger = ActionLedger(os.environ["ACTIONS_TABLE"], AuthorityStore(os.environ["AUTHORITY_TABLE"], region), region)
 
     state_before_a = _state_rows(state_store)
+    from boto3.dynamodb.conditions import Key
+
+    checkpoint_table = boto3.resource("dynamodb", region_name=region).Table(os.environ["CHECKPOINT_TABLE"])
+
+    def ownership_items(thread):
+        items = {i["sk"]: i for i in checkpoint_table.query(
+            KeyConditionExpression=Key("thread_id").eq(thread) & Key("sk").between("final", "lease"),
+            ConsistentRead=True)["Items"]}
+        return items.get("lease"), items.get("final")
 
     # ---- Process A: START, pause before validate, exit ----
     a = _run_child([sys.executable, "-m", "app.workers.risk_worker", "start",
@@ -320,8 +333,10 @@ def run(headline: str, env_file: Path, out: Path | None, expect_action: str = "a
     }
 
     alert = between["checkpoint"].get("alert") or {}
+    lease_after, final_after = ownership_items(thread_id)
     checks = {
         "resume": _resume_checks(headline, a, b, between, after, state_before_a),
+        "ownership": ownership_checks(a_out, b_out, lease_after, final_after, after["trace_b"]),
         "action": action_checks(
             expect_action,
             alert=alert,
@@ -333,8 +348,11 @@ def run(headline: str, env_file: Path, out: Path | None, expect_action: str = "a
             action_id=action_id,
         ),
     }
+    from scripts.c2b_analysis_kill import code_identity
+
     evidence = _jsonable({
         "headline": headline,
+        "code": code_identity(),
         "caller_arn": identity["Arn"],
         "region": region,
         "config": {k: os.environ.get(k) for k in (
@@ -370,6 +388,27 @@ def run(headline: str, env_file: Path, out: Path | None, expect_action: str = "a
 
 def _check(ok: bool, detail) -> dict:
     return {"ok": bool(ok), "detail": detail}
+
+
+def ownership_checks(a_out: dict, b_out: dict, lease: dict | None, final: dict | None,
+                     trace_b: dict | None) -> dict:
+    """Owned lifecycle: START at epoch 1, RESUME at epoch 2, everything B left behind at epoch 2."""
+    lease, final, trace_b = lease or {}, final or {}, trace_b or {}
+    epoch = lambda v: int(v) if v is not None else None  # noqa: E731  (DynamoDB returns Decimal)
+    a_epoch, b_epoch = epoch(a_out.get("lease_epoch")), epoch(b_out.get("lease_epoch"))
+    return {
+        "a_started_at_epoch_1": _check(a_epoch == 1, {"a_epoch": a_epoch}),
+        "b_resumed_at_the_next_epoch": _check(a_epoch is not None and b_epoch == a_epoch + 1,
+                                              {"a_epoch": a_epoch, "b_epoch": b_epoch}),
+        "b_trace_and_final_marker_at_b_epoch": _check(
+            epoch(trace_b.get("lease_epoch")) == b_epoch and final.get("trace_id") == b_out.get("trace_id")
+            and epoch(final.get("epoch")) == b_epoch,
+            {"trace_epoch": trace_b.get("lease_epoch"), "final_trace_id": final.get("trace_id"),
+             "final_epoch": final.get("epoch"), "b_trace_id": b_out.get("trace_id")}),
+        "lease_released_at_b_epoch": _check(
+            lease.get("state") == "RELEASED" and epoch(lease.get("epoch")) == b_epoch,
+            {"state": lease.get("state"), "epoch": lease.get("epoch")}),
+    }
 
 
 def action_checks(expect: str, *, alert: dict, headline: str, prior_row: dict | None, b_outcome: dict,

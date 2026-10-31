@@ -812,3 +812,18 @@ def test_truly_completed_thread_is_still_already_completed(env):
     assert again["status"] == "already_completed"
     assert again["trace_id"] == completed["trace_id"]
     assert len(env.actions.scan()["Items"]) == 1
+
+
+def test_harness_ownership_checks_on_an_owned_start_and_resume(env):
+    """DR1's ownership group, fed by a real owned START and RESUME (in-process)."""
+    proof = _load_proof_script()
+    started = risk_workflow.start_workflow({"headline": HEADLINE}, pause_before=["validate"], **_new_executor())
+    deps = _new_executor()
+    resumed = risk_workflow.resume_workflow(started["thread_id"], **deps)
+    lease = LeaseStore(CHECKPOINTS, REGION).read(started["thread_id"])
+    final = deps["ownership"].finals.read(started["thread_id"])
+
+    checks = proof.ownership_checks(started, resumed, lease, final, _trace(resumed["trace_id"]))
+    assert all(c["ok"] for c in checks.values()), checks
+    stale = proof.ownership_checks(started, {**resumed, "lease_epoch": 3}, lease, final, _trace(resumed["trace_id"]))
+    assert not stale["b_resumed_at_the_next_epoch"]["ok"]

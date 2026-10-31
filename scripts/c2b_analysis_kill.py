@@ -50,13 +50,30 @@ COMMANDS
     snapshot --thread-id T --events FILE --label L
              Records the durable checkpoint state (latest checkpoint, next node,
              whether analyze's pending writes are stored) as an event.
-    verdict  --thread-id T --events FILE --expect {c1,c3} [--out FILE] [--offline]
+    verdict  --thread-id T --events FILE --expect {c1,c3,contention} [--out FILE] [--offline]
              Evaluates the event log and durable state (checkpoint, traces);
              exit 0 only if every acceptance check passed. Acceptance uses
              the normal lifecycle evidence; diagnostics (--direct-invoke) are
              reported separately and are optional. --offline reads no durable
              state: the checks that need it are reported as not evaluated and
              the verdict cannot pass.
+
+OWNERSHIP (production dependencies are owned; docs/SAME_THREAD_OWNERSHIP_DESIGN.md)
+    Every attempt acquires the thread's lease; a heartbeat keeps renewing it
+    while the attempt holds, so a second attempt during a hold is
+    `contended` (exit 5 from the lifecycle; recorded, nothing executed).
+    After a kill the lease is only taken over once it expires: set
+    LEASE_TTL_MS low for experiments and wait longer than it before the
+    takeover attempt. --release-file F makes a hold continue once F exists
+    (owned contention experiment: the owner completes after the contender).
+    --direct-invoke needs unfenced dependencies and is refused on owned ones.
+    Events record code identity (git commit / CODE_REVISION / IMAGE_DIGEST)
+    and lease epochs; snapshots record the lease and the final marker.
+
+    verdict --expect contention: an owner held (with --release-file) while a
+    contender attempt ran; the contender must be `contended` with no analyze,
+    no model call, no workflow write and no trace; the owner then completes
+    and finalizes at the same epoch.
 
 EVENTS
     One JSON object per line, appended, flushed and fsynced before any hold,
@@ -148,9 +165,10 @@ def read_events(path: Path) -> list[dict]:
 # ---- Hooks ----
 
 class _Context:
-    def __init__(self, hold: str, hold_timeout: float, log: EventLog, thread_id: str):
+    def __init__(self, hold: str, hold_timeout: float, log: EventLog, thread_id: str, release_file=None):
         self.hold = hold
         self.hold_timeout = hold_timeout
+        self.release_file = release_file
         self.log = log
         self.thread_id = thread_id
         self.analyze_task_id = None
@@ -161,13 +179,21 @@ class _Context:
 
 
 def _hold(ctx: _Context, point: str) -> None:
-    """Record the hold durably, announce it, and wait to be killed. Never continues."""
+    """Record the hold durably, announce it, and wait to be killed (or released, with --release-file)."""
     ctx.holding = True
     ctx.log.emit("holding", point=point, thread_id=ctx.thread_id, hold_timeout_s=ctx.hold_timeout,
-                 waiting_thread=threading.current_thread().name)
-    print(f"HOLDING point={point} pid={os.getpid()} thread_id={ctx.thread_id} "
-          f"-> run: kill -9 {os.getpid()}", file=sys.stderr, flush=True)
-    threading.Event().wait(ctx.hold_timeout)
+                 waiting_thread=threading.current_thread().name,
+                 release_file=str(ctx.release_file) if ctx.release_file else None)
+    how = f"touch {ctx.release_file}" if ctx.release_file else f"kill -9 {os.getpid()}"
+    print(f"HOLDING point={point} pid={os.getpid()} thread_id={ctx.thread_id} -> run: {how}",
+          file=sys.stderr, flush=True)
+    deadline = time.monotonic() + ctx.hold_timeout
+    while time.monotonic() < deadline:
+        if ctx.release_file and Path(ctx.release_file).exists():
+            ctx.holding = False
+            ctx.log.emit("hold_released", point=point)
+            return
+        threading.Event().wait(0.1)
     ctx.log.emit("hold_expired", point=point)
     os._exit(EXIT_HOLD_EXPIRED)
 
@@ -296,7 +322,8 @@ def install_hooks(ctx: _Context, checkpointer, *, require_bedrock: bool = True) 
         if ctx.hold == HOLD_AFTER_ANALYZE_WRITES and not ctx.analyze_task_id:
             ctx.log.emit("hook_failed", reason="LangGraph did not expose the analyze task id")
             os._exit(EXIT_HOOK)
-        ctx.log.emit("analyze_enter", trace_id=configurable.get("trace_id"), task_id=ctx.analyze_task_id)
+        ctx.log.emit("analyze_enter", trace_id=configurable.get("trace_id"), task_id=ctx.analyze_task_id,
+                     lease_epoch=configurable.get("lease_epoch"))
         result = original_analyze(state)
         ctx.analyze_returned = True
         ctx.log.emit("analyze_return", alert_status=(result.get("alert") or {}).get("status"))
@@ -344,6 +371,22 @@ def install_hooks(ctx: _Context, checkpointer, *, require_bedrock: bool = True) 
 
 # ---- Commands ----
 
+def code_identity() -> dict:
+    """What code ran: git commit (and whether the tree was dirty), else the image's labels."""
+    import subprocess
+
+    identity = {"code_revision": os.environ.get("CODE_REVISION"), "image_digest": os.environ.get("IMAGE_DIGEST")}
+    try:
+        identity["git_commit"] = subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, capture_output=True,
+                                                text=True, timeout=5).stdout.strip() or None
+        status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=PROJECT_ROOT,
+                                capture_output=True, text=True, timeout=5)
+        identity["git_dirty"] = bool(status.stdout.strip()) if status.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        identity.update(git_commit=None, git_dirty=None)
+    return identity
+
+
 def _default_deps():
     from app.workflows.risk_workflow import checkpoint_dependencies_from_env
     return checkpoint_dependencies_from_env()
@@ -356,7 +399,9 @@ def _executor_id() -> str:
 
 def _outcome_fields(outcome: dict) -> dict:
     keys = ("status", "thread_id", "trace_id", "next", "change_type", "state_written", "final_status",
-            "eligibility_change_type", "action_eligible", "eligibility_basis", "action_id", "action_status")
+            "eligibility_change_type", "action_eligible", "eligibility_basis", "action_id", "action_status",
+            "lease_epoch", "lineage_checkpoint_id", "finalized_by_trace_id", "recovered_finalization",
+            "trace_recovered", "holder", "error_type")
     return {k: outcome.get(k) for k in keys}
 
 
@@ -364,7 +409,8 @@ def cmd_start(args, deps_factory) -> int:
     from app.workflows.risk_workflow import start_workflow
 
     log = EventLog(args.events, attempt=f"start-{os.getpid()}")
-    log.emit("attempt_start", role="start", executor_id=_executor_id(), host=socket.gethostname())
+    log.emit("attempt_start", role="start", executor_id=_executor_id(), host=socket.gethostname(),
+             code=code_identity())
     outcome = start_workflow({"headline": args.headline}, pause_before=["analyze"], **deps_factory())
     log.emit("attempt_exit", **_outcome_fields(outcome))
     print(f"THREAD_ID={outcome.get('thread_id')}", flush=True)
@@ -382,9 +428,15 @@ def cmd_attempt(args, deps_factory, *, require_bedrock: bool) -> int:
     role = "langgraph-direct" if args.direct_invoke else "resume"
     log = EventLog(args.events, attempt=f"{role}-{args.hold}-{os.getpid()}")
     log.emit("attempt_start", role=role, hold=args.hold, thread_id=args.thread_id,
-             executor_id=_executor_id(), host=socket.gethostname())
+             executor_id=_executor_id(), host=socket.gethostname(), code=code_identity(),
+             release_file=str(args.release_file) if args.release_file else None)
     deps = deps_factory()
-    ctx = _Context(args.hold, args.hold_timeout, log, args.thread_id)
+    if args.direct_invoke and (deps.get("ownership") is not None or getattr(deps["checkpointer"], "fenced", False)):
+        log.emit("attempt_exit", status="refused", error="--direct-invoke needs unfenced dependencies")
+        print("--direct-invoke bypasses the lifecycle and has no ownership token; owned (fenced) "
+              "dependencies refuse it", file=sys.stderr)
+        return 2
+    ctx = _Context(args.hold, args.hold_timeout, log, args.thread_id, release_file=args.release_file)
 
     cfg = {"configurable": {"thread_id": args.thread_id}}
     snapshot = build_app(deps["checkpointer"], action_gate=deps["action_gate"],
@@ -460,7 +512,19 @@ def durable_snapshot(deps: dict, thread_id: str, analyze_task_ids: set[str]) -> 
         "pending_analyze_step": pending_analyze_step,
         "pending_analyze_alert_status": pending_alert.get("status"),
         "pending_write_task_count": len(pending_task_ids),
+        **_ownership_snapshot(deps, thread_id),
     }
+
+
+def _ownership_snapshot(deps: dict, thread_id: str) -> dict:
+    ownership = deps.get("ownership")
+    if ownership is None:
+        return {}
+    lease = ownership.leases.read(thread_id) or {}
+    final = ownership.finals.read(thread_id) or {}
+    return {"lease": {k: lease.get(k) for k in ("epoch", "state", "owner", "expires_at_ms")} if lease else None,
+            "final": {k: final.get(k) for k in ("kind", "trace_id", "epoch", "change_type", "recovered")}
+            if final else None}
 
 
 def _analyze_task_ids(events: list[dict]) -> set[str]:
@@ -513,7 +577,17 @@ def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_t
         return next((e for e in evs if e["event"] == event
                      and all(e.get(k) == v for k, v in match.items())), None)
 
-    killed, resumed, direct = first("resume", False), first("resume", True), first("langgraph-direct", True)
+    def exit_status(evs):
+        return (find(evs, "attempt_exit") or {}).get("status")
+
+    resume_attempts = [evs for evs in attempts.values()
+                       if evs[0]["event"] == "attempt_start" and evs[0].get("role") == "resume"]
+    # Owned runs: attempts that found the thread held did nothing; they are checked separately.
+    contended = [evs for evs in resume_attempts if exit_status(evs) == "contended"]
+    killed = next((evs for evs in resume_attempts if evs[0].get("hold") != HOLD_NONE and evs not in contended), [])
+    resumed = next((evs for evs in reversed(resume_attempts)
+                    if evs[0].get("hold") == HOLD_NONE and evs not in contended), [])
+    direct = first("langgraph-direct", True)
     k, r, d = names(killed), names(resumed), names(direct)
     snapshots = {e["label"]: e for e in events if e["event"] == "durable_snapshot"}
     before, between = snapshots.get("before-kill"), snapshots.get("after-kill")
@@ -567,6 +641,7 @@ def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_t
                 {"model_returns": [{"attempt": e["attempt"], "request_id": e.get("request_id"),
                                     "output_tokens": e.get("output_tokens")} for e in all_model_returns]}),
         })
+        _owned_takeover_checks(acceptance, killed, resumed, contended, final_state, durable, find)
         return {"acceptance": acceptance, "diagnostics": {}}
 
     # ---- c3: reuse established from the normal lifecycle evidence ----
@@ -631,6 +706,8 @@ def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_t
              "final_durable": {x: final_state.get(x) for x in ("step", "next", "tasks")},
              "final_trace_event": final_trace.get("workflow_event"), "final_trace_nodes": final_nodes})
 
+    _owned_takeover_checks(acceptance, killed, resumed, contended, final_state, durable, find)
+
     # Optional: what LangGraph alone does (bypasses the lifecycle). Not acceptance.
     if direct:
         diagnostic = _check(
@@ -641,11 +718,116 @@ def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_t
     return {"acceptance": acceptance, "diagnostics": {"langgraph_direct_invoke_reuses_stored_writes": diagnostic}}
 
 
+def _owned_takeover_checks(acceptance: dict, killed, resumed, contended, final_state, durable, find) -> None:
+    """Owned runs only: contention before expiry, takeover at a higher epoch, marker and lease at that epoch."""
+    k_enter = find(killed, "analyze_enter") or {}
+    r_exit = find(resumed, "attempt_exit") or {}
+    if k_enter.get("lease_epoch") is None and r_exit.get("lease_epoch") is None:
+        return  # unfenced baseline run
+    killed_epoch, resumed_epoch = k_enter.get("lease_epoch"), r_exit.get("lease_epoch")
+    k_hold = find(killed, "holding") or {}
+    r_start = find(resumed, "attempt_start") or {}
+    holders = [(find(evs, "attempt_exit") or {}).get("holder") or {} for evs in contended]
+    acceptance["ownership_contended_until_expiry"] = _check(
+        all(h.get("epoch") == killed_epoch for h in holders)
+        and all(k_hold.get("ts", "") < evs[0]["ts"] < r_start.get("ts", "~") for evs in contended)
+        and all(not {"analyze_enter", "model_return", "writes_committed", "checkpoint_committed"}
+                & {e["event"] for e in evs} for evs in contended),
+        {"contended_attempts": len(contended), "holder_epochs": [h.get("epoch") for h in holders],
+         "killed_epoch": killed_epoch})
+    acceptance["ownership_takeover_epoch_increased"] = _check(
+        killed_epoch is not None and resumed_epoch is not None and resumed_epoch > killed_epoch,
+        {"killed_epoch": killed_epoch, "resumed_epoch": resumed_epoch})
+    if not durable:
+        acceptance["ownership_final_marker_and_lease"] = _not_evaluated("verdict did not read durable state (--offline)")
+        return
+    final, lease = (final_state or {}).get("final") or {}, (final_state or {}).get("lease") or {}
+    acceptance["ownership_final_marker_and_lease"] = _check(
+        final.get("trace_id") == r_exit.get("trace_id") and final.get("epoch") == resumed_epoch
+        and lease.get("state") == "RELEASED" and lease.get("epoch") == resumed_epoch,
+        {"final": final, "lease": lease, "resume_trace_id": r_exit.get("trace_id")})
+
+
+def evaluate_contention(events: list[dict], *, final_state: dict | None, contender_traces: dict | None,
+                        owner_trace: dict | None) -> dict:
+    """An owner held (releasable) while a contender attempt ran; see module doc."""
+    attempts: dict[str, list[dict]] = {}
+    for e in events:
+        attempts.setdefault(e["attempt"], []).append(e)
+
+    def find(evs, event):
+        return next((e for e in evs if e["event"] == event), None)
+
+    resumes = [evs for evs in attempts.values() if evs[0]["event"] == "attempt_start"
+               and evs[0].get("role") == "resume"]
+    owner = next((evs for evs in resumes if evs[0].get("hold") != HOLD_NONE), [])
+    contenders = [evs for evs in resumes if evs is not owner]
+    o_enter, o_hold, o_release = find(owner, "analyze_enter") or {}, find(owner, "holding") or {}, \
+        find(owner, "hold_released") or {}
+    o_exit = find(owner, "attempt_exit") or {}
+    owner_epoch = o_enter.get("lease_epoch")
+    snapshots = {e["label"]: e for e in events if e["event"] == "durable_snapshot"}
+    before, after = snapshots.get("before-contender") or {}, snapshots.get("after-contender") or {}
+    durable = final_state is not None and contender_traces is not None and owner_trace is not None
+    forbidden = {"analyze_enter", "model_invoke_start", "model_return", "writes_committed", "checkpoint_committed",
+                 "validate_enter", "tripwire_hit"}
+
+    acceptance = {
+        "owner_held_then_released": _check(
+            bool(o_hold) and bool(o_release) and o_exit.get("status") == "completed",
+            {"owner_events": [e["event"] for e in owner]}),
+        "contender_ran_during_the_hold": _check(
+            bool(contenders) and all(o_hold.get("ts", "~") < evs[0]["ts"]
+                                     and (find(evs, "attempt_exit") or {}).get("ts", "~") < o_release.get("ts", "")
+                                     for evs in contenders),
+            {"contenders": len(contenders), "hold": o_hold.get("ts"), "release": o_release.get("ts")}),
+        "contender_was_contended_by_the_owner": _check(
+            bool(contenders) and all(
+                (find(evs, "attempt_exit") or {}).get("status") == "contended"
+                and ((find(evs, "attempt_exit") or {}).get("holder") or {}).get("owner") == o_enter.get("trace_id")
+                and ((find(evs, "attempt_exit") or {}).get("holder") or {}).get("epoch") == owner_epoch
+                for evs in contenders),
+            [{"status": (find(evs, "attempt_exit") or {}).get("status"),
+              "holder": (find(evs, "attempt_exit") or {}).get("holder")} for evs in contenders]),
+        "contender_executed_nothing": _check(
+            bool(contenders) and all("hooks_installed" in {e["event"] for e in evs}
+                                     and not forbidden & {e["event"] for e in evs}
+                                     and not [e for e in evs if e["event"] == "aws_call"
+                                              and e.get("call", "").startswith("bedrock")]
+                                     for evs in contenders),
+            [[e["event"] for e in evs] for evs in contenders]),
+        "one_inference_total": _check(
+            sum(1 for e in events if e["event"] == "model_return") == 1,
+            sum(1 for e in events if e["event"] == "model_return")),
+        "no_workflow_write_by_the_contender": _check(
+            bool(before) and bool(after) and before.get("checkpoint_id") == after.get("checkpoint_id")
+            and before.get("lease") == after.get("lease"),
+            {"before": {k: before.get(k) for k in ("checkpoint_id", "lease")},
+             "after": {k: after.get(k) for k in ("checkpoint_id", "lease")}}),
+    }
+    if not durable:
+        for name in ("contender_wrote_no_trace", "owner_finalized_at_its_epoch"):
+            acceptance[name] = _not_evaluated("verdict did not read durable state (--offline)")
+        return {"acceptance": acceptance, "diagnostics": {}}
+    final, lease = final_state.get("final") or {}, final_state.get("lease") or {}
+    acceptance["contender_wrote_no_trace"] = _check(
+        all(t is None for t in contender_traces.values()), {k: v is not None for k, v in contender_traces.items()})
+    acceptance["owner_finalized_at_its_epoch"] = _check(
+        final.get("trace_id") == o_exit.get("trace_id") and final.get("epoch") == owner_epoch == o_exit.get("lease_epoch")
+        and lease.get("state") == "RELEASED" and lease.get("epoch") == owner_epoch
+        and (owner_trace or {}).get("workflow_event") == "resumed_completed",
+        {"final": final, "lease": lease, "owner_epoch": owner_epoch,
+         "owner_trace_event": (owner_trace or {}).get("workflow_event")})
+    return {"acceptance": acceptance, "diagnostics": {}}
+
+
 def cmd_verdict(args, deps_factory) -> int:
     events = read_events(args.events)
+    if args.expect == "contention":
+        return _verdict_contention(args, deps_factory, events)
     start_exit = next((e for e in events if e["event"] == "attempt_exit" and e["attempt"].startswith("start-")), {})
     resume_exit = next((e for e in reversed(events) if e["event"] == "attempt_exit"
-                        and e["attempt"].startswith("resume-none-")), {})
+                        and e["attempt"].startswith("resume-none-") and e.get("status") != "contended"), {})
     final_trace = paused_trace = final_state = None
     if not args.offline:
         from app.storage.risk_trace_store import get_risk_trace_by_identifier
@@ -666,9 +848,38 @@ def cmd_verdict(args, deps_factory) -> int:
         "final_outcome": {k: resume_exit.get(k) for k in (
             "status", "trace_id", "change_type", "eligibility_change_type", "action_eligible", "action_status")},
         "checks": checks,
+        "code": next((e.get("code") for e in events if e.get("code")), None),
         "complete": all(c["ok"] is not None for c in acceptance),
         "passed": all(c["ok"] is True for c in acceptance),
         "diagnostics_ok": all(c["ok"] for c in diagnostics_run) if diagnostics_run else None,
+    }
+    text = json.dumps(result, indent=2, default=str)
+    print(text)
+    if args.out:
+        args.out.write_text(text + "\n")
+    return EXIT_OK if result["passed"] else EXIT_VERDICT_FAILED
+
+
+def _verdict_contention(args, deps_factory, events) -> int:
+    final_state = owner_trace = contender_traces = None
+    if not args.offline:
+        from app.storage.risk_trace_store import get_risk_trace_by_trace_id
+
+        exits = [e for e in events if e["event"] == "attempt_exit" and e["attempt"].startswith("resume-")]
+        owner_exit = next((e for e in exits if e.get("status") != "contended"), {})
+        owner_trace = get_risk_trace_by_trace_id(owner_exit["trace_id"]) if owner_exit.get("trace_id") else {}
+        contender_traces = {e["trace_id"]: get_risk_trace_by_trace_id(e["trace_id"])
+                            for e in exits if e.get("status") == "contended" and e.get("trace_id")}
+        final_state = durable_snapshot(deps_factory(), args.thread_id, _analyze_task_ids(events))
+    checks = evaluate_contention(events, final_state=final_state, contender_traces=contender_traces,
+                                 owner_trace=owner_trace)
+    acceptance = checks["acceptance"].values()
+    result = {
+        "experiment": "owned contention", "thread_id": args.thread_id, "durable_state_read": not args.offline,
+        "final_durable_state": final_state, "checks": checks,
+        "code": next((e.get("code") for e in events if e.get("code")), None),
+        "complete": all(c["ok"] is not None for c in acceptance),
+        "passed": all(c["ok"] is True for c in acceptance),
     }
     text = json.dumps(result, indent=2, default=str)
     print(text)
@@ -690,6 +901,8 @@ def _parser() -> argparse.ArgumentParser:
     attempt.add_argument("--events", type=Path, required=True)
     attempt.add_argument("--hold", choices=HOLD_CHOICES, required=True)
     attempt.add_argument("--hold-timeout", type=float, default=DEFAULT_HOLD_TIMEOUT_S)
+    attempt.add_argument("--release-file", type=Path,
+                         help="continue the hold once this file exists (default: wait to be killed)")
     attempt.add_argument("--direct-invoke", action="store_true",
                          help="diagnostic: continue with the graph's invoke(None), bypassing the lifecycle")
 
@@ -701,7 +914,7 @@ def _parser() -> argparse.ArgumentParser:
     verdict = commands.add_parser("verdict")
     verdict.add_argument("--thread-id", required=True)
     verdict.add_argument("--events", type=Path, required=True)
-    verdict.add_argument("--expect", choices=("c1", "c3"), required=True)
+    verdict.add_argument("--expect", choices=("c1", "c3", "contention"), required=True)
     verdict.add_argument("--out", type=Path)
     verdict.add_argument("--offline", action="store_true",
                          help="evaluate the event log only; checks needing durable state are not evaluated")
