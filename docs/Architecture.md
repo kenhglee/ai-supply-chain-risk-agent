@@ -1159,6 +1159,28 @@ A suppressed run passes only if it created no ledger item. `--expect-action requ
 
 This verifies only the `suppressed` (no-action) route on AWS. **Live verification of a `new_alert` or `escalated` run, where `act` executes after `assess`, is still pending.**
 
+### Mid-node kill experiment (C2b, local)
+
+**Driver.** `scripts/c2b_analysis_kill.py` runs separately from normal execution. It installs hooks in its own process only, then calls the unmodified lifecycle; normal execution has no hooks and no delays.
+- **Process roles.** START pauses before `analyze`. A held attempt is killed with `kill -9`. A fresh process then resumes.
+- **Tripwires.** Triage, retrieval, embeddings and any model other than risk inference are blocked.
+- **Event log.** Events are fsynced JSONL: attempts, `analyze` entry and return, model return (request ID and token usage only), the hold point, and stored writes and checkpoints. No prompts, response bodies or credentials are recorded. A killed attempt has no completion trace; the event log is its record.
+
+**Local tests** (`tests/test_c2b_driver.py`). Each attempt is a separate Python process (`tests/c2b_local_child.py`) killed with SIGKILL. Only fsynced files carry state between processes: a test-only `FileCheckpointSaver`, CSV supplier state and JSONL traces. These tests do not exercise `DynamoCheckpointSaver`. **Nothing has been run against AWS.**
+
+- **c1: hold after the risk model returns, inside `analyze`. Passes locally.**
+  - The durable checkpoint is unchanged by the killed attempt.
+  - The resume runs `analyze` again, with a second inference (a distinct request ID).
+  - Retrieval is not repeated.
+  - This proves at-least-once re-execution with duplicate inference after the client received a full response. It is not an in-flight kill: the provider had finished.
+- **c3 negative control: hold after `analyze`'s pending writes are stored, before the next checkpoint.**
+  - The hold sits in the checkpoint `put`, which the main thread waits on. A hold in the background writer does not stop the graph: in a probe, `validate`, `assess` and later checkpoints ran during it.
+  - Nothing downstream ran during the hold.
+  - LangGraph itself reuses the stored writes. A direct `invoke(None)` diagnostic continued without running `analyze` or calling the model.
+  - **The lifecycle did not.** `get_state()` reports `next=()` while the `analyze` task still holds its result. `resume_workflow` treated an empty `next` as completed and returned `already_completed`, so `validate`, `assess` and the supplier-state write never ran.
+
+Transport-level holds and in-flight termination are deferred.
+
 ### Phase 3 status
 
 Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
@@ -1170,7 +1192,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] C1: local Docker runtime portability (Lambda START → Docker RESUME, same image digest)
   - [x] C2a: Kubernetes executor replacement (Pod A START → delete → Pod B RESUME → Pod C no-op)
   - [x] C2+: whole-cluster destruction/recreation (`risk-c2` deleted → `risk-c2-resume` completes the workflow)
-  - [ ] C2b (optional, parked): force-kill mid-node / at-least-once behavior; not required to close Phase C
+  - [ ] C2b: force-kill mid-node. Local driver: c1 passes; the c3 control exposed a lifecycle completion defect (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b-local)); not run against AWS
   - [x] Same external state model preserved across Lambda, Docker and Kubernetes executors
 - [ ] Workload identity for the worker (least privilege, no developer credentials)
 - [x] 3D1: authority store, transactional action ledger, governed `act` node, fail-closed configuration, `session` worker (proven under moto)
