@@ -32,7 +32,6 @@ behavior; the workflow lifecycle does not use fenced mode yet.
 """
 import hashlib
 import os
-import random
 import time
 from collections.abc import Iterator, Sequence
 from datetime import datetime, timezone
@@ -41,7 +40,7 @@ from typing import Any
 import boto3
 from boto3.dynamodb.conditions import Key
 from boto3.dynamodb.types import Binary, TypeSerializer
-from botocore.exceptions import ClientError, ConnectionError as BotoConnectionError, HTTPClientError
+from botocore.exceptions import ClientError
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -54,6 +53,7 @@ from langgraph.checkpoint.base import (
     get_checkpoint_metadata,
 )
 
+from app.storage.fenced_writes import ABSENT, APPLIED, run_fenced_transaction
 from app.storage.thread_lease import (
     HELD,
     LEASE_SK,
@@ -61,7 +61,6 @@ from app.storage.thread_lease import (
     LeaseLost,
     OwnershipRequired,
     WriteConflict,
-    WriteOutcomeUnknown,
 )
 
 # DynamoDB rejects items over 400 KB; fail earlier with a clear message.
@@ -69,15 +68,6 @@ MAX_ITEM_BYTES = 350_000
 # One task's writes go in one transaction (100 items, one is the lease check).
 MAX_FENCED_WRITES = 99
 
-# Retried with the same request and token.
-RETRYABLE_ERROR_CODES = frozenset({
-    "ProvisionedThroughputExceededException", "ThrottlingException", "RequestLimitExceeded",
-    "TransactionInProgressException", "InternalServerError", "ServiceUnavailable",
-})
-RETRYABLE_CANCELLATION_REASONS = frozenset({"TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded"})
-# The request may or may not have been applied.
-UNKNOWN_OUTCOME_EXCEPTIONS = (HTTPClientError, BotoConnectionError)
-APPLIED, ABSENT = "applied", "absent"
 
 
 def _bytes(value: Any) -> bytes:
@@ -105,6 +95,8 @@ class DynamoCheckpointSaver(BaseCheckpointSaver):
         # by a background writer while another exception propagates, so callers
         # check this instead of relying on the exception reaching them.
         self.lost: dict[tuple[str, str, int], LeaseLost] = {}
+        # Lineage: the last checkpoint each (thread, owner, epoch) wrote.
+        self.last_checkpoint: dict[tuple[str, str, int], str] = {}
 
     # ---- Keys ----
 
@@ -393,43 +385,13 @@ class DynamoCheckpointSaver(BaseCheckpointSaver):
         return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()[:32]
 
     def _transact(self, token, operation: str, items: "list[dict]", request_token: str, verify) -> None:
-        """Run one fenced transaction until it is applied, verified, or classified.
-
-        Classification order: lost ownership (lease check failed) -> data
-        conflict (verified by read-back) -> transaction conflict / throttling
-        (retried with the same token) -> unknown outcome (retried, then
-        verified) -> anything else is raised.
-        """
-        unknown = False
-        for attempt in range(self.max_attempts):
-            try:
-                self._client.transact_write_items(TransactItems=items, ClientRequestToken=request_token)
-                return
-            except ClientError as exc:
-                code = exc.response.get("Error", {}).get("Code")
-                if code == "TransactionCanceledException":
-                    reasons = [r.get("Code") for r in exc.response.get("CancellationReasons", [])]
-                    if reasons and reasons[0] == "ConditionalCheckFailed":
-                        raise self._lease_lost(token, operation) from None
-                    if "ConditionalCheckFailed" in reasons[1:]:
-                        if verify() == APPLIED:
-                            return
-                        raise WriteConflict(f"{operation}: a conflicting item exists") from None
-                    if not set(reasons) & RETRYABLE_CANCELLATION_REASONS:
-                        raise
-                elif code not in RETRYABLE_ERROR_CODES:
-                    raise  # IdempotentParameterMismatch, ValidationException, ...
-                unknown = unknown or code in {"InternalServerError", "ServiceUnavailable"}
-            except UNKNOWN_OUTCOME_EXCEPTIONS:
-                unknown = True
-            self._sleep(self.backoff_s * (2 ** attempt) * (1 + random.random()))
-        # Retries exhausted: establish what happened from durable state.
-        if verify() == APPLIED:
-            return
-        if not self._still_owner(token):
-            raise self._lease_lost(token, operation)
-        raise WriteOutcomeUnknown(f"{operation}: not applied after {self.max_attempts} attempts"
-                                  + (" (unknown outcome)" if unknown else ""))
+        try:
+            run_fenced_transaction(self._client, token=token, operation=operation, items=items,
+                                   request_token=request_token, verify=verify,
+                                   still_owner=lambda: self._still_owner(token),
+                                   max_attempts=self.max_attempts, backoff_s=self.backoff_s, sleep=self._sleep)
+        except LeaseLost:
+            raise self._lease_lost(token, operation) from None
 
     def _fenced_put(self, config: RunnableConfig, item: dict) -> None:
         token = self._token(config)
@@ -456,6 +418,7 @@ class DynamoCheckpointSaver(BaseCheckpointSaver):
             self._request_token("chk", *token, item["sk"]),
             verify,
         )
+        self.last_checkpoint[token] = item["checkpoint_id"]
 
     def _fenced_put_writes(self, config: RunnableConfig, writes: Sequence[tuple[str, Any]], task_id: str,
                            task_path: str) -> None:

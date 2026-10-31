@@ -1,7 +1,14 @@
 // Checkpointed attempts that stopped before END (mirrors INCOMPLETE_WORKFLOW_EVENTS
 // in app/storage/risk_trace_store.py). Their final_status is an intermediate
 // analysis result and must not be shown as a completed outcome.
-const INCOMPLETE_WORKFLOW_EVENTS = new Set(['paused', 'authority_denied']);
+const INCOMPLETE_WORKFLOW_EVENTS = new Set([
+  'paused',
+  'authority_denied',
+  'lease_lost',
+  'action_in_flight',
+  'attempt_failed',
+  'completion_unverified',
+]);
 
 export interface TraceBadge {
   label: string;

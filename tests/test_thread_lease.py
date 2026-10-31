@@ -76,23 +76,9 @@ def _leases(clock, ttl_ms=10_000):
     return LeaseStore(TABLE, REGION, ttl_ms=ttl_ms, now_ms=clock)
 
 
-# moto's transact_write_items deep-copies its in-memory table for rollback and
-# is not safe against a concurrent transaction mutating that table; LangGraph
-# writes from several background threads. Real DynamoDB serializes conflicting
-# transactions itself, so this lock exists only for moto (production has none).
-_MOTO_TRANSACTION_LOCK = threading.Lock()
-
-
 def _saver():
-    saver = DynamoCheckpointSaver(TABLE, REGION, fenced=True, sleep=lambda s: None)
-    real = saver._client.transact_write_items
-
-    def serialized(**kwargs):
-        with _MOTO_TRANSACTION_LOCK:
-            return real(**kwargs)
-
-    saver._client.transact_write_items = serialized
-    return saver
+    # moto's backend is serialized session-wide in tests/conftest.py.
+    return DynamoCheckpointSaver(TABLE, REGION, fenced=True, sleep=lambda s: None)
 
 
 def _config(lease, checkpoint_id=None):
