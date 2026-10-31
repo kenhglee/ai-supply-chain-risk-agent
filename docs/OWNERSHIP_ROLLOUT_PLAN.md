@@ -166,17 +166,18 @@ Terminal 2, after `HOLDING ... pid=<PID>`:
 kill -9 <PID>
 ```
 
-Terminal 1:
+Terminal 1, after it prints `owner exit=137`, and **before any contender attempt**:
 ```bash
+$PY $C record-exit --events $E --pid <PID> --exit-status 137   # confirms <PID> is gone and records it
 $PY $C snapshot --thread-id $T --events $E --label after-kill
-$PY $C attempt --thread-id $T --events $E --hold none     # within 30 s: contended
+$PY $C attempt --thread-id $T --events $E --hold none     # within 30 s of the last renewal: contended
 sleep 35
 $PY $C attempt --thread-id $T --events $E --hold none     # takeover: completed at a higher epoch
 $PY $C verdict --thread-id $T --events $E --expect c1 --out $D/verdict.json
 ```
 Acceptance:
 - **The c1 checks:** the analysis re-runs with a second inference, and retrieval is not repeated.
-- **`ownership_contended_until_expiry`:** the early attempt saw the dead owner's epoch.
+- **`ownership_contended_until_expiry`:** a contender that started **after** the recorded exit saw the dead owner's epoch, while that lease was still valid. If no exit is recorded, or no contender follows it, this check is `not_evaluated` and the verdict is incomplete. The record's time is an upper bound on the death, not the kill time.
 - **`ownership_takeover_epoch_increased`.**
 - **`ownership_final_marker_and_lease`:** the marker and the released lease are at the takeover epoch.
 
@@ -268,11 +269,30 @@ Evidence: [`docs/evidence/OWN-preflight-20261031T224222Z.json`](evidence/OWN-pre
 - Transaction-conflict behavior between the owner's concurrent writes. They completed, but conflicts weren't counted.
 - Anything about the deployed Lambda, which wasn't involved.
 
-### Experiment B: kill, expiry and takeover (not reviewed)
+### Experiment B: kill, expiry and takeover
 
-`~/ownership-runs/OWN-takeover-20261031T233348Z` exists locally, with a `verdict.json` reporting 11 of 11 passed. It has **not been reviewed and is not preserved here.**
+**Run `OWN-takeover-20261031T233348Z`** ([evidence](evidence/OWN-takeover-20261031T233348Z/)). Code: commit `4b3ee87`, clean tree.
 
-There is one open question. Its `contended` attempt (23:35:29Z) precedes the `after-kill` snapshot (23:36:28Z), and the kill time isn't in the event log. `ownership_contended_until_expiry` only requires a contended attempt between the hold and the takeover, so the run may show contention against a **live** owner rather than a dead one. Before accepting it, establish the kill time:
-- from the operator's shell record of `kill -9` and its exit status;
-- or by requiring an `after-kill` snapshot before any contender attempt.
+**Demonstrated:**
+- **Recovery at epoch 3.**
+  - START paused before `analyze` at epoch 1.
+  - The owner (trace `5e34d227…`, epoch 2) inferred once (Bedrock request `20a65392-…`), held at `after-inference`, and was killed. It has no exit event and wrote nothing. The checkpoint `1f1d5838-…` is unchanged, still at step 3, `analyze` next.
+  - The takeover attempt (trace `d73d3d0b…`) acquired at **epoch 3** and completed.
+- **Repeated inference.** The takeover entered `analyze` again and made a second Bedrock call (`e068a476-…`): two inferences in total, at least once as expected for a node interrupted before its writes were stored.
+- **Retrieval reused.** The final trace's `retrieve` step is START's own (started 23:33:51.409Z). There was no new retrieval and no tripwire hit.
+- **Finalization.** The outcome was `suppressed`, with final marker `finalized` at epoch 3 (by the takeover attempt). The lease was `RELEASED` at epoch 3 by that attempt, and the graph is at step 6 with no pending tasks.
 
+**Not verified: post-kill, pre-expiry contention.**
+- One attempt (started 23:35:29.343Z) returned `contended`, with holder epoch 2 and lease expiry 23:35:58.427Z.
+- The kill time and the owner's exit were **not recorded**.
+- The `after-kill` snapshot came later (23:36:28.094Z). It shows the epoch-2 lease still `HELD`, with that expiry unchanged.
+- The run therefore can't show whether that contender met the owner **before or after** it died. No kill timestamp is inferred here.
+
+**Verdicts:**
+- The original `verdict.json` passed `ownership_contended_until_expiry` under the earlier, weaker rule.
+- Regenerated read-only from the same events with the corrected verdict (`1ad2d5e`), as `verdict.regenerated.json`:
+  - that check is **`not_evaluated`** (no recorded exit);
+  - the verdict is **incomplete** (`complete: false`, `passed: false`);
+  - the other 10 acceptance checks pass.
+
+**To verify the remaining claim,** repeat B with `record-exit` between the kill and the contender (§6). The thread here is finalized and can't be reused.
