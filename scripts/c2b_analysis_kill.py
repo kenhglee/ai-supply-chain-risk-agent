@@ -50,8 +50,13 @@ COMMANDS
     snapshot --thread-id T --events FILE --label L
              Records the durable checkpoint state (latest checkpoint, next node,
              whether analyze's pending writes are stored) as an event.
-    verdict  --thread-id T --events FILE --expect {c1,c3} [--out FILE]
-             Evaluates the event log and durable state; exit 0 if it holds.
+    verdict  --thread-id T --events FILE --expect {c1,c3} [--out FILE] [--offline]
+             Evaluates the event log and durable state (checkpoint, traces);
+             exit 0 only if every acceptance check passed. Acceptance uses
+             the normal lifecycle evidence; diagnostics (--direct-invoke) are
+             reported separately and are optional. --offline reads no durable
+             state: the checks that need it are reported as not evaluated and
+             the verdict cannot pass.
 
 EVENTS
     One JSON object per line, appended, flushed and fsynced before any hold,
@@ -84,6 +89,7 @@ HOLD_AFTER_INFERENCE = "after-inference"
 HOLD_AFTER_ANALYZE_WRITES = "after-analyze-writes"
 HOLD_NONE = "none"
 HOLD_CHOICES = (HOLD_AFTER_INFERENCE, HOLD_AFTER_ANALYZE_WRITES, HOLD_NONE)
+ANALYSIS_NODES = ["infer", "decide", "retrieve", "analyze"]
 
 EXIT_OK = 0
 EXIT_VERDICT_FAILED = 1
@@ -435,6 +441,14 @@ def durable_snapshot(deps: dict, thread_id: str, analyze_task_ids: set[str]) -> 
                          risk_reader=deps["risk_store"]).get_state(cfg)
     pending_task_ids = {task_id for task_id, _, _ in latest.pending_writes or []}
     values = latest.checkpoint["channel_values"]
+    # The analyze trace step held in analyze's stored writes (timings only), so
+    # the final trace can be matched to the persisted original exactly.
+    pending_steps = next((v for tid, ch, v in latest.pending_writes or []
+                          if tid in analyze_task_ids and ch == "trace_steps"), None) or []
+    pending_alert = next((v for tid, ch, v in latest.pending_writes or []
+                          if tid in analyze_task_ids and ch == "alert"), None) or {}
+    pending_analyze_step = next(({k: st.get(k) for k in ("node_name", "started_at", "ended_at")}
+                                 for st in reversed(pending_steps) if st.get("node_name") == "analyze"), None)
     return {
         "exists": True,
         "checkpoint_id": latest.checkpoint["id"],
@@ -443,6 +457,8 @@ def durable_snapshot(deps: dict, thread_id: str, analyze_task_ids: set[str]) -> 
         "tasks": _task_summary(snapshot),
         "nodes": [s["node_name"] for s in values.get("trace_steps") or []],
         "analyze_writes_stored": bool(pending_task_ids & analyze_task_ids),
+        "pending_analyze_step": pending_analyze_step,
+        "pending_analyze_alert_status": pending_alert.get("status"),
         "pending_write_task_count": len(pending_task_ids),
     }
 
@@ -459,109 +475,200 @@ def cmd_snapshot(args, deps_factory) -> int:
     return EXIT_OK
 
 
+NOT_EVALUATED = "not_evaluated"
+NOT_RUN = "not_run"
+
+
 def _check(ok, detail) -> dict:
     return {"ok": bool(ok), "detail": detail}
 
 
-def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_trace: dict | None) -> dict:
-    """Checks over the event log: one killed attempt, then a lifecycle RESUME
-    (and, for c3, optionally a --direct-invoke diagnostic)."""
+def _not_evaluated(reason: str) -> dict:
+    """Needs durable state (checkpoint / traces) that this verdict did not read."""
+    return {"ok": None, "status": NOT_EVALUATED, "detail": reason}
+
+
+def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_trace: dict | None,
+             final_state: dict | None) -> dict:
+    """Acceptance checks over one killed attempt and the lifecycle RESUME that
+    followed it, plus optional diagnostics kept out of acceptance.
+
+    final_trace / paused_trace / final_state are None when the verdict did
+    not read durable state (--offline); checks that need them are then
+    reported as not evaluated, never as passed.
+    """
     attempts: dict[str, list[dict]] = {}
     for e in events:
         attempts.setdefault(e["attempt"], []).append(e)
-    first = lambda role, hold_none: next(  # noqa: E731
-        (evs for evs in attempts.values()
-         if evs[0]["event"] == "attempt_start" and evs[0].get("role") == role
-         and (evs[0].get("hold") == HOLD_NONE) == hold_none), [])
-    killed, resumed, direct = first("resume", False), first("resume", True), first("langgraph-direct", True)
-    names = lambda evs: [e["event"] for e in evs]  # noqa: E731
-    exit_of = lambda evs: next((e for e in evs if e["event"] == "attempt_exit"), {})  # noqa: E731
-    snapshots = {e["label"]: e for e in events if e["event"] == "durable_snapshot"}
-    before, between = snapshots.get("before-kill", {}), snapshots.get("after-kill", {})
-    hold_point = HOLD_AFTER_INFERENCE if expect == "c1" else HOLD_AFTER_ANALYZE_WRITES
-    k, r, d = names(killed), names(resumed), names(direct)
-    k_hold = next((e for e in killed if e["event"] == "holding"), {})
-    paused_steps = {st["node_name"]: st for st in (paused_trace or {}).get("trace_steps") or []}
-    final_steps = {st["node_name"]: st for st in
-                   ((final_trace or {}).get("trace_steps") or exit_of(direct).get("trace_steps") or [])}
-    retrieve_reused = (final_steps.get("retrieve") is not None and paused_steps.get("retrieve") is not None
-                       and final_steps["retrieve"]["started_at"] == paused_steps["retrieve"]["started_at"])
-    analyze_tasks = [t for t in between.get("tasks") or [] if t.get("name") == "analyze"]
 
-    checks = {
+    def first(role: str, hold_none: bool) -> list[dict]:
+        return next((evs for evs in attempts.values()
+                     if evs[0]["event"] == "attempt_start" and evs[0].get("role") == role
+                     and (evs[0].get("hold") == HOLD_NONE) == hold_none), [])
+
+    def names(evs):
+        return [e["event"] for e in evs]
+
+    def find(evs, event, **match):
+        return next((e for e in evs if e["event"] == event
+                     and all(e.get(k) == v for k, v in match.items())), None)
+
+    killed, resumed, direct = first("resume", False), first("resume", True), first("langgraph-direct", True)
+    k, r, d = names(killed), names(resumed), names(direct)
+    snapshots = {e["label"]: e for e in events if e["event"] == "durable_snapshot"}
+    before, between = snapshots.get("before-kill"), snapshots.get("after-kill")
+    hold_point = HOLD_AFTER_INFERENCE if expect == "c1" else HOLD_AFTER_ANALYZE_WRITES
+    k_hold = find(killed, "holding") or {}
+    k_enter, k_return = find(killed, "analyze_enter") or {}, find(killed, "analyze_return") or {}
+    r_start, r_exit = find(resumed, "attempt_start") or {}, find(resumed, "attempt_exit") or {}
+    # The first attempt after the kill: the lifecycle RESUME, or the optional diagnostic.
+    recovery_start = min((x for x in (r_start, find(direct, "attempt_start")) if x), key=lambda x: x["ts"],
+                         default={})
+    all_model_returns = [e for e in killed + resumed if e["event"] == "model_return"]
+    durable = final_trace is not None and paused_trace is not None and final_state is not None
+    final_steps = {st["node_name"]: st for st in (final_trace or {}).get("trace_steps") or []}
+    paused_steps = {st["node_name"]: st for st in (paused_trace or {}).get("trace_steps") or []}
+    no_durable = "verdict did not read durable state (--offline)"
+
+    acceptance = {
         "killed_attempt_reached_hold": _check(
             k_hold.get("point") == hold_point and "attempt_exit" not in k and "hold_expired" not in k,
             {"hold": k_hold.get("point"), "events": k}),
         "killed_attempt_entered_analyze_and_got_response": _check(
-            "analyze_enter" in k and "model_return" in k,
+            bool(k_enter) and "model_return" in k,
             {"request_ids": [e.get("request_id") for e in killed if e["event"] == "model_return"]}),
         "nothing_downstream_before_kill": _check(
-            "downstream_during_hold" not in k and "validate_enter" not in k
-            and not [e for e in killed if e["event"] == "checkpoint_committed"],
+            bool(k_hold) and "downstream_during_hold" not in k and "validate_enter" not in k
+            and find(killed, "checkpoint_committed") is None,
             {"after_hold": k[k.index("holding") + 1:] if "holding" in k else None}),
         "no_tripwire_hits": _check(
-            "tripwire_hit" not in k + r + d,
+            bool(resumed) and "tripwire_hit" not in k + r + d,
             [e.get("what") for e in killed + resumed + direct if e["event"] == "tripwire_hit"]),
-        "retrieval_reused_from_start": _check(
-            retrieve_reused, {"retrieve_started_at": (final_steps.get("retrieve") or {}).get("started_at"),
-                              "start_retrieve_started_at": (paused_steps.get("retrieve") or {}).get("started_at")}),
+        "retrieval_reused_from_start": (_check(
+            final_steps.get("retrieve") is not None and paused_steps.get("retrieve") is not None
+            and final_steps["retrieve"]["started_at"] == paused_steps["retrieve"]["started_at"],
+            {"retrieve_started_at": (final_steps.get("retrieve") or {}).get("started_at"),
+             "start_retrieve_started_at": (paused_steps.get("retrieve") or {}).get("started_at")})
+            if durable else _not_evaluated(no_durable)),
     }
+
     if expect == "c1":
-        model_returns = [e for e in killed + resumed if e["event"] == "model_return"]
-        checks.update({
+        acceptance.update({
             "durable_state_unchanged_by_killed_attempt": _check(
-                before.get("checkpoint_id") and before.get("checkpoint_id") == between.get("checkpoint_id")
+                bool(before) and bool(between) and before.get("checkpoint_id") == between.get("checkpoint_id")
                 and between.get("next") == ["analyze"] and not between.get("analyze_writes_stored"),
-                {"before": {x: before.get(x) for x in ("checkpoint_id", "step", "next")},
-                 "after_kill": {x: between.get(x) for x in ("checkpoint_id", "step", "next", "analyze_writes_stored")}}),
-            "resume_completed": _check(exit_of(resumed).get("status") == "completed", exit_of(resumed) or None),
+                {"before": {x: (before or {}).get(x) for x in ("checkpoint_id", "step", "next")},
+                 "after_kill": {x: (between or {}).get(x)
+                                for x in ("checkpoint_id", "step", "next", "analyze_writes_stored")}}),
+            "resume_completed": _check(r_exit.get("status") == "completed", r_exit or None),
             "resume_reran_analyze_and_inference": _check(
-                "analyze_enter" in r and "model_return" in r and len(model_returns) == 2,
+                "hooks_installed" in r and "analyze_enter" in r and "model_return" in r
+                and len(all_model_returns) == 2,
                 {"model_returns": [{"attempt": e["attempt"], "request_id": e.get("request_id"),
-                                    "output_tokens": e.get("output_tokens")} for e in model_returns]}),
+                                    "output_tokens": e.get("output_tokens")} for e in all_model_returns]}),
         })
+        return {"acceptance": acceptance, "diagnostics": {}}
+
+    # ---- c3: reuse established from the normal lifecycle evidence ----
+    analyze_task = k_enter.get("task_id")
+    analyze_tasks = [t for t in (between or {}).get("tasks") or [] if t.get("name") == "analyze"]
+    writes_event = find(killed, "writes_committed", node="analyze", task_id=analyze_task) if analyze_task else None
+    acceptance["analysis_writes_durable_before_recovery"] = _check(
+        writes_event is not None and bool(k_hold) and writes_event["seq"] < k_hold["seq"]
+        and bool(before) and bool(between) and between.get("analyze_writes_stored") is True
+        and before.get("checkpoint_id") == between.get("checkpoint_id")
+        and bool(analyze_tasks) and all(t.get("has_result") for t in analyze_tasks)
+        and between["ts"] < recovery_start.get("ts", ""),
+        {"analyze_task_id": analyze_task, "writes_committed_seq": (writes_event or {}).get("seq"),
+         "hold_seq": k_hold.get("seq"),
+         "after_kill": {x: (between or {}).get(x) for x in ("checkpoint_id", "step", "next", "tasks",
+                                                            "analyze_writes_stored")}})
+
+    acceptance["resume_did_not_execute_analyze_or_invoke_model"] = _check(
+        "hooks_installed" in r and "attempt_exit" in r
+        and not {"analyze_enter", "model_invoke_start", "model_return"} & set(r)
+        and not [e for e in resumed if e["event"] == "aws_call" and e.get("call", "").startswith("bedrock")]
+        and len(all_model_returns) == 1,
+        {"resume_events": r or "no resume attempt",
+         "model_returns": [{"attempt": e["attempt"], "request_id": e.get("request_id")} for e in all_model_returns]})
+
+    if not durable:
+        acceptance["final_analysis_step_is_persisted_original"] = _not_evaluated(no_durable)
     else:
-        killed_analyze_return = next((e for e in killed if e["event"] == "analyze_return"), {})
-        checks.update({
-            "analyze_writes_stored_without_new_checkpoint": _check(
-                "writes_committed" in k and between.get("analyze_writes_stored") is True
-                and before.get("checkpoint_id") == between.get("checkpoint_id")
-                and analyze_tasks and all(t["has_result"] for t in analyze_tasks),
-                {"after_kill": {x: between.get(x) for x in ("checkpoint_id", "step", "next", "tasks")}}),
-            "langgraph_reuses_stored_writes": _check(
-                bool(direct) and "analyze_enter" not in d and "model_return" not in d and "validate_enter" in d
-                and final_steps.get("analyze", {}).get("ended_at", "~") <= killed_analyze_return.get("ts", ""),
-                {"direct_invoke_events": d or "not run",
-                 "analyze_ended_at": (final_steps.get("analyze") or {}).get("ended_at"),
-                 "killed_attempt_analyze_return_logged_at": killed_analyze_return.get("ts")}),
-            "lifecycle_resume_continues_from_stored_writes": _check(
-                exit_of(resumed).get("status") == "completed" and "analyze_enter" not in r
-                and "model_return" not in r and "validate_enter" in r,
-                {"resume_status": exit_of(resumed).get("status"), "resume_events": r}),
-        })
-    return checks
+        step = final_steps.get("analyze") or {}
+        stored = (between or {}).get("pending_analyze_step")
+        if stored:
+            basis = "exact match with the analyze step stored in the pending writes"
+            ok = {kk: step.get(kk) for kk in ("node_name", "started_at", "ended_at")} == stored
+        else:
+            basis = "within the killed attempt's logged analyze window (snapshot predates step capture)"
+            ok = (bool(step) and bool(k_enter) and bool(k_return)
+                  and k_enter["ts"] <= step.get("started_at", "") <= step.get("ended_at", "~") <= k_return["ts"])
+        ok = ok and step.get("ended_at", "~") < r_start.get("ts", "") \
+            and k_return.get("alert_status") == (final_trace or {}).get("final_status")
+        acceptance["final_analysis_step_is_persisted_original"] = _check(
+            ok, {"basis": basis, "final_analyze_step": {kk: step.get(kk) for kk in ("started_at", "ended_at")},
+                 "stored_analyze_step": stored,
+                 "killed_attempt_analyze_window": [k_enter.get("ts"), k_return.get("ts")],
+                 "resume_started_at": r_start.get("ts"),
+                 "alert_status": [k_return.get("alert_status"), (final_trace or {}).get("final_status")]})
+
+    downstream = ["validate", "assess"] + (["act"] if r_exit.get("action_eligible") else [])
+    lifecycle_ok = ("validate_enter" in r and all(find(resumed, "writes_committed", node=n) for n in downstream)
+                    and r_exit.get("status") == "completed" and r_exit.get("state_written") is True)
+    if not durable:
+        acceptance["downstream_and_finalization_completed"] = (
+            _check(False, {"resume_exit": r_exit or None}) if not lifecycle_ok
+            else _not_evaluated(f"{no_durable}; event-log evidence alone is complete"))
+    else:
+        final_nodes = [st["node_name"] for st in (final_trace or {}).get("trace_steps") or []]
+        acceptance["downstream_and_finalization_completed"] = _check(
+            lifecycle_ok and final_state.get("tasks") == [] and final_state.get("next") == []
+            and final_trace.get("workflow_event") == "resumed_completed"
+            and final_nodes == ANALYSIS_NODES + downstream,
+            {"resume_status": r_exit.get("status"), "state_written": r_exit.get("state_written"),
+             "downstream_writes": [n for n in downstream if find(resumed, "writes_committed", node=n)],
+             "final_durable": {x: final_state.get(x) for x in ("step", "next", "tasks")},
+             "final_trace_event": final_trace.get("workflow_event"), "final_trace_nodes": final_nodes})
+
+    # Optional: what LangGraph alone does (bypasses the lifecycle). Not acceptance.
+    if direct:
+        diagnostic = _check(
+            "analyze_enter" not in d and "model_return" not in d and "validate_enter" in d,
+            {"direct_invoke_events": d})
+    else:
+        diagnostic = {"ok": None, "status": NOT_RUN, "detail": "attempt --direct-invoke was not run (optional)"}
+    return {"acceptance": acceptance, "diagnostics": {"langgraph_direct_invoke_reuses_stored_writes": diagnostic}}
 
 
 def cmd_verdict(args, deps_factory) -> int:
-    from app.storage.risk_trace_store import get_risk_trace_by_identifier
-
     events = read_events(args.events)
     start_exit = next((e for e in events if e["event"] == "attempt_exit" and e["attempt"].startswith("start-")), {})
     resume_exit = next((e for e in reversed(events) if e["event"] == "attempt_exit"
                         and e["attempt"].startswith("resume-none-")), {})
-    final_trace = (get_risk_trace_by_identifier(resume_exit["trace_id"])
-                   if resume_exit.get("status") == "completed" else None)
-    paused_trace = get_risk_trace_by_identifier(start_exit["trace_id"]) if start_exit.get("trace_id") else None
-    checks = evaluate(events, args.expect, final_trace, paused_trace)
-    final_state = durable_snapshot(deps_factory(), args.thread_id, _analyze_task_ids(events))
+    final_trace = paused_trace = final_state = None
+    if not args.offline:
+        from app.storage.risk_trace_store import get_risk_trace_by_identifier
+
+        final_trace = (get_risk_trace_by_identifier(resume_exit["trace_id"])
+                       if resume_exit.get("status") == "completed" else None) or {}
+        paused_trace = (get_risk_trace_by_identifier(start_exit["trace_id"])
+                        if start_exit.get("trace_id") else None) or {}
+        final_state = durable_snapshot(deps_factory(), args.thread_id, _analyze_task_ids(events))
+    checks = evaluate(events, args.expect, final_trace, paused_trace, final_state)
+    acceptance = checks["acceptance"].values()
+    diagnostics_run = [c for c in checks["diagnostics"].values() if c["ok"] is not None]
     result = {
         "experiment": f"C2b {args.expect}",
         "thread_id": args.thread_id,
+        "durable_state_read": not args.offline,
         "final_durable_state": final_state,
         "final_outcome": {k: resume_exit.get(k) for k in (
             "status", "trace_id", "change_type", "eligibility_change_type", "action_eligible", "action_status")},
         "checks": checks,
-        "passed": all(c["ok"] for c in checks.values()),
+        "complete": all(c["ok"] is not None for c in acceptance),
+        "passed": all(c["ok"] is True for c in acceptance),
+        "diagnostics_ok": all(c["ok"] for c in diagnostics_run) if diagnostics_run else None,
     }
     text = json.dumps(result, indent=2, default=str)
     print(text)
@@ -596,6 +703,8 @@ def _parser() -> argparse.ArgumentParser:
     verdict.add_argument("--events", type=Path, required=True)
     verdict.add_argument("--expect", choices=("c1", "c3"), required=True)
     verdict.add_argument("--out", type=Path)
+    verdict.add_argument("--offline", action="store_true",
+                         help="evaluate the event log only; checks needing durable state are not evaluated")
     return parser
 
 

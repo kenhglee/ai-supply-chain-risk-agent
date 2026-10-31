@@ -82,10 +82,10 @@ class Run:
         out = self.child("attempt", "--thread-id", thread_id, "--events", str(self.events), "--hold", "none", *extra)
         return json.loads(out.stdout.strip().splitlines()[-1])
 
-    def verdict(self, thread_id: str, expect: str) -> dict:
+    def verdict(self, thread_id: str, expect: str, *extra) -> dict:
         proc = self.child("verdict", "--thread-id", thread_id, "--events", str(self.events),
-                          "--expect", expect, check=False)
-        return json.loads(proc.stdout)
+                          "--expect", expect, *extra, check=False)
+        return {**json.loads(proc.stdout), "exit_code": proc.returncode}
 
     def attempt_events(self, pid: int) -> list[str]:
         return [e["event"] for e in driver.read_events(self.events) if e["pid"] == pid]
@@ -125,8 +125,9 @@ def test_c1_sigkill_after_inference_reruns_analysis_but_not_retrieval(tmp_path):
     assert (resumed["status"], resumed["eligibility_change_type"]) == ("completed", "suppressed")
 
     result = run.verdict(thread_id, "c1")
-    assert result["passed"], {k: v for k, v in result["checks"].items() if not v["ok"]}
-    request_ids = [m["request_id"] for m in result["checks"]["resume_reran_analyze_and_inference"]["detail"]["model_returns"]]
+    assert result["passed"], {k: v for k, v in result["checks"]["acceptance"].items() if not v["ok"]}
+    acceptance = result["checks"]["acceptance"]
+    request_ids = [m["request_id"] for m in acceptance["resume_reran_analyze_and_inference"]["detail"]["model_returns"]]
     assert len(set(request_ids)) == 2  # two separate inferences
     _assert_no_content_recorded(run.events)
 
@@ -167,10 +168,15 @@ def test_c3_langgraph_reuses_stored_writes_without_rerunning_analysis(tmp_path):
     assert direct["status"] == "direct_invoke_returned"
     assert [s["node_name"] for s in direct["trace_steps"]][-3:] == ["analyze", "validate", "assess"]
     result = run.verdict(thread_id, "c3")
+    assert result["checks"]["diagnostics"]["langgraph_direct_invoke_reuses_stored_writes"]["ok"] is True
+    assert result["diagnostics_ok"] is True
+    acceptance = result["checks"]["acceptance"]
     for name in ("killed_attempt_reached_hold", "nothing_downstream_before_kill",
-                 "analyze_writes_stored_without_new_checkpoint", "langgraph_reuses_stored_writes",
-                 "retrieval_reused_from_start", "no_tripwire_hits"):
-        assert result["checks"][name]["ok"], (name, result["checks"][name])
+                 "analysis_writes_durable_before_recovery"):
+        assert acceptance[name]["ok"], (name, acceptance[name])
+    # A diagnostic is not a lifecycle recovery: without a lifecycle RESUME, acceptance fails.
+    assert acceptance["resume_did_not_execute_analyze_or_invoke_model"]["ok"] is False
+    assert result["passed"] is False
     _assert_no_content_recorded(run.events)
 
 
@@ -185,10 +191,106 @@ def test_c3_lifecycle_resume_continues_from_stored_writes(tmp_path):
     assert (resumed["status"], resumed["eligibility_change_type"]) == ("completed", "suppressed")
     assert resumed["state_written"] is True
     result = run.verdict(thread_id, "c3")
-    failed = {k: v for k, v in result["checks"].items() if not v["ok"] and k != "langgraph_reuses_stored_writes"}
-    assert not failed, failed  # the LangGraph diagnostic was not run in this test
-    assert result["checks"]["lifecycle_resume_continues_from_stored_writes"]["ok"]
+    assert result["passed"] and result["complete"], {
+        k: v for k, v in result["checks"]["acceptance"].items() if not v["ok"]}
+    acceptance = result["checks"]["acceptance"]
+    assert acceptance["final_analysis_step_is_persisted_original"]["detail"]["basis"].startswith("exact")
+    # The optional diagnostic was not run and does not affect acceptance.
+    assert result["checks"]["diagnostics"]["langgraph_direct_invoke_reuses_stored_writes"]["status"] == "not_run"
+    assert result["diagnostics_ok"] is None
+
+    offline = run.verdict(thread_id, "c3", "--offline")
+    assert (offline["passed"], offline["complete"], offline["exit_code"]) == (False, False, 1)
+    assert offline["durable_state_read"] is False
     _assert_no_content_recorded(run.events)
+
+
+# ---- c3 verdict: rejecting repeated inference and missing evidence ----
+# One real c3 run (subprocesses, SIGKILL, lifecycle RESUME); its evidence is
+# then altered in memory and re-evaluated with driver.evaluate.
+
+@pytest.fixture(scope="module")
+def c3_evidence(tmp_path_factory):
+    run = Run(tmp_path_factory.mktemp("c3"))
+    thread_id, _ = _c3_killed(run)
+    run.snapshot(thread_id, "after-kill")
+    run.attempt(thread_id)
+    final_state = run.snapshot(thread_id, "final")
+    events = driver.read_events(run.events)
+    traces = [json.loads(line) for line in (run.base / "risk_traces.jsonl").read_text().splitlines()]
+    paused = next(t for t in traces if t["workflow_event"] == "paused")
+    final = next(t for t in traces if t["workflow_event"] == "resumed_completed")
+    return {"events": events, "paused": paused, "final": final, "final_state": final_state}
+
+
+def _evaluate(ev, events=None, final=None, final_state=None):
+    return driver.evaluate(events if events is not None else ev["events"], "c3",
+                           final if final is not None else ev["final"], ev["paused"],
+                           final_state if final_state is not None else ev["final_state"])["acceptance"]
+
+
+def _attempt(events, prefix):
+    return next(e["attempt"] for e in events if e["attempt"].startswith(prefix))
+
+
+def test_c3_evidence_passes_unaltered(c3_evidence):
+    acceptance = _evaluate(c3_evidence)
+    assert all(c["ok"] is True for c in acceptance.values()), {k: v for k, v in acceptance.items() if not v["ok"]}
+
+
+def test_c3_verdict_rejects_repeated_inference_on_resume(c3_evidence):
+    events = [dict(e) for e in c3_evidence["events"]]
+    resume = _attempt(events, "resume-none-")
+    exit_index = next(i for i, e in enumerate(events) if e["attempt"] == resume and e["event"] == "attempt_exit")
+    events[exit_index:exit_index] = [
+        {**events[exit_index], "event": "analyze_enter"},
+        {**events[exit_index], "event": "model_return", "request_id": "second-inference"},
+    ]
+    assert _evaluate(c3_evidence, events=events)["resume_did_not_execute_analyze_or_invoke_model"]["ok"] is False
+
+
+@pytest.mark.parametrize("drop, check", [
+    (lambda e: e["attempt"].startswith("resume-none-") and e["event"] == "hooks_installed",
+     "resume_did_not_execute_analyze_or_invoke_model"),  # no probes means no evidence of absence
+    (lambda e: e["attempt"].startswith("resume-none-") and e["event"] == "attempt_exit",
+     "resume_did_not_execute_analyze_or_invoke_model"),
+    (lambda e: e["event"] == "durable_snapshot" and e["label"] == "after-kill",
+     "analysis_writes_durable_before_recovery"),
+    (lambda e: e["event"] == "writes_committed" and e.get("node") == "analyze",
+     "analysis_writes_durable_before_recovery"),
+    (lambda e: e["attempt"].startswith("resume-none-") and e["event"] == "writes_committed"
+     and e.get("node") == "assess", "downstream_and_finalization_completed"),
+])
+def test_c3_verdict_rejects_missing_evidence(c3_evidence, drop, check):
+    events = [e for e in c3_evidence["events"] if not drop(e)]
+    assert _evaluate(c3_evidence, events=events)[check]["ok"] is False
+
+
+def test_c3_verdict_rejects_analysis_step_that_is_not_the_persisted_one(c3_evidence):
+    final = json.loads(json.dumps(c3_evidence["final"]))
+    analyze = next(st for st in final["trace_steps"] if st["node_name"] == "analyze")
+    analyze["started_at"] = analyze["ended_at"] = "2099-01-01T00:00:00.000+00:00"
+    assert _evaluate(c3_evidence, final=final)["final_analysis_step_is_persisted_original"]["ok"] is False
+
+    # Without the stored step (older snapshots) the killed attempt's window is the basis; it still rejects.
+    events = [dict(e, pending_analyze_step=None) if e["event"] == "durable_snapshot" else e
+              for e in c3_evidence["events"]]
+    check = _evaluate(c3_evidence, events=events, final=final)["final_analysis_step_is_persisted_original"]
+    assert check["ok"] is False and check["detail"]["basis"].startswith("within")
+    assert _evaluate(c3_evidence, events=events)["final_analysis_step_is_persisted_original"]["ok"] is True
+
+
+def test_c3_verdict_rejects_unfinished_finalization(c3_evidence):
+    pending = {**c3_evidence["final_state"], "tasks": [{"name": "assess", "has_result": True, "error": False}]}
+    assert _evaluate(c3_evidence, final_state=pending)["downstream_and_finalization_completed"]["ok"] is False
+
+
+def test_c3_offline_verdict_cannot_pass(c3_evidence):
+    acceptance = driver.evaluate(c3_evidence["events"], "c3", None, None, None)["acceptance"]
+    not_evaluated = {k for k, c in acceptance.items() if c["ok"] is None}
+    assert not_evaluated == {"retrieval_reused_from_start", "final_analysis_step_is_persisted_original",
+                             "downstream_and_finalization_completed"}
+    assert all(c["ok"] is True for k, c in acceptance.items() if k not in not_evaluated)
 
 
 # ---- Unit tests (in-process; nothing is killed) ----
