@@ -50,6 +50,11 @@ COMMANDS
     snapshot --thread-id T --events FILE --label L
              Records the durable checkpoint state (latest checkpoint, next node,
              whether analyze's pending writes are stored) as an event.
+    record-exit --events FILE --pid PID [--exit-status N]
+             After killing a held owner and BEFORE any contender attempt:
+             confirms PID is no longer running and records that (with the
+             operator's observed exit status). The record's time bounds the
+             owner's death from above; it is not the kill time itself.
     verdict  --thread-id T --events FILE --expect {c1,c3,contention} [--out FILE] [--offline]
              Evaluates the event log and durable state (checkpoint, traces);
              exit 0 only if every acceptance check passed. Acceptance uses
@@ -540,6 +545,26 @@ def _analyze_task_ids(events: list[dict]) -> set[str]:
     return {e["task_id"] for e in events if e["event"] == "analyze_enter" and e.get("task_id")}
 
 
+def cmd_record_exit(args) -> int:
+    """Record that a killed attempt's process is gone (operator step after kill -9, before the contender)."""
+    log = EventLog(args.events, attempt=f"record-exit-{os.getpid()}")
+    try:
+        os.kill(args.pid, 0)
+        running = True
+    except ProcessLookupError:
+        running = False
+    except PermissionError:  # exists, owned by someone else
+        running = True
+    if running:
+        log.emit("process_exit_refused", target_pid=args.pid, reason="process is still running")
+        print(f"pid {args.pid} is still running; not recording an exit", file=sys.stderr)
+        return 2
+    record = log.emit("process_exit_recorded", target_pid=args.pid, confirmed_not_running=True,
+                      exit_status=args.exit_status)
+    print(json.dumps(record), flush=True)
+    return EXIT_OK
+
+
 def cmd_snapshot(args, deps_factory) -> int:
     log = EventLog(args.events, attempt=f"snapshot-{os.getpid()}")
     state = durable_snapshot(deps_factory(), args.thread_id, _analyze_task_ids(read_events(args.events)))
@@ -650,7 +675,7 @@ def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_t
                 {"model_returns": [{"attempt": e["attempt"], "request_id": e.get("request_id"),
                                     "output_tokens": e.get("output_tokens")} for e in all_model_returns]}),
         })
-        _owned_takeover_checks(acceptance, killed, resumed, contended, final_state, durable, find)
+        _owned_takeover_checks(acceptance, events, killed, resumed, contended, final_state, durable, find)
         return {"acceptance": acceptance, "diagnostics": {}}
 
     # ---- c3: reuse established from the normal lifecycle evidence ----
@@ -715,7 +740,7 @@ def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_t
              "final_durable": {x: final_state.get(x) for x in ("step", "next", "tasks")},
              "final_trace_event": final_trace.get("workflow_event"), "final_trace_nodes": final_nodes})
 
-    _owned_takeover_checks(acceptance, killed, resumed, contended, final_state, durable, find)
+    _owned_takeover_checks(acceptance, events, killed, resumed, contended, final_state, durable, find)
 
     # Optional: what LangGraph alone does (bypasses the lifecycle). Not acceptance.
     if direct:
@@ -727,7 +752,8 @@ def evaluate(events: list[dict], expect: str, final_trace: dict | None, paused_t
     return {"acceptance": acceptance, "diagnostics": {"langgraph_direct_invoke_reuses_stored_writes": diagnostic}}
 
 
-def _owned_takeover_checks(acceptance: dict, killed, resumed, contended, final_state, durable, find) -> None:
+def _owned_takeover_checks(acceptance: dict, events, killed, resumed, contended, final_state, durable,
+                           find) -> None:
     """Owned runs only: contention before expiry, takeover at a higher epoch, marker and lease at that epoch."""
     k_enter = find(killed, "analyze_enter") or {}
     r_exit = find(resumed, "attempt_exit") or {}
@@ -736,14 +762,8 @@ def _owned_takeover_checks(acceptance: dict, killed, resumed, contended, final_s
     killed_epoch, resumed_epoch = k_enter.get("lease_epoch"), r_exit.get("lease_epoch")
     k_hold = find(killed, "holding") or {}
     r_start = find(resumed, "attempt_start") or {}
-    holders = [(find(evs, "attempt_exit") or {}).get("holder") or {} for evs in contended]
-    acceptance["ownership_contended_until_expiry"] = _check(
-        all(h.get("epoch") == killed_epoch for h in holders)
-        and all(k_hold.get("ts", "") < evs[0]["ts"] < r_start.get("ts", "~") for evs in contended)
-        and all(not {"analyze_enter", "model_return", "writes_committed", "checkpoint_committed"}
-                & {e["event"] for e in evs} for evs in contended),
-        {"contended_attempts": len(contended), "holder_epochs": [h.get("epoch") for h in holders],
-         "killed_epoch": killed_epoch})
+    acceptance["ownership_contended_until_expiry"] = _contended_after_recorded_exit(
+        events, killed, contended, r_start, killed_epoch, find)
     acceptance["ownership_takeover_epoch_increased"] = _check(
         killed_epoch is not None and resumed_epoch is not None and resumed_epoch > killed_epoch,
         {"killed_epoch": killed_epoch, "resumed_epoch": resumed_epoch})
@@ -831,6 +851,44 @@ def _contender_write_calls(contenders: list, find) -> dict:
         ok = ok and writes in ({}, {"dynamodb:UpdateItem": 1})
         detail.append({"aws_calls": calls, "write_calls": writes})
     return _check(ok, detail)
+
+
+def _epoch_ms(ts: str) -> float:
+    return datetime.fromisoformat(ts).timestamp() * 1000
+
+
+def _contended_after_recorded_exit(events, killed, contended, r_start, killed_epoch, find) -> dict:
+    """Post-kill, pre-expiry contention: needs a recorded, confirmed exit of the killed
+    owner BEFORE the contender started, and the owner's lease still valid then.
+
+    Without that chronology the claim is not_evaluated: a contended attempt could
+    otherwise have met the owner while it was still alive.
+    """
+    killed_pid = killed[0]["pid"] if killed else None
+    record = next((e for e in events if e["event"] == "process_exit_recorded"
+                   and e.get("target_pid") == killed_pid and e.get("confirmed_not_running")), None)
+    if record is None:
+        return _not_evaluated("no recorded exit of the killed owner (run `record-exit --pid <owner pid>` after "
+                              "the kill and before the contender); contention timing relative to the kill is unknown")
+    before_exit = [evs for evs in contended if evs[0]["ts"] <= record["ts"]]
+    after_exit = [evs for evs in contended if record["ts"] < evs[0]["ts"] < r_start.get("ts", "~")]
+    detail = {"killed_pid": killed_pid, "exit_recorded_at": record["ts"], "exit_status": record.get("exit_status"),
+              "contenders_before_recorded_exit": len(before_exit), "contenders_after_recorded_exit": len(after_exit)}
+    if not after_exit:
+        return _not_evaluated(f"no contender attempt after the recorded exit: {detail}")
+    results = []
+    for evs in after_exit:
+        holder = (find(evs, "attempt_exit") or {}).get("holder") or {}
+        started_ms = _epoch_ms(evs[0]["ts"])
+        results.append({
+            "attempt": evs[0]["attempt"], "started_at": evs[0]["ts"], "holder_epoch": holder.get("epoch"),
+            "lease_valid_at_start": holder.get("expires_at_ms") is not None and holder["expires_at_ms"] > started_ms,
+            "executed_nothing": not {"analyze_enter", "model_return", "writes_committed", "checkpoint_committed"}
+            & {e["event"] for e in evs},
+        })
+    ok = all(r["holder_epoch"] == killed_epoch and r["lease_valid_at_start"] and r["executed_nothing"]
+             for r in results)
+    return _check(ok, {**detail, "post_exit_contenders": results})
 
 
 def evaluate_contention(events: list[dict], *, final_state: dict | None, contender_traces: dict | None,
@@ -1001,6 +1059,11 @@ def _parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--events", type=Path, required=True)
     snapshot.add_argument("--label", required=True)
 
+    record_exit = commands.add_parser("record-exit")
+    record_exit.add_argument("--events", type=Path, required=True)
+    record_exit.add_argument("--pid", type=int, required=True)
+    record_exit.add_argument("--exit-status", type=int, help="the status your shell observed (e.g. 137 for kill -9)")
+
     verdict = commands.add_parser("verdict")
     verdict.add_argument("--thread-id", required=True)
     verdict.add_argument("--events", type=Path, required=True)
@@ -1023,6 +1086,8 @@ def main(argv: list[str] | None = None, *, deps_factory=None, require_bedrock: b
         return cmd_attempt(args, deps_factory, require_bedrock=require_bedrock)
     if args.command == "snapshot":
         return cmd_snapshot(args, deps_factory)
+    if args.command == "record-exit":
+        return cmd_record_exit(args)
     return cmd_verdict(args, deps_factory)
 
 

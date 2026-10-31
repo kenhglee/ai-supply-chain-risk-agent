@@ -16,7 +16,10 @@ import pytest
 from scripts import c2b_analysis_kill as driver
 from tests.test_c2b_driver import CHILD, PROJECT_ROOT, Run
 
-SHORT_TTL_MS = 1500
+# Long enough to cover the steps between the kill and the early contender
+# (record-exit, the after-kill snapshot, process start-up) even under load, so the
+# dead owner's lease is still valid when the contender starts.
+SHORT_TTL_MS = 10_000
 
 
 class OwnedRun(Run):
@@ -77,27 +80,77 @@ def test_contention_verdict_rejects_a_contender_that_ran_inference(tmp_path):
     assert checks["acceptance"]["one_inference_total"]["ok"] is False
 
 
-def test_owned_kill_is_contended_until_expiry_then_taken_over(tmp_path):
+def _kill_and_take_over(tmp_path, *, record_exit=True):
     run = OwnedRun(tmp_path, ttl_ms=SHORT_TTL_MS)
     thread_id = run.start()
     run.snapshot(thread_id, "before-kill")
     owner = run.held(thread_id, "after-inference")
     owner.kill()
-    owner.wait(timeout=30)
+    returncode = owner.wait(timeout=30)
+    if record_exit:  # operator step: after the kill, before any contender
+        run.child("record-exit", "--events", str(run.events), "--pid", str(owner.pid),
+                  "--exit-status", str(128 - returncode if returncode < 0 else returncode))
     run.snapshot(thread_id, "after-kill")
     early = run.attempt(thread_id)  # the dead owner's lease has not expired yet
     time.sleep(SHORT_TTL_MS / 1000 + 0.5)
     late = run.attempt(thread_id)
+    return run, thread_id, owner, early, late
+
+
+def test_owned_kill_is_contended_until_expiry_then_taken_over(tmp_path):
+    run, thread_id, owner, early, late = _kill_and_take_over(tmp_path)
 
     assert (early["status"], late["status"]) == ("contended", "completed")
     assert late["lease_epoch"] == early["holder"]["epoch"] + 1
     result = run.verdict(thread_id, "c1")
     acceptance = result["checks"]["acceptance"]
-    assert result["passed"], {k: v for k, v in acceptance.items() if not v["ok"]}
+    assert result["passed"] and result["complete"], {k: v for k, v in acceptance.items() if not v["ok"]}
     for name in ("ownership_contended_until_expiry", "ownership_takeover_epoch_increased",
                  "ownership_final_marker_and_lease"):
         assert acceptance[name]["ok"] is True, name
-    assert acceptance["ownership_contended_until_expiry"]["detail"]["contended_attempts"] == 1
+    detail = acceptance["ownership_contended_until_expiry"]["detail"]
+    assert (detail["contenders_after_recorded_exit"], detail["exit_status"]) == (1, 137)
+    assert detail["post_exit_contenders"][0]["lease_valid_at_start"] is True
+
+
+def _contention_check(events, expect="c1"):
+    return driver.evaluate(events, expect, None, None, None)["acceptance"]["ownership_contended_until_expiry"]
+
+
+def test_takeover_without_a_recorded_exit_leaves_post_kill_contention_not_evaluated(tmp_path):
+    run, thread_id, _, _, _ = _kill_and_take_over(tmp_path, record_exit=False)
+    check = _contention_check(driver.read_events(run.events))
+    assert (check["ok"], check["status"]) == (None, "not_evaluated")
+    verdict = run.verdict(thread_id, "c1")
+    assert (verdict["complete"], verdict["passed"], verdict["exit_code"]) == (False, False, 1)
+
+
+def test_contender_before_the_recorded_exit_does_not_count(tmp_path):
+    run, _, _, _, _ = _kill_and_take_over(tmp_path)
+    events = driver.read_events(run.events)
+    resume_start = max(e["ts"] for e in events if e["event"] == "attempt_start" and e.get("hold") == "none")
+    moved = [dict(e, ts=resume_start) if e["event"] == "process_exit_recorded" else e for e in events]
+    check = _contention_check(moved)  # the only contender now precedes the exit record
+    assert (check["ok"], check["status"]) == (None, "not_evaluated")
+    assert "no contender attempt after the recorded exit" in check["detail"]
+
+
+def test_contender_against_an_already_expired_lease_fails(tmp_path):
+    run, _, _, _, _ = _kill_and_take_over(tmp_path)
+    events = []
+    for e in driver.read_events(run.events):
+        if e["event"] == "attempt_exit" and e.get("status") == "contended":
+            e = dict(e, holder={**e["holder"], "expires_at_ms": 1})
+        events.append(e)
+    check = _contention_check(events)
+    assert check["ok"] is False and check["detail"]["post_exit_contenders"][0]["lease_valid_at_start"] is False
+
+
+def test_record_exit_refuses_a_running_process(tmp_path):
+    run = OwnedRun(tmp_path)
+    proc = run.child("record-exit", "--events", str(run.events), "--pid", str(os.getpid()), check=False)
+    assert proc.returncode == 2
+    assert [e["event"] for e in driver.read_events(run.events)] == ["process_exit_refused"]
 
 
 def test_direct_invoke_is_refused_on_owned_dependencies(tmp_path):
