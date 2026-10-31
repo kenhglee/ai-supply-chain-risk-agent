@@ -1144,6 +1144,21 @@ The remaining window fails toward a duplicate ticket instead: if the process die
 
 A suppressed run passes only if it created no ledger item. `--expect-action required|skipped` pins the expected case. The DR1 evidence files above predate this change and use the earlier flat check list.
 
+**Manual AWS verification: suppressed branch only.** This was run manually against the development tables. No evidence file is stored in `docs/evidence/`; the facts below are the recorded outcome.
+
+| Field | Value |
+|---|---|
+| `thread_id` | `thread-68cb0fe1351c456192dd2078b2bde4d7` |
+| Processes | START PID `58151`, RESUME PID `58939` (separate processes) |
+| START | Paused before `validate` |
+| RESUME | `completed` |
+| Assessment | `eligibility_change_type=suppressed`, `action_eligible=false` |
+| Action | No `action_id`, no `action_status` |
+| Business state | `state_written=true` |
+| Resume tripwires | `hits=[]`; AWS services called: DynamoDB and SSO |
+
+This verifies only the `suppressed` (no-action) route on AWS. **Live verification of a `new_alert` or `escalated` run, where `act` executes after `assess`, is still pending.**
+
 ### Phase 3 status
 
 Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
@@ -1179,7 +1194,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] F2d: Phase 3F documentation
 - [ ] Separation of duties and IAM-level enforcement of authority (operator vs agent principals)
 - [x] DR1: two-process resume after checkpointed analysis; no retrieval, embedding or model call on resume (`DR1-20261030T232053Z`)
-- [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); not yet run against AWS
+- [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); AWS: suppressed route verified manually (`thread-68cb0fe1…`), action-eligible route pending
 
 ## Data Models and Storage
 
