@@ -131,9 +131,12 @@ def main(argv: list[str]) -> int:
     agent._get_retriever = lambda: retriever
 
     def deps():
+        # The C2b local tests characterize the unfenced lifecycle's crash recovery
+        # (explicit baseline); owned recovery is covered in tests/test_ownership_processes.py.
         return {"checkpointer": FileCheckpointSaver(base / "checkpoints.pkl"),
                 "risk_store": CsvRiskStateStore(state_csv),
-                "action_gate": UnconfiguredActionGate()}
+                "action_gate": UnconfiguredActionGate(),
+                "unfenced_baseline": True}
 
     return driver.main(argv, deps_factory=deps, require_bedrock=False)
 

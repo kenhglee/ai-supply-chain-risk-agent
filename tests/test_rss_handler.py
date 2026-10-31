@@ -62,22 +62,23 @@ def stubs(monkeypatch):
         calls.pipeline.append(event)
         return {"alerts_processed": 1, "state_writes": 0}
 
-    def fake_start(row, *, checkpointer, risk_store, action_gate=None, pause_before=None):
-        calls.start.append({"row": row, "pause_before": pause_before,
-                            "checkpointer": checkpointer, "risk_store": risk_store})
+    def fake_start(row, *, checkpointer, risk_store, action_gate=None, ownership=None, pause_before=None):
+        calls.start.append({"row": row, "pause_before": pause_before, "checkpointer": checkpointer,
+                            "risk_store": risk_store, "ownership": ownership})
         return calls.start_outcome
 
-    def fake_resume(thread_id, *, checkpointer, risk_store, action_gate=None):
-        calls.resume.append({"thread_id": thread_id, "checkpointer": checkpointer, "risk_store": risk_store})
+    def fake_resume(thread_id, *, checkpointer, risk_store, action_gate=None, ownership=None):
+        calls.resume.append({"thread_id": thread_id, "checkpointer": checkpointer, "risk_store": risk_store,
+                             "ownership": ownership})
         return calls.resume_outcome
 
     class FakeSaver:
-        def __init__(self, table_name, region=None):
-            self.table_name = table_name
+        def __init__(self, table_name, region=None, *, fenced=False):
+            self.table_name, self.fenced = table_name, fenced
             calls.savers.append(self)
 
     def fake_get_risk_store():
-        store = object()
+        store = SimpleNamespace(table=SimpleNamespace(name="supplier_risk_state"))
         calls.stores.append(store)
         return store
 
@@ -86,12 +87,17 @@ def stubs(monkeypatch):
                                     final_status="ok", supplier="TSMC")
 
     monkeypatch.setenv("CHECKPOINT_TABLE", "risk_agent_checkpoints")
+    monkeypatch.setenv("RISK_STATE_BACKEND", "dynamodb")
+    monkeypatch.setenv("TRACE_STORE_BACKEND", "dynamodb")
     monkeypatch.setenv("AWS_LAMBDA_LOG_STREAM_NAME", "stream-1")
     monkeypatch.setattr(handler, "run_supplier_risk_flow", fake_pipeline)
     monkeypatch.setattr(handler, "start_workflow", fake_start)
     monkeypatch.setattr(handler, "resume_workflow", fake_resume)
     monkeypatch.setattr(risk_workflow, "DynamoCheckpointSaver", FakeSaver)
     monkeypatch.setattr(risk_workflow, "get_risk_store", fake_get_risk_store)
+    monkeypatch.setattr(risk_workflow, "LeaseStore", lambda table, **kw: SimpleNamespace(table=table, **kw))
+    monkeypatch.setattr(risk_workflow, "FinalizationStore", lambda table, state: SimpleNamespace(table=table,
+                                                                                                state=state))
     return calls
 
 
@@ -154,6 +160,15 @@ def test_checkpoint_start_routes_with_pause_before_analyze(stubs):
         "eligibility_change_type": None,
         "action_eligible": None,
         "eligibility_basis": None,
+        "lease_epoch": None,
+        "lineage_checkpoint_id": None,
+        "finalized_by_trace_id": None,
+        "recovered_finalization": None,
+        "trace_recovered": None,
+        "legacy_recognized": None,
+        "unverified_reasons": None,
+        "holder": None,
+        "error_type": None,
         "executor_id": "stream-1",
         "request_id": "req-1",
     }
@@ -167,7 +182,8 @@ def test_checkpoint_resume_receives_only_thread_id(stubs):
     assert response["statusCode"] == 200
     [call] = stubs.resume
     assert call["thread_id"] == THREAD_ID
-    assert set(call) == {"thread_id", "checkpointer", "risk_store"}
+    assert set(call) == {"thread_id", "checkpointer", "risk_store", "ownership"}
+    assert call["checkpointer"].fenced is True  # production dependencies are always owned
     body = _body(response)
     assert body["action"] == "checkpoint_resume"
     assert body["status"] == "completed"
@@ -293,3 +309,21 @@ def test_start_then_resume_through_handler(env, monkeypatch):
     assert _body(again)["status"] == "already_completed"
     assert len(savers) == 3
     assert len({id(s) for s in savers}) == 3
+
+
+@pytest.mark.parametrize("status, code", [
+    ("contended", 409), ("lease_lost", 409), ("action_in_flight", 409), ("completion_unverified", 409),
+    ("attempt_failed", 500),
+])
+def test_ownership_outcomes_map_to_http_status(stubs, status, code):
+    stubs.resume_outcome = _outcome(status)
+    response = handler.lambda_handler({"action": "checkpoint_resume", "thread_id": THREAD_ID}, CONTEXT)
+    assert response["statusCode"] == code
+    assert _body(response)["status"] == status
+
+
+@pytest.mark.parametrize("variable", ["RISK_STATE_BACKEND", "TRACE_STORE_BACKEND"])
+def test_checkpointed_lifecycle_never_falls_back_to_unfenced_stores(stubs, monkeypatch, variable):
+    monkeypatch.setenv(variable, "csv" if variable == "RISK_STATE_BACKEND" else "jsonl")
+    with pytest.raises(RuntimeError, match=f"{variable}=dynamodb"):
+        handler.lambda_handler({"action": "checkpoint_resume", "thread_id": THREAD_ID}, CONTEXT)

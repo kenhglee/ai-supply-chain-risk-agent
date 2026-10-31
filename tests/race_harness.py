@@ -83,6 +83,8 @@ CREATE TABLE IF NOT EXISTS actions (
 CREATE TABLE IF NOT EXISTS claim_attempts (action_id TEXT, trace_id TEXT, outcome TEXT, at TEXT);
 CREATE TABLE IF NOT EXISTS lease (
   thread_id TEXT PRIMARY KEY, epoch INTEGER, state TEXT, owner TEXT, expires_at_ms INTEGER);
+CREATE TABLE IF NOT EXISTS final (thread_id TEXT PRIMARY KEY, marker TEXT);
+CREATE TABLE IF NOT EXISTS traces (trace_id TEXT PRIMARY KEY, record TEXT, at TEXT);
 CREATE TABLE IF NOT EXISTS fenced_log (
   kind TEXT, thread_id TEXT, checkpoint_id TEXT, task_path TEXT, owner TEXT, epoch INTEGER,
   outcome TEXT, at TEXT);
@@ -200,7 +202,7 @@ class SqliteLeaseStore:
     def __init__(self, path: Path, ttl_ms: int):
         self.path, self.ttl_ms = path, ttl_ms
 
-    def acquire(self, thread_id: str, owner: str):
+    def acquire(self, thread_id: str, owner: str, *, executor: str = "", new_thread: bool = False):
         from app.storage.thread_lease import HELD, Lease, LeaseContended
 
         now = int(time.time() * 1000)
@@ -209,7 +211,7 @@ class SqliteLeaseStore:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT epoch, state, owner, expires_at_ms FROM lease WHERE thread_id=?",
                                (thread_id,)).fetchone()
-            if row and row[1] == HELD and row[3] >= now:
+            if row and (new_thread or (row[1] == HELD and row[3] >= now)):
                 conn.execute("ROLLBACK")
                 raise LeaseContended(thread_id, {"epoch": row[0], "owner": row[2], "expires_at_ms": row[3]})
             epoch = (row[0] if row else 0) + 1
@@ -219,6 +221,17 @@ class SqliteLeaseStore:
             return Lease(thread_id, owner, epoch, now + self.ttl_ms)
         finally:
             conn.close()
+
+    def renew(self, lease):
+        from app.storage.thread_lease import HELD, Lease, LeaseLost
+
+        expires = int(time.time() * 1000) + self.ttl_ms
+        with connect(self.path) as conn:
+            cur = conn.execute("UPDATE lease SET expires_at_ms=? WHERE thread_id=? AND owner=? AND epoch=? AND state=?",
+                               (expires, lease.thread_id, lease.owner, lease.epoch, HELD))
+        if cur.rowcount != 1:
+            raise LeaseLost(lease.thread_id, lease.owner, lease.epoch, "renew")
+        return Lease(lease.thread_id, lease.owner, lease.epoch, expires)
 
     def release(self, lease) -> bool:
         with connect(self.path) as conn:
@@ -241,6 +254,7 @@ class FencedSqliteCheckpointSaver(SqliteCheckpointSaver):
     def __init__(self, path: Path):
         super().__init__(path)
         self.lost: dict = {}
+        self.last_checkpoint: dict = {}
 
     def _fenced(self, config, kind, task_path, write):
         from app.storage.thread_lease import HELD, LeaseLost, OwnershipRequired
@@ -285,6 +299,8 @@ class FencedSqliteCheckpointSaver(SqliteCheckpointSaver):
                           metadata.get("step"), metadata.get("trace_id"), ctype, cblob, mtype, mblob, _now()))
         self._fenced({**config, "configurable": {**config["configurable"], "checkpoint_id": checkpoint["id"]}},
                      "checkpoint", None, write)
+        c = config["configurable"]
+        self.last_checkpoint[(c["thread_id"], c["lease_owner"], int(c["lease_epoch"]))] = checkpoint["id"]
         return {"configurable": {"thread_id": thread_id, "checkpoint_ns": ns, "checkpoint_id": checkpoint["id"]}}
 
     def put_writes(self, config, writes, task_id, task_path=""):
@@ -304,6 +320,89 @@ class FencedSqliteCheckpointSaver(SqliteCheckpointSaver):
                              (thread_id, checkpoint_id, task_id, task_path, writer, cur.rowcount, int(idx < 0),
                               _now()))
         self._fenced(config, "writes", task_path, write)
+
+
+def _lease_is(conn, lease: dict) -> bool:
+    from app.storage.thread_lease import HELD
+
+    row = conn.execute("SELECT owner, epoch, state FROM lease WHERE thread_id=?", (lease["thread_id"],)).fetchone()
+    return bool(row) and row[0] == lease["owner"] and row[1] == int(lease["epoch"]) and row[2] == HELD
+
+
+class SqliteFinalStore:
+    """FinalizationStore rules: lease check + once-only marker + optional supplier row, one transaction."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def read(self, thread_id: str) -> dict | None:
+        with connect(self.path) as conn:
+            row = conn.execute("SELECT marker FROM final WHERE thread_id=?", (thread_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def commit(self, lease, marker: dict, supplier=None) -> dict:
+        from app.storage.finalization import AlreadyFinalized
+        from app.storage.thread_lease import LeaseLost
+
+        marker = {**marker, "thread_id": lease.thread_id, "epoch": lease.epoch}
+        conn = connect(self.path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not _lease_is(conn, {"thread_id": lease.thread_id, "owner": lease.owner, "epoch": lease.epoch}):
+                conn.execute("ROLLBACK")
+                raise LeaseLost(lease.thread_id, lease.owner, lease.epoch, "finalization")
+            row = conn.execute("SELECT marker FROM final WHERE thread_id=?", (lease.thread_id,)).fetchone()
+            if row:
+                conn.execute("ROLLBACK")
+                existing = json.loads(row[0])
+                if existing.get("trace_id") == marker["trace_id"] and existing.get("epoch") == lease.epoch:
+                    return existing
+                raise AlreadyFinalized(lease.thread_id, existing)
+            conn.execute("INSERT INTO final VALUES (?,?)", (lease.thread_id, json.dumps(marker, default=str)))
+            if supplier is not None:
+                name, risk_type, state_row = supplier
+                conn.execute("INSERT OR REPLACE INTO supplier_state VALUES (?,?)",
+                             (f"{name}#{risk_type}",
+                              json.dumps({**state_row, "supplier": name, "risk_type": risk_type})))
+            conn.execute("COMMIT")
+            return marker
+        finally:
+            conn.close()
+
+
+class SqliteTraceStore:
+    """Trace store with the write-once rule (conditional on trace_id), shared by processes."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def append(self, record: dict) -> None:
+        with connect(self.path) as conn:
+            conn.execute("INSERT OR REPLACE INTO traces VALUES (?,?,?)",
+                         (record["trace_id"], json.dumps(record, default=str), _now()))
+
+    def append_once(self, record: dict) -> str:
+        from app.storage.risk_trace_store import CONFLICT, SAME, WRITTEN, _same_trace
+
+        with connect(self.path) as conn:
+            cur = conn.execute("INSERT OR IGNORE INTO traces VALUES (?,?,?)",
+                               (record["trace_id"], json.dumps(record, default=str), _now()))
+            if cur.rowcount == 1:
+                return WRITTEN
+            existing = json.loads(conn.execute("SELECT record FROM traces WHERE trace_id=?",
+                                               (record["trace_id"],)).fetchone()[0])
+        return SAME if _same_trace(existing, json.loads(json.dumps(record, default=str))) else CONFLICT
+
+    def get_all(self) -> list[dict]:
+        with connect(self.path) as conn:
+            return [json.loads(r[0]) for r in conn.execute("SELECT record FROM traces ORDER BY at")]
+
+    def get_by_trace_id(self, trace_id: str) -> dict | None:
+        with connect(self.path) as conn:
+            row = conn.execute("SELECT record FROM traces WHERE trace_id=?", (trace_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    get_by_identifier = get_by_trace_id
 
 
 class SqliteRiskStateStore:
@@ -348,11 +447,18 @@ class SqliteActionGate:
     def execute(self, action_id: str, *, scope: str, context: dict, effect) -> dict:
         from app.governance.action_ledger import ActionInFlight
 
+        from app.storage.thread_lease import LeaseLost
+
         trace_id = context["trace_id"]
+        lease = context.get("lease")
         conn = connect(self.path)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("BEGIN IMMEDIATE")
+            if lease is not None and not _lease_is(conn, lease):  # fenced: admission and replay need ownership
+                self._log(conn, action_id, trace_id, "lease_rejected")
+                conn.execute("COMMIT")
+                raise LeaseLost(lease["thread_id"], lease["owner"], int(lease["epoch"]), f"admission of {action_id}")
             row = conn.execute("SELECT * FROM actions WHERE action_id=?", (action_id,)).fetchone()
             if row is None or row["status"] == "DENIED":
                 conn.execute(
@@ -409,6 +515,7 @@ def run_child(argv: list[str]) -> int:
     parser.add_argument("--ownership", action="store_true")
     parser.add_argument("--lease-ttl-ms", type=int, default=120_000)
     parser.add_argument("--fail-analyze", action="store_true", help="raise inside analyze after its gates")
+    parser.add_argument("--no-heartbeat", action="store_true", help="stand-in for a stalled owner")
     args = parser.parse_args(argv)
 
     os.environ["RISK_STATE_BACKEND"] = "csv"  # unused: stores are injected
@@ -530,27 +637,49 @@ def run_child(argv: list[str]) -> int:
     deps = {"checkpointer": saver, "risk_store": SqliteRiskStateStore(db), "action_gate": SqliteActionGate(db)}
     log.emit("attempt_start", role=args.role, thread_id=args.thread_id, ownership=args.ownership)
 
-    lease = None
     if args.ownership:
-        from app.storage.thread_lease import LeaseContended, LeaseLost
-        import uuid as _uuid
+        from app.storage.thread_lease import LeaseContended
+        from app.workflows.risk_workflow import COMPLETED_EVENTS, Ownership
 
-        leases = SqliteLeaseStore(db, args.lease_ttl_ms)
-        gate("before-acquire")
-        try:
-            lease = leases.acquire(args.thread_id, f"owner-{worker}-{_uuid.uuid4().hex[:8]}")
-        except LeaseContended as exc:
-            log.emit("contended", holder_epoch=exc.holder.get("epoch"), holder=exc.holder.get("owner"))
-            return 5
-        log.emit("acquired", epoch=lease.epoch, owner=lease.owner)
-        original_config = risk_workflow._config
+        traces = SqliteTraceStore(db)
+        risk_trace_store._store = traces
+        leases, finals = SqliteLeaseStore(db, args.lease_ttl_ms), SqliteFinalStore(db)
+        real_acquire, real_release, real_commit = leases.acquire, leases.release, finals.commit
+        real_append_once = traces.append_once
 
-        def owned_config(thread_id, trace_id=None):
-            cfg = original_config(thread_id, trace_id)
-            cfg["configurable"].update(lease_owner=lease.owner, lease_epoch=lease.epoch)
-            return cfg
+        def acquire(thread_id, owner, **kwargs):
+            gate("before-acquire")
+            try:
+                lease = real_acquire(thread_id, owner, **kwargs)
+            except LeaseContended as exc:
+                log.emit("contended", holder_epoch=exc.holder.get("epoch"), holder=exc.holder.get("owner"))
+                raise
+            log.emit("acquired", epoch=lease.epoch, owner=lease.owner)
+            return lease
 
-        risk_workflow._config = owned_config
+        def release(lease):
+            ok = real_release(lease)
+            log.emit("released", ok=ok, epoch=lease.epoch)
+            return ok
+
+        def commit(lease, marker, supplier=None):
+            gate("before-finalize")
+            log.emit("finalize_enter", kind=marker.get("kind"))
+            stored = real_commit(lease, marker, supplier)
+            log.emit("finalize_return", change_type=stored.get("change_type"), kind=stored.get("kind"),
+                     risk_level=marker.get("risk_level"))
+            return stored
+
+        def append_once(record):
+            if record.get("workflow_event") in COMPLETED_EVENTS and not record.get("trace_recovered"):
+                gate("before-trace")
+            result = real_append_once(record)
+            log.emit("trace_once", workflow_event=record.get("workflow_event"), result=result,
+                     trace_id=record.get("trace_id"))
+            return result
+
+        leases.acquire, leases.release, finals.commit, traces.append_once = acquire, release, commit, append_once
+        deps["ownership"] = Ownership(leases, finals, heartbeat_interval_s=0 if args.no_heartbeat else None)
 
         # Hold point after analyze's writes are stored, before the next checkpoint
         # (the main thread waits on that put). Recognized by checkpoint contents.
@@ -563,6 +692,9 @@ def run_child(argv: list[str]) -> int:
             return original_put(config, checkpoint, metadata, new_versions)
 
         saver.put = put
+    else:
+        deps["unfenced_baseline"] = True
+
     try:
         if args.role == "start":
             outcome = risk_workflow.start_workflow(
@@ -574,16 +706,14 @@ def run_child(argv: list[str]) -> int:
         log.emit("attempt_error", error_type=type(exc).__name__, error=str(exc)[:300],
                  ownership_lost=[list(k) for k in getattr(saver, "lost", {})])
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
-        if args.ownership and type(exc).__name__ == "LeaseLost":
-            return 6
         return EXIT_ERROR
-    if lease is not None:
-        log.emit("released", ok=leases.release(lease), epoch=lease.epoch)
     log.emit("attempt_exit", **{k: outcome.get(k) for k in (
         "status", "thread_id", "trace_id", "next", "change_type", "state_written", "risk_level",
-        "eligibility_change_type", "action_eligible", "action_id", "action_status")})
+        "eligibility_change_type", "action_eligible", "action_id", "action_status", "lease_epoch",
+        "finalized_by_trace_id", "recovered_finalization", "trace_recovered", "error_type")},
+             ownership_lost=[list(k) for k in getattr(saver, "lost", {})])
     print(json.dumps({k: outcome.get(k) for k in ("status", "thread_id", "trace_id")}), flush=True)
-    return 0
+    return {"contended": 5, "lease_lost": 6, "action_in_flight": 6}.get(outcome.get("status"), 0)
 
 
 if __name__ == "__main__":

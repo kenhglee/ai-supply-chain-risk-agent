@@ -6,6 +6,11 @@ logger = logging.getLogger()
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 from app.workflows.risk_workflow import (
+    ACTION_IN_FLIGHT,
+    ATTEMPT_FAILED,
+    COMPLETION_UNVERIFIED,
+    CONTENDED,
+    LEASE_LOST,
     NOT_FOUND,
     OUTCOME_FIELDS,
     START_PAUSE_BEFORE,
@@ -28,8 +33,23 @@ class InvalidCheckpointRequest(ValueError):
     pass
 
 
+# Outcomes that are not a success: the thread is owned elsewhere, ownership was
+# lost, an action is IN_FLIGHT, or a legacy completion could not be verified.
+CONFLICT_STATUSES = frozenset({CONTENDED, LEASE_LOST, ACTION_IN_FLIGHT, COMPLETION_UNVERIFIED})
+
+
 def _response(status_code: int, body: dict) -> dict:
-    return {"statusCode": status_code, "body": json.dumps(body)}
+    return {"statusCode": status_code, "body": json.dumps(body, default=str)}
+
+
+def _status_code(outcome_status: str) -> int:
+    if outcome_status == NOT_FOUND:
+        return 404
+    if outcome_status in CONFLICT_STATUSES:
+        return 409
+    if outcome_status == ATTEMPT_FAILED:
+        return 500
+    return 200
 
 
 def _require_keys(event: dict, expected: set[str]) -> None:
@@ -100,8 +120,8 @@ def _handle_checkpoint_action(event: dict, request_id: str | None) -> dict:
         "executor_id": get_executor_id(),
         "request_id": request_id,
     }
-    logger.info(json.dumps({"stage": "checkpoint_action_complete", **body}))
-    return _response(404 if outcome["status"] == NOT_FOUND else 200, body)
+    logger.info(json.dumps({"stage": "checkpoint_action_complete", **body}, default=str))
+    return _response(_status_code(outcome["status"]), body)
 
 
 def lambda_handler(event, context):

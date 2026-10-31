@@ -1,19 +1,21 @@
 """Same-thread ownership across separate processes (persistent SQLite stand-ins).
 
-Each worker is a separate process (tests/race_harness.py --ownership) sharing
-one SQLite database. The worker acquires the thread's lease before running and
-writes through FencedSqliteCheckpointSaver, which applies the same lease
-conditions as DynamoCheckpointSaver(fenced=True). Acquisition happens in the
-harness because the workflow lifecycle does not acquire yet; action fencing,
-finalization and lifecycle integration are not covered here. Retry and
-read-back behavior is tested against DynamoDB (moto) in tests/test_thread_lease.py.
+Each worker is a separate process (tests/race_harness.py --ownership) running
+the integrated owned lifecycle (risk_workflow.start/resume_workflow) against one
+SQLite database. The stand-ins apply the same conditions as the DynamoDB
+implementations: lease, fenced checkpoint and pending writes, fenced action
+gate, once-only finalization and write-once traces. Retry and read-back are
+tested against DynamoDB (moto) in tests/test_thread_lease.py and
+tests/test_ownership_storage.py.
 """
 import pytest
 
 from tests.test_concurrent_resume import Race
 
 OWN = ["--ownership"]
-EXPIRES_AT_ONCE = ["--ownership", "--lease-ttl-ms", "1"]  # taken over as soon as another worker tries
+# A stalled owner: its lease expires at once and no heartbeat renews it, so the
+# next worker takes over.
+EXPIRES_AT_ONCE = ["--ownership", "--lease-ttl-ms", "1", "--no-heartbeat"]
 
 
 @pytest.fixture
@@ -67,7 +69,8 @@ def test_takeover_rejects_the_stale_owners_pending_and_checkpoint_writes(race):
 
     a, b = race.first("A", "acquired"), race.first("B", "acquired")
     assert (a["epoch"], b["epoch"]) == (1, 2)
-    assert race.first("A", "attempt_error")["error_type"] == "LeaseLost"
+    assert race.first("A", "attempt_exit")["status"] == "lease_lost"
+    assert race.first("A", "finalize_enter") is None and race.first("A", "released") is None
     # The pending writes were rejected by the lease check. LangGraph sends the next
     # checkpoint from another writer thread, so it is either rejected by the lease
     # check too or refused locally once the loss is recorded; never stored.
@@ -88,13 +91,14 @@ def test_takeover_rejects_a_stale_special_error_write_even_when_its_exception_is
     race.spawn("B", "resume", thread_id=thread_id, gates=[], extra=OWN)
     assert race.wait_exit("B") == 0
     race.release("A", "after-analyze")
-    assert race.wait_exit("A") == 1
+    assert race.wait_exit("A") == 6
 
-    error = race.first("A", "attempt_error")
-    # LangGraph re-raised the node's RuntimeError; the LeaseLost from the background
-    # writer was swallowed, but the fenced saver recorded the loss.
-    assert error["error_type"] == "RuntimeError"
-    assert error["ownership_lost"] == [[thread_id, race.first("A", "acquired")["owner"], 1]]
+    exit_event = race.first("A", "attempt_exit")
+    # LangGraph re-raised the node's RuntimeError and swallowed the background
+    # writer's LeaseLost; the fenced saver recorded the loss, so the lifecycle
+    # reports lease_lost (not the RuntimeError, and not a success).
+    assert (exit_event["status"], exit_event["error_type"]) == ("lease_lost", "RuntimeError")
+    assert exit_event["ownership_lost"] == [[thread_id, race.first("A", "acquired")["owner"], 1]]
     assert [r["kind"] for r in _fenced(race, race.first("A", "acquired")["owner"], "rejected")] == ["writes"]
     assert race.query("SELECT * FROM writes WHERE channel = '__error__'") == []
 

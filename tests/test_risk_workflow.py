@@ -32,6 +32,8 @@ from app.governance.authority import AuthorityStore  # noqa: E402
 from app.governance.policy import PolicyStore, materialize, parse_policy  # noqa: E402
 from app.storage import risk_trace_store  # noqa: E402
 from app.storage.checkpoint_store import DynamoCheckpointSaver  # noqa: E402
+from app.storage.finalization import FinalizationStore  # noqa: E402
+from app.storage.thread_lease import LeaseStore  # noqa: E402
 from app.storage.supplier_risk_state_store import DynamoRiskStateStore  # noqa: E402
 from app.workflows import risk_workflow  # noqa: E402
 from app.workflows import supplier_risk_agent as agent  # noqa: E402
@@ -175,11 +177,23 @@ def env(monkeypatch):
 
 
 def _new_executor():
-    """Fresh saver + risk store + action gate, as a new process would build them."""
+    """Owned dependencies, as checkpoint_dependencies_from_env builds them in a new process."""
+    return {
+        "checkpointer": DynamoCheckpointSaver(CHECKPOINTS, REGION, fenced=True),
+        "risk_store": DynamoRiskStateStore(SUPPLIER_STATE, REGION),
+        "action_gate": ActionLedger(ACTIONS, AuthorityStore(AUTHORITY, REGION), REGION, lease_table=CHECKPOINTS),
+        "ownership": risk_workflow.Ownership(LeaseStore(CHECKPOINTS, REGION),
+                                             FinalizationStore(CHECKPOINTS, SUPPLIER_STATE, REGION)),
+    }
+
+
+def _unfenced_executor():
+    """Pre-ownership dependencies: only for building legacy state, or the explicit unfenced baseline."""
     return {
         "checkpointer": DynamoCheckpointSaver(CHECKPOINTS, REGION),
         "risk_store": DynamoRiskStateStore(SUPPLIER_STATE, REGION),
         "action_gate": ActionLedger(ACTIONS, AuthorityStore(AUTHORITY, REGION), REGION),
+        "unfenced_baseline": True,
     }
 
 
@@ -188,7 +202,7 @@ def _calls(env) -> tuple[int, int, int]:
 
 
 def _trace(trace_id: str) -> dict:
-    return risk_trace_store.DynamoTraceStore(TRACES, REGION).get_by_identifier(trace_id)
+    return risk_trace_store.DynamoTraceStore(TRACES, REGION).get_by_trace_id(trace_id)
 
 
 def _nodes(trace: dict) -> list[str]:
@@ -398,7 +412,8 @@ def test_checkpointed_traces_carry_workflow_identity(env):
 def test_resume_accepts_no_workflow_input():
     """thread_id is the only input; the rest are keyword-only dependencies."""
     params = inspect.signature(risk_workflow.resume_workflow).parameters
-    assert list(params) == ["thread_id", "checkpointer", "risk_store", "action_gate"]
+    assert list(params) == ["thread_id", "checkpointer", "risk_store", "action_gate", "ownership",
+                            "unfenced_baseline"]
     assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for name, p in params.items() if name != "thread_id")
 
 
@@ -542,7 +557,7 @@ def _build_legacy_app(checkpointer, action_gate):
 
 def test_legacy_checkpoint_parked_at_act_still_resumes(env):
     _seed_state("High")  # would be suppressed if it were assessed now
-    deps = _new_executor()
+    deps = _unfenced_executor()
     thread_id = "thread-" + "c" * 32
     state = agent.initial_risk_state("alert-legacy", thread_id, "trace-legacy", HEADLINE)
     del state["assessment"]  # the old RiskState had no such channel

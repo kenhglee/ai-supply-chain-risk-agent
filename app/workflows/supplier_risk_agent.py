@@ -799,6 +799,11 @@ def make_act_node(action_gate):
             "action_eligible": None,
         }
         action_id = review_ticket_action_id(state["thread_id"])
+        configurable = config["configurable"]
+        # The attempt's ownership token: a fenced ledger requires it for admission,
+        # replay and denial.
+        lease = ({"thread_id": state["thread_id"], "owner": configurable["lease_owner"],
+                  "epoch": configurable["lease_epoch"]} if configurable.get("lease_owner") else None)
         result = action_gate.execute(
             action_id,
             scope=AGENT_SCOPE,
@@ -813,6 +818,7 @@ def make_act_node(action_gate):
                     "risk_type": alert.get("risk_type"),
                     "risk_level": alert.get("risk_level"),
                 },
+                **({"lease": lease} if lease else {}),
             },
             effect=lambda: open_review_ticket(alert, state["headline"], action_id),
         )

@@ -39,6 +39,7 @@ from tests.test_risk_workflow import (  # noqa: E402,F401  (env is a pytest fixt
     REGION,
     OK_ALERT,
     SUPPLIER_STATE,
+    _new_executor,
     _trace,
     env,
 )
@@ -202,8 +203,7 @@ def test_session_survives_bad_lines(env, monkeypatch):
     out = io.StringIO()
     lines = ["not json", json.dumps({"resume": "thread-123"}), json.dumps({"delete": "x"}), "",
              json.dumps({"resume": "thread-" + "d" * 32})]
-    deps = {"checkpointer": DynamoCheckpointSaver(CHECKPOINTS, REGION), "risk_store": None,
-            "action_gate": UnconfiguredActionGate()}
+    deps = _new_executor()
 
     assert risk_worker.run_session(lines, deps, out=out) == 0
 

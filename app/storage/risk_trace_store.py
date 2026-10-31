@@ -64,6 +64,9 @@ class JsonlTraceStore:
     def get_all(self) -> list[dict]:
         return sorted(self._load_all(), key=lambda r: r.get("created_at", ""), reverse=True)
 
+    def get_by_trace_id(self, trace_id: str) -> dict | None:
+        return next((r for r in self._load_all() if r.get("trace_id") == trace_id), None)
+
     def get_by_identifier(self, identifier: str) -> dict | None:
         matches = [
             r for r in self._load_all()
@@ -178,6 +181,11 @@ class DynamoTraceStore:
     def get_all(self) -> list[dict]:
         return sorted(self._scan_all(), key=lambda r: r.get("created_at", ""), reverse=True)
 
+    def get_by_trace_id(self, trace_id: str) -> dict | None:
+        """Exactly the record with this trace_id (no alert_id fallback)."""
+        item = self._table.get_item(Key={"trace_id": trace_id}, ConsistentRead=True).get("Item")
+        return self._from_dynamo_item(item) if item else None
+
     def get_by_identifier(self, identifier: str) -> dict | None:
         # Try PK lookup first (trace_id)
         response = self._table.get_item(Key={"trace_id": identifier})
@@ -240,6 +248,11 @@ def append_risk_trace_once(record: dict) -> str:
 
 def get_all_traces() -> list[dict]:
     return _get_trace_store().get_all()
+
+
+def get_risk_trace_by_trace_id(trace_id: str) -> dict | None:
+    """Exactly the record with this trace_id; used by recovery and legacy evidence."""
+    return _get_trace_store().get_by_trace_id(trace_id)
 
 
 def get_risk_trace_by_identifier(identifier: str) -> dict | None:
