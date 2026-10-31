@@ -679,6 +679,13 @@ def run_child(argv: list[str]) -> int:
             return result
 
         leases.acquire, leases.release, finals.commit, traces.append_once = acquire, release, commit, append_once
+        real_execute = deps["action_gate"].execute
+
+        def execute(action_id, **kwargs):
+            gate("before-claim")  # inside act, before admission (and its lease check)
+            return real_execute(action_id, **kwargs)
+
+        deps["action_gate"].execute = execute
         deps["ownership"] = Ownership(leases, finals, heartbeat_interval_s=0 if args.no_heartbeat else None)
 
         # Hold point after analyze's writes are stored, before the next checkpoint

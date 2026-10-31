@@ -1,12 +1,15 @@
-"""Same-thread concurrent resume (R1-R4) and same-risk cross-thread races (X1).
+"""Unfenced BASELINE: same-thread concurrent resume (R1-R4) and cross-thread races (X1).
 
 Each worker is a separate Python process (tests/race_harness.py) running the
-unmodified lifecycle against one persistent SQLite database. Gate files force
-a specific interleaving; every scenario first verifies from the event log and
-the database that the intended interleaving actually happened.
+lifecycle with unfenced_baseline=True (no ownership) against one persistent
+SQLite database. Gate files force a specific interleaving; every scenario first
+verifies from the event log and the database that the intended interleaving
+actually happened.
 
-The observed-behavior tests pass today: they assert the unsafe behavior.
-Future protection requirements are separate strict xfails.
+The observed-behavior tests assert the unsafe behavior of the unprotected
+lifecycle. The R1-R4 requirements are strict xfails here because the baseline
+is unprotected by design; the owned lifecycle meets them in
+tests/test_protected_races.py. X1 (cross-thread) is unresolved in both.
 
 See tests/race_harness.py for how the SQLite stores differ from DynamoDB.
 Set RACE_REPORT_DIR to also write one JSON summary per scenario.
@@ -52,10 +55,10 @@ class Race:
                 cmd += [f"--{key.replace('_', '-')}", str(value)]
         return cmd
 
-    def start_paused(self) -> str:
+    def start_paused(self, ownership: bool = False) -> str:
         """Setup: one thread, paused before analyze (triage and retrieval done)."""
-        proc = subprocess.run(self._cmd("S", "start", pause_before="analyze"), cwd=PROJECT_ROOT,
-                              capture_output=True, text=True, timeout=WAIT_S)
+        proc = subprocess.run(self._cmd("S", "start", pause_before="analyze") + (["--ownership"] if ownership else []),
+                              cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=WAIT_S)
         assert proc.returncode == 0, proc.stderr[-2000:]
         return json.loads(proc.stdout.strip().splitlines()[-1])["thread_id"]
 
@@ -83,6 +86,18 @@ class Race:
 
     def wait_exit(self, worker) -> int:
         return self.procs[worker].wait(timeout=WAIT_S)
+
+    def kill(self, worker) -> int:
+        self.procs[worker].send_signal(signal.SIGKILL)
+        return self.procs[worker].wait(timeout=WAIT_S)
+
+    def traces(self) -> list[dict]:
+        """Traces from the SQLite store (ownership runs) or the JSONL file (baseline runs)."""
+        rows = self.query("SELECT record FROM traces ORDER BY at")
+        if rows:
+            return [json.loads(r["record"]) for r in rows]
+        path = self.base / "risk_traces.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def cleanup(self):
         for proc in self.procs.values():
@@ -114,7 +129,7 @@ class Race:
         children: dict[str, list] = {}
         for c in checkpoints:
             children.setdefault(c["parent_id"], []).append(c)
-        traces = [json.loads(line) for line in (self.base / "risk_traces.jsonl").read_text().splitlines()]
+        traces = self.traces()
         exits = {w: self.first(w, "attempt_exit") or self.first(w, "attempt_error") for w in self.procs}
         return {
             "inference_count": {w: self.names(w).count("model_invoke") for w in self.procs},
@@ -241,14 +256,15 @@ def test_r1_observed_double_inference_forked_history_and_divergent_outcome(r1):
     assert s["latest_checkpoint_writer"][r1["thread_ids"][0]] == s["process_outcomes"]["B"]["trace_id"]
 
 
-@pytest.mark.xfail(strict=True, reason="Requirement: a thread resumed concurrently runs inference at most once; "
-                                        "the second worker reports contention and executes nothing")
+@pytest.mark.xfail(strict=True, reason="Baseline is unprotected by design; met by the owned lifecycle in "
+                                        "test_protected_races.py::test_r1_protected_single_execution_without_fork")
 def test_r1_requirement_single_execution(r1):
     s = r1["summary"]
     assert sum(s["inference_count"].values()) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="Requirement: concurrent resume never forks a thread's checkpoint history")
+@pytest.mark.xfail(strict=True, reason="Baseline is unprotected by design; met by the owned lifecycle in "
+                                        "test_protected_races.py::test_r1_protected_single_execution_without_fork")
 def test_r1_requirement_no_checkpoint_fork(r1):
     assert r1["summary"]["forks"] == {}
 
@@ -302,8 +318,8 @@ def test_r2_observed_unhandled_action_in_flight_and_single_effect(r2):
     assert s["process_outcomes"]["A"]["action_status"] == "COMPLETED"
 
 
-@pytest.mark.xfail(strict=True, reason="Requirement: action contention is reported as a lifecycle outcome "
-                                        "(no unhandled ActionInFlight); the contending worker exits cleanly")
+@pytest.mark.xfail(strict=True, reason="Baseline is unprotected by design; met by the owned lifecycle in test_protected_races.py "
+                                        "(R2: contended / action_in_flight outcomes)")
 def test_r2_requirement_contention_is_an_outcome(r2):
     assert r2["summary"]["process_outcomes"]["B"]["event"] == "attempt_exit"
 
@@ -366,8 +382,8 @@ def test_r3_observed_replay_with_divergent_business_state(r3):
     assert _state_row(race)["current_risk_level"] == "Medium"
 
 
-@pytest.mark.xfail(strict=True, reason="Requirement: a thread's action and its business-state finalization come "
-                                        "from the same analysis (one owner)")
+@pytest.mark.xfail(strict=True, reason="Baseline is unprotected by design; met by the owned lifecycle in test_protected_races.py "
+                                        "(R3 variants)")
 def test_r3_requirement_action_and_business_state_agree(r3):
     [action] = r3["summary"]["actions"]
     assert json.loads(action["subject"])["risk_level"] == _state_row(r3["race"])["current_risk_level"]
@@ -400,7 +416,8 @@ def test_r4_observed_two_finalizations_for_one_thread(r4):
     assert s["forks"]
 
 
-@pytest.mark.xfail(strict=True, reason="Requirement: a thread's business state is finalized exactly once")
+@pytest.mark.xfail(strict=True, reason="Baseline is unprotected by design; met by the owned lifecycle in "
+                                        "test_protected_races.py::test_r4_protected_single_finalization_with_recovery_by_the_new_owner")
 def test_r4_requirement_single_finalization(r4):
     s = r4["summary"]
     assert len([e for e in s["trace_events"] if e[1] == "resumed_completed"]) == 1
