@@ -6,13 +6,26 @@ Process A runs the real worker START with --pause-before validate. infer,
 decide (triage model), retrieve (embeddings) and analyze (risk model) run,
 their result is checkpointed in DynamoDB, and A exits. Process B is a new
 interpreter: it installs tripwires on every retrieval, embedding and model
-entry point, then runs the real worker RESUME on the same thread_id. B must
-reach END through validate -> act (governed mock review ticket) and the
-supplier-state write without touching a tripwire.
+entry point, then runs the real worker RESUME on the same thread_id.
+
+Two groups of acceptance checks, both required:
+
+  resume  B reaches END (validate -> assess [-> act]) and writes supplier
+          state without touching a tripwire: durable completion without
+          repeated retrieval or inference.
+  action  B's assessment matches the supplier state B resumed against, and
+          the action happened if and only if that change is action-eligible
+          (new_alert, escalated). A suppressed or downgraded run passes only
+          if it created no ledger item.
+
+--expect-action required|skipped additionally fails the run unless the
+assessed change is (or is not) action-eligible, e.g. to insist on covering
+action execution; auto (default) accepts either.
 
 USAGE
     AUTHORITY_TABLE=risk_agent_authority ACTIONS_TABLE=risk_agent_actions \\
-        python scripts/durable_resume_proof.py run [--headline "..."] [--out evidence.json]
+        python scripts/durable_resume_proof.py run [--headline "..."]
+            [--expect-action auto|required|skipped] [--out evidence.json]
 
     python scripts/durable_resume_proof.py guarded-resume --thread-id thread-<32 hex>
         Process B on its own: tripwires + worker RESUME. Prints the worker
@@ -50,7 +63,8 @@ DEFAULT_HEADLINE = "TSMC halts production after earthquake in Taiwan"
 DEFAULT_ENV_FILE = PROJECT_ROOT / "docker" / "worker.env"
 REQUIRED_ENV = ("CHECKPOINT_TABLE", "AUTHORITY_TABLE", "ACTIONS_TABLE", "RISK_STATE_TABLE", "RISK_TRACES_TABLE")
 ANALYSIS_NODES = ["infer", "decide", "retrieve", "analyze"]
-RESUME_NODES = ["validate", "act"]
+RESUME_NODES = ["validate", "assess"]  # then "act" only when action-eligible
+EXPECT_ACTION_CHOICES = ("auto", "required", "skipped")
 
 # Model inference and managed retrieval. Any call to these from process B fails it.
 BLOCKED_AWS_SERVICES = frozenset({"bedrock-runtime", "bedrock-agent-runtime"})
@@ -254,7 +268,7 @@ def redact_evidence_text(text: str, hostname: str | None = None) -> str:
     return re.sub(r"(arn:aws:sts::\d+:assumed-role/[^/\"]+/)[^\"]+", r"\1<session>", text)
 
 
-def run(headline: str, env_file: Path, out: Path | None) -> int:
+def run(headline: str, env_file: Path, out: Path | None, expect_action: str = "auto") -> int:
     problems = _configure_env(env_file)
     if problems:
         print(json.dumps({"preflight": "failed", "problems": problems}, indent=2))
@@ -305,7 +319,20 @@ def run(headline: str, env_file: Path, out: Path | None) -> int:
         "trace_b": traces.get_by_identifier(b_out["trace_id"]) if b_out.get("trace_id") else None,
     }
 
-    checks = _acceptance_checks(headline, a, b, between, after, state_before_a, action_id)
+    alert = between["checkpoint"].get("alert") or {}
+    checks = {
+        "resume": _resume_checks(headline, a, b, between, after, state_before_a),
+        "action": action_checks(
+            expect_action,
+            alert=alert,
+            headline=headline,
+            prior_row=between["state_rows"].get(f"{alert.get('supplier')}#{alert.get('risk_type')}"),
+            b_outcome=b_out,
+            b_steps=(after["trace_b"] or {}).get("trace_steps") or [],
+            action_item=after["action_item"],
+            action_id=action_id,
+        ),
+    }
     evidence = _jsonable({
         "headline": headline,
         "caller_arn": identity["Arn"],
@@ -328,8 +355,11 @@ def run(headline: str, env_file: Path, out: Path | None) -> int:
             "trace_b_workflow_event": (after["trace_b"] or {}).get("workflow_event"),
             "trace_b_steps": (after["trace_b"] or {}).get("trace_steps"),
         },
+        "expect_action": expect_action,
+        "assessment": {k: b_out.get(k) for k in (
+            "eligibility_change_type", "action_eligible", "eligibility_basis", "change_type")},
         "checks": checks,
-        "passed": all(c["ok"] for c in checks.values()),
+        "passed": all(c["ok"] for group in checks.values() for c in group.values()),
     })
     text = redact_evidence_text(json.dumps(evidence, indent=2))
     print(text)
@@ -342,7 +372,63 @@ def _check(ok: bool, detail) -> dict:
     return {"ok": bool(ok), "detail": detail}
 
 
-def _acceptance_checks(headline, a, b, between, after, state_before_a, action_id) -> dict:
+def action_checks(expect: str, *, alert: dict, headline: str, prior_row: dict | None, b_outcome: dict,
+                  b_steps: list[dict], action_item: dict | None, action_id: str) -> dict:
+    """Did B act exactly when the assessed business change requires an action?
+
+    The expected change is recomputed from the supplier-state row B resumed
+    against (read between the processes), with the workflow's own classifier.
+    """
+    from app.workflows.supplier_risk_agent import ACTION_ELIGIBLE_CHANGE_TYPES, classify_risk_change
+
+    expected_change, _, _ = classify_risk_change(alert, headline, prior_row)
+    eligible = expected_change in ACTION_ELIGIBLE_CHANGE_TYPES
+    action = action_item or {}
+    nodes = [s["node_name"] for s in b_steps]
+    assess_step = next((s for s in b_steps if s["node_name"] == "assess"), {})
+
+    if eligible:
+        action_ok = (
+            action.get("status") == "COMPLETED"
+            and action.get("claimed_by_trace_id") == b_outcome.get("trace_id")
+            and (action.get("effect") or {}).get("correlation_id") == action_id
+            and b_outcome.get("action_status") == "COMPLETED"
+            and nodes[-2:] == ["assess", "act"]
+        )
+    else:
+        action_ok = (
+            action_item is None
+            and b_outcome.get("action_id") is None
+            and "act" not in nodes
+            and assess_step.get("decision") == "no_action"
+        )
+
+    return {
+        "eligibility_assessed_by_b": _check(
+            b_outcome.get("eligibility_basis") == "assessed"
+            and b_outcome.get("eligibility_change_type") == expected_change
+            and b_outcome.get("action_eligible") is eligible,
+            {"expected_change": expected_change, "expected_eligible": eligible,
+             "assessed_change": b_outcome.get("eligibility_change_type"),
+             "assessed_eligible": b_outcome.get("action_eligible"),
+             "basis": b_outcome.get("eligibility_basis"),
+             "prior_risk_level": (prior_row or {}).get("current_risk_level")}),
+        "action_matches_eligibility": _check(
+            action_ok,
+            {"expected": "action completed by B" if eligible else "no action",
+             "ledger_status": action.get("status"),
+             "claimed_by_trace_id": action.get("claimed_by_trace_id"),
+             "authority_version": action.get("authority_version"),
+             "policy_version": action.get("policy_version"),
+             "ticket_id": (action.get("effect") or {}).get("ticket_id"),
+             "b_nodes_after_validate": nodes[nodes.index("validate") + 1:] if "validate" in nodes else None}),
+        "expected_action_mode": _check(
+            expect == "auto" or (expect == "required") == eligible,
+            {"expect": expect, "eligible": eligible}),
+    }
+
+
+def _resume_checks(headline, a, b, between, after, state_before_a) -> dict:
     from app.storage.risk_trace_store import trace_display_status
 
     a_out, b_out = a["outcome"] or {}, b["outcome"] or {}
@@ -351,8 +437,9 @@ def _acceptance_checks(headline, a, b, between, after, state_before_a, action_id
     alert = chk_between.get("alert") or {}
     key = f"{alert.get('supplier')}#{alert.get('risk_type')}"
     row_after = after["state_rows"].get(key) or {}
-    action = after["action_item"] or {}
     b_steps = (after["trace_b"] or {}).get("trace_steps") or []
+    b_nodes = [s["node_name"] for s in b_steps]
+    resumed_nodes = b_nodes[len(ANALYSIS_NODES):]
     a_steps_by_node = {s["node_name"]: s for s in chk_between.get("trace_steps") or []}
     non_dynamodb_calls = {c for c in tripwires.get("aws_calls") or [] if not c.startswith("dynamodb:")}
 
@@ -393,17 +480,18 @@ def _acceptance_checks(headline, a, b, between, after, state_before_a, action_id
              "non_dynamodb_calls": sorted(non_dynamodb_calls),
              "aws_call_count": len(tripwires.get("aws_calls") or [])}),
         "b_reused_checkpointed_steps": _check(
-            [s["node_name"] for s in b_steps] == ANALYSIS_NODES + RESUME_NODES
+            b_nodes[:len(ANALYSIS_NODES)] == ANALYSIS_NODES
+            and resumed_nodes in (RESUME_NODES, RESUME_NODES + ["act"])
             and all(s == a_steps_by_node.get(s["node_name"]) for s in b_steps[:len(ANALYSIS_NODES)])
             and all(_parse_ts(s["started_at"]) < b["started_ts"] for s in b_steps[:len(ANALYSIS_NODES)])
             and all(_parse_ts(s["started_at"]) >= b["started_ts"] for s in b_steps[len(ANALYSIS_NODES):]),
-            {"b_trace_nodes": [s["node_name"] for s in b_steps],
+            {"b_trace_nodes": b_nodes,
              "analyze_started_at": a_steps_by_node.get("analyze", {}).get("started_at"),
              "validate_started_at": next((s["started_at"] for s in b_steps if s["node_name"] == "validate"), None),
              "b_process_started_at": b["started_at"]}),
         "workflow_completed": _check(
             b["returncode"] == 0 and b_out.get("status") == "completed" and b_out.get("next") == []
-            and chk_after.get("nodes") == ANALYSIS_NODES + RESUME_NODES,
+            and chk_after.get("nodes") == b_nodes,
             {"status": b_out.get("status"), "exit": b["returncode"], "next": b_out.get("next"),
              "final_status": b_out.get("final_status")}),
         "business_result_persisted": _check(
@@ -412,14 +500,6 @@ def _acceptance_checks(headline, a, b, between, after, state_before_a, action_id
             and row_after.get("current_risk_level") == alert.get("risk_level")
             and _parse_ts(row_after.get("last_seen_at", "1970-01-01T00:00:00+00:00")) >= int(b["started_ts"]),
             {"change_type": b_out.get("change_type"), "row": row_after}),
-        "governed_action_completed_by_b": _check(
-            action.get("status") == "COMPLETED"
-            and action.get("claimed_by_trace_id") == b_out.get("trace_id")
-            and (action.get("effect") or {}).get("correlation_id") == action_id,
-            {"status": action.get("status"), "claimed_by_trace_id": action.get("claimed_by_trace_id"),
-             "authority_version": action.get("authority_version"),
-             "policy_version": action.get("policy_version"),
-             "ticket_id": (action.get("effect") or {}).get("ticket_id")}),
         "paused_trace_not_displayed_as_completed": _check(
             (between["trace_a"] or {}).get("final_status") == "ok"
             and trace_display_status(between["trace_a"] or {}) == "paused (workflow not completed)",
@@ -439,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     run_cmd = commands.add_parser("run", help="orchestrate process A (start) and process B (guarded resume)")
     run_cmd.add_argument("--headline", default=DEFAULT_HEADLINE)
     run_cmd.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
+    run_cmd.add_argument("--expect-action", choices=EXPECT_ACTION_CHOICES, default="auto")
     run_cmd.add_argument("--out", type=Path)
     resume_cmd = commands.add_parser("guarded-resume", help="process B: tripwires + worker resume")
     resume_cmd.add_argument("--thread-id", required=True)
@@ -446,7 +527,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "guarded-resume":
         return guarded_resume(args.thread_id)
-    return run(args.headline, args.env_file, args.out)
+    return run(args.headline, args.env_file, args.out, args.expect_action)
 
 
 if __name__ == "__main__":

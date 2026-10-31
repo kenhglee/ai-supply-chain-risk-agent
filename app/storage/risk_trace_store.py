@@ -61,12 +61,15 @@ class JsonlTraceStore:
 
 # Optional top-level scalars, stored natively when present. thread_id,
 # workflow_event and executor_id link checkpointed workflow attempts; the
-# action/authority fields record governed-action outcomes (Phase 3D).
+# action/authority fields record governed-action outcomes (Phase 3D); the
+# eligibility fields record the pre-action business assessment, kept separate
+# from the write-time change_type.
 _OPTIONAL_SCALAR_FIELDS = (
     "tool_decision", "final_status", "supplier", "risk_type", "risk_level",
     "thread_id", "workflow_event", "executor_id",
     "action_id", "action_status", "authority_status", "authority_version",
     "denied_layer", "policy_version", "policy_sha256",
+    "eligibility_change_type", "action_eligible", "eligibility_basis",
 )
 
 

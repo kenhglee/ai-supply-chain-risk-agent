@@ -423,7 +423,7 @@ RESUME takes no workflow input, so a completed thread can't be restarted by pass
 - **Empty `next`, completed.** `finalize_completed_run` (shared with `process_alert_row`) updates supplier state and writes a trace with `workflow_event="started_completed"` or `"resumed_completed"`, including the action fields when `act` ran.
 - **`act` refused by authority.** The invoke raises `AuthorityDenied`. No business write happens, the thread stays at `next=["act"]`, and a trace is written with `workflow_event="authority_denied"`.
 
-Outcomes also carry `action_id`, `action_status` and `authority_version` (all `null` when no governed action was reached).
+Outcomes also carry `action_id`, `action_status` and `authority_version` (all `null` when no governed action was reached), and `eligibility_change_type`, `action_eligible` and `eligibility_basis` from the pre-action assessment (see [Action eligibility](#action-eligibility-assess-before-act)).
 
 **Checkpoint table** (`DynamoCheckpointSaver`): PK `thread_id`, SK `sk`.
 - Checkpoint items are `chk#{ns}#{checkpoint_id}` and hold the whole serialized checkpoint.
@@ -435,9 +435,10 @@ Outcomes also carry `action_id`, `action_status` and `authority_version` (all `n
 **Guarantees and limits**
 - **Durable continuation with at-least-once node execution.** A node interrupted mid-run (for example an LLM call) runs again on resume.
 - **Not exactly-once between graph completion and business state.** If the process dies after the graph reaches END but before supplier state is written, the checkpoint already shows completion. RESUME then returns `already_completed` and that state write is lost.
-- **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent. (The action ledger does stop the governed action itself from being claimed twice; see Phase 3D.)
+- **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent. (The action ledger does stop the governed action itself from being claimed twice; see Phase 3D.) This is separate from cross-thread business deduplication; see [Action eligibility](#action-eligibility-assess-before-act).
+- **RESUME does not rewrite workflow state.** The attempt's `trace_id` travels in config (`configurable.trace_id`) and is recorded in each checkpoint's metadata. State `trace_id` stays the starting attempt's. Earlier versions stamped it with `update_state`, which re-ran the last node's routing under the current graph.
 - **`executor_id` is audit only** (`AWS_LAMBDA_LOG_STREAM_NAME`, or `host:pid` locally). A warm Lambda environment can run several attempts.
-- **Not handled yet:** checkpoint TTL/cleanup, batching checkpoint writes (one run is roughly 80 `PutItem` calls), a concurrency lease, and the audit gap when a resume fails after the new `trace_id` is stamped.
+- **Not handled yet:** checkpoint TTL/cleanup, batching checkpoint writes (one run is roughly 80 `PutItem` calls), and a concurrency lease.
 
 ### Lambda durability experiment (Phase 3A3)
 
@@ -641,16 +642,17 @@ Each concern has its own durable store. None of them is derived from another, an
 
 #### Governed-action boundary
 
-The checkpointed graph adds one node, `act`, between `validate` and END:
+The checkpointed graph adds `assess` and `act` between `validate` and END. `assess` was added after Phase 3F; see [Action eligibility](#action-eligibility-assess-before-act):
 
 ```
-… → analyze → validate ──ok + valid──► act → END
+… → analyze → validate ──ok + valid──► assess ──new_alert / escalated──► act → END
+                       │                      └──suppressed / downgraded──► END
                        ├──inconclusive──► END
                        └──invalid──► fallback → END
 ```
 
 - **Only `build_app(checkpointer, action_gate=...)` has `act`.** The module-level Phase 2 graph is unchanged and performs no privileged action.
-- **`act` opens a review ticket** for a valid supplier-specific alert. It uses the mock ServiceNow `create_servicenow_ticket`, so there is no external system of record.
+- **`act` opens a review ticket** for a valid supplier-specific alert whose assessed business change is action-eligible. It uses the mock ServiceNow `create_servicenow_ticket`, so there is no external system of record.
 - **The action ID is deterministic:** `action#{thread_id}#open_review_ticket`. A re-run of `act`, after a denial or a crash, maps to the same ledger item. The ticket's `correlation_id` equals the action ID.
 - **A denial produces no checkpoint for `act`.** `act` raises `AuthorityDenied`, so LangGraph saves no output from it, and the latest checkpoint keeps `next=("act",)`. Earlier nodes are not re-run. A later RESUME, by any executor and given only the `thread_id`, runs just `act`.
 - **Supplier state is written only after `act` succeeds and the graph reaches END.** A denied workflow therefore leaves business state untouched.
@@ -1110,6 +1112,38 @@ The same tripwires are covered under moto by `tests/test_risk_workflow.py`: paus
 - **Least-privilege identity.** `RiskAgentGovernedWorkerRole` cannot reach the checkpoint, state or trace tables, and its ledger access is limited to `action#probe-*`. The IAM-boundary capabilities (`claude_inference`, `titan_embeddings`) therefore did not govern this executor; only the application-level `act` gate did.
 - **CSV business state, concurrent RESUME, `IN_FLIGHT` reconciliation:** out of scope.
 
+### Action eligibility (assess before act)
+
+**Problem.** Until this change, `act` ran for every valid `ok` alert. The business comparison (`compare_and_update_risk_state`) ran only after END, in `finalize_completed_run`. So a duplicate alert opened a ticket and was then labelled `suppressed`. DR1, 3D3 and C2 all recorded `suppressed` together with a completed action.
+
+**Design: decide eligibility before the action, persist business state after END.**
+- `classify_risk_change(alert, headline, prior)` is the pure comparison. `compare_and_update_risk_state` is now `get → classify → put`, with unchanged behavior; the Phase 2 path uses it as before.
+- **`assess`** (governed graph only) reads the prior `(supplier, risk_type)` row and classifies the alert. It writes no state. It records `assessment = {basis, eligibility_change_type, action_eligible, prior_risk_level, prior_last_seen_at}`; the trace step's decision is `act` or `no_action`.
+- **Eligible changes:** `new_alert` and `escalated`. `suppressed` and `downgraded` end without an action, but supplier state is still updated after END (`last_headline`, `last_seen_at`, level).
+- **Strongly consistent reads.** `DynamoRiskStateStore.get` uses `ConsistentRead=True`, for both the assessment and the write-time comparison.
+- **The assessment is checkpointed.** A RESUME after an `act` denial re-runs only `act` and uses the saved assessment. It does not re-assess against state that may have changed since.
+- **Two change types, kept separate.** `eligibility_change_type` is what `assess` decided before the action. `change_type` is what `finalize_completed_run` computed when it wrote state after END. Both appear in outcomes and traces. They can differ, for example `new_alert` at assessment and `suppressed` at write time when another workflow wrote the same row while this one was parked.
+- **Legacy checkpoints.** A thread parked at `act` by the pre-assess graph has no assessment. It keeps its original behavior: the action proceeds with no eligibility gate. Outcomes and traces mark it `eligibility_basis = legacy_unassessed`, with `eligibility_change_type` and `action_eligible` null. This relies on RESUME not rewriting state; see the Phase 3A guarantees above. When resume still stamped `trace_id` with `update_state`, LangGraph re-ran `validate`'s routing under the new graph and sent such threads to `assess` instead.
+
+**Why the state write is not moved before `act`.** Writing supplier state at assessment time would open failure windows in which a needed action is skipped for good:
+- A crash after the write but before `assess`'s checkpoint makes the re-run `assess` read its own write and classify `suppressed`.
+- A denied, then abandoned, thread leaves the row at the new level, so every later alert for that supplier and risk is `suppressed`.
+- It would also break the Phase 3D rule that a denied workflow leaves business state untouched.
+
+The remaining window fails toward a duplicate ticket instead: if the process dies after `act` but before the END write, the row is not updated and a later thread can assess `new_alert` again.
+
+**What repeating `assess` does and does not guarantee.** Re-running `assess`, for example after a crash before its checkpoint, has no write side effects. Its answer is not fixed, though: if another workflow updates the same supplier-state row in between, the repeated assessment can classify differently. A checkpointed assessment is reused, not recomputed.
+
+**Unresolved, and separate from each other:**
+- **Cross-thread business deduplication.** The ledger deduplicates per `thread_id` (`action#{thread_id}#open_review_ticket`), not per `(supplier, risk_type, level)`. Two different threads for the same business change, running at the same time, can both assess `new_alert` before either writes state, and both open a ticket.
+- **Same-thread concurrent RESUME.** Two executors resuming one thread can both run nodes and both apply the supplier-state write (see the Phase 3A guarantees). The ledger stops the action itself being claimed twice for that thread.
+
+**DR1 harness.** `scripts/durable_resume_proof.py` now reports two check groups:
+- `resume`: durable completion without repeated retrieval or inference.
+- `action`: the assessment matches the supplier state B resumed against, and the action happened if and only if that change is eligible.
+
+A suppressed run passes only if it created no ledger item. `--expect-action required|skipped` pins the expected case. The DR1 evidence files above predate this change and use the earlier flat check list.
+
 ### Phase 3 status
 
 Thesis: the workflow is stateful, the execution environment is disposable, and authority is independently governable.
@@ -1145,6 +1179,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] F2d: Phase 3F documentation
 - [ ] Separation of duties and IAM-level enforcement of authority (operator vs agent principals)
 - [x] DR1: two-process resume after checkpointed analysis; no retrieval, embedding or model call on resume (`DR1-20261030T232053Z`)
+- [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); not yet run against AWS
 
 ## Data Models and Storage
 
@@ -1154,7 +1189,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
 class RiskState(TypedDict):
     alert_id: str
     thread_id: Optional[str]  # durable logical workflow; None on the Phase 2 path
-    trace_id: str             # one execution attempt
+    trace_id: str             # the starting attempt; later attempts pass theirs in config
     headline: str
     candidate_suppliers: List[str]
     context: str
@@ -1163,6 +1198,7 @@ class RiskState(TypedDict):
     is_valid: Optional[bool]
     trace_steps: List[dict]
     retriever_metadata: Optional[dict]  # set by retrieve; None when skipped
+    assessment: Optional[dict]          # set by assess before act (governed graph); None on legacy threads
     action_result: Optional[dict]       # set by act (governed checkpointed graph only)
 ```
 
@@ -1201,6 +1237,9 @@ One JSON object per line, appended by `append_risk_trace`:
   "risk_type": "earthquake" | null,
   "risk_level": "High" | null,
   "change_type": "new_alert" | "escalated" | "suppressed" | "downgraded" | "inconclusive" | "ignored",
+  "eligibility_change_type": "new_alert" | "escalated" | "suppressed" | "downgraded" | null,
+  "action_eligible": true | false | null,
+  "eligibility_basis": "assessed" | "legacy_unassessed" | null,
   "trace_steps": [
     {
       "node_name": "infer",

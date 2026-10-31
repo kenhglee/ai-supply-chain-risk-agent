@@ -5,14 +5,27 @@ execution attempt with its own trace_id. RESUME never accepts workflow input,
 so a completed thread can't be re-run by accident (invoke(new_input, thread)
 would restart it from the beginning).
 
+RESUME continues from the saved pending node and writes nothing into the
+workflow state first: the attempt's trace_id travels in config
+(configurable.trace_id), which also records it in each checkpoint's metadata.
+Rewriting state on RESUME would re-run the last node's routing under the
+current graph and could send a parked thread somewhere else.
+
 Guarantees: durable continuation with at-least-once node execution. A node
 interrupted mid-run is re-executed on resume. Completing the graph and
 writing supplier state are not atomic: if the process dies after the graph
 reaches END but before finalize_completed_run writes state, RESUME reports
 already_completed and that state write is lost.
 
-Privileged actions (Phase 3D): the checkpointed graph routes valid alerts
-through the governed act node. If external authority refuses admission,
+Action eligibility: the checkpointed graph routes valid "ok" alerts through
+assess, which reads supplier state (read-only) and classifies the business
+change. Only new_alert and escalated reach act; suppressed and downgraded end
+without an action. The assessment (eligibility_change_type) is checkpointed
+and reported separately from the write-time change_type, which
+finalize_completed_run computes when it writes supplier state after END.
+
+Privileged actions (Phase 3D): eligible alerts go through the governed act
+node. If external authority refuses admission,
 act raises AuthorityDenied, the thread stays at next=["act"] and the
 attempt is reported as authority_denied; a later RESUME (after authority is
 restored) re-runs only act. Missing governance configuration denies.
@@ -27,6 +40,7 @@ from app.governance.authority import AuthorityDenied
 from app.storage.checkpoint_store import DynamoCheckpointSaver
 from app.storage.supplier_risk_state_store import get_risk_store
 from app.workflows.supplier_risk_agent import (
+    LEGACY_UNASSESSED,
     STATE_WRITE_CHANGE_TYPES,
     build_app,
     build_trace_record,
@@ -53,6 +67,7 @@ OUTCOME_FIELDS = (
     "status", "thread_id", "trace_id", "next", "change_type",
     "state_written", "final_status", "supplier",
     "action_id", "action_status", "authority_version",
+    "eligibility_change_type", "action_eligible", "eligibility_basis",
 )
 
 
@@ -79,8 +94,11 @@ def _gate(action_gate):
     return action_gate if action_gate is not None else UnconfiguredActionGate()
 
 
-def _config(thread_id: str) -> dict:
-    return {"configurable": {"thread_id": thread_id}}
+def _config(thread_id: str, trace_id: str | None = None) -> dict:
+    configurable = {"thread_id": thread_id}
+    if trace_id:
+        configurable["trace_id"] = trace_id  # this attempt; copied into checkpoint metadata
+    return {"configurable": configurable}
 
 
 def _action_fields(values: dict | None) -> dict:
@@ -89,6 +107,23 @@ def _action_fields(values: dict | None) -> dict:
         "action_id": result.get("action_id"),
         "action_status": result.get("status"),
         "authority_version": result.get("authority_version"),
+    }
+
+
+def _eligibility_fields(values: dict | None, next_nodes=()) -> dict:
+    """The pre-action assessment, separate from the write-time change_type.
+
+    A thread parked at act with no assessment predates the assess node and
+    keeps legacy behavior; say so explicitly.
+    """
+    assessment = (values or {}).get("assessment")
+    if assessment is None and "act" in next_nodes:
+        assessment = {"basis": LEGACY_UNASSESSED}
+    assessment = assessment or {}
+    return {
+        "eligibility_change_type": assessment.get("eligibility_change_type"),
+        "action_eligible": assessment.get("action_eligible"),
+        "eligibility_basis": assessment.get("basis"),
     }
 
 
@@ -113,6 +148,7 @@ def _outcome(status: str, *, thread_id, trace_id, next_nodes=(), values=None,
         "risk_type": alert.get("risk_type"),
         "risk_level": alert.get("risk_level"),
         **(action or _action_fields(values)),
+        **_eligibility_fields(values, next_nodes),
     }
 
 
@@ -133,7 +169,8 @@ def _settle(app, thread_id: str, trace_id: str, risk_store, *,
             t_run_start=t_run_start,
             run_duration_ms=run_duration_ms,
             change_type=None,
-            trace_extras={**trace_extras, "workflow_event": PAUSED},
+            trace_extras={**trace_extras, **_eligibility_fields(snapshot.values, snapshot.next),
+                          "workflow_event": PAUSED},
         ))
         return _outcome(PAUSED, thread_id=thread_id, trace_id=trace_id,
                         next_nodes=snapshot.next, values=snapshot.values)
@@ -149,7 +186,7 @@ def _settle(app, thread_id: str, trace_id: str, risk_store, *,
         t_run_start=t_run_start,
         run_duration_ms=run_duration_ms,
         trace_extras={**trace_extras, **_action_fields(values), **_policy_fields(values),
-                      "workflow_event": completed_event},
+                      **_eligibility_fields(values), "workflow_event": completed_event},
     )
     return _outcome(COMPLETED, thread_id=thread_id, trace_id=trace_id,
                     values=values, change_type=enriched["change_type"])
@@ -181,6 +218,7 @@ def _denied(app, thread_id: str, trace_id: str, denial: AuthorityDenied, *, t_ru
             "policy_version": denial.policy_version,
             "policy_sha256": denial.policy_sha256,
             **action,
+            **_eligibility_fields(snapshot.values, snapshot.next),
         },
     ))
     return _outcome(AUTHORITY_DENIED, thread_id=thread_id, trace_id=trace_id,
@@ -209,12 +247,12 @@ def start_workflow(row: dict, *, checkpointer, risk_store, action_gate=None,
     if checkpointer.get_tuple(cfg) is not None:
         raise RuntimeError(f"thread_id collision: {thread_id} already has checkpoints")
 
-    app = build_app(checkpointer, action_gate=_gate(action_gate))
+    app = build_app(checkpointer, action_gate=_gate(action_gate), risk_reader=risk_store)
     t_run_start = time.time()
     try:
         app.invoke(
             initial_risk_state(alert_id, thread_id, trace_id, headline),
-            cfg,
+            _config(thread_id, trace_id),
             interrupt_before=pause_before,
             durability="sync",
         )
@@ -230,18 +268,18 @@ def resume_workflow(thread_id: str, *, checkpointer, risk_store, action_gate=Non
     if checkpointer.get_tuple(cfg) is None:
         return _outcome(NOT_FOUND, thread_id=thread_id, trace_id=None)
 
-    app = build_app(checkpointer, action_gate=_gate(action_gate))
+    app = build_app(checkpointer, action_gate=_gate(action_gate), risk_reader=risk_store)
     snapshot = app.get_state(cfg)
     if not snapshot.next:
+        # The attempt that completed it: checkpoint metadata, else (older threads) state.
+        last_trace_id = (snapshot.metadata or {}).get("trace_id") or snapshot.values.get("trace_id")
         return _outcome(ALREADY_COMPLETED, thread_id=thread_id,
-                        trace_id=snapshot.values.get("trace_id"), values=snapshot.values)
+                        trace_id=last_trace_id, values=snapshot.values)
 
     trace_id = uuid.uuid4().hex
-    app.update_state(cfg, {"trace_id": trace_id})
-
     t_run_start = time.time()
     try:
-        app.invoke(None, cfg, durability="sync")
+        app.invoke(None, _config(thread_id, trace_id), durability="sync")
     except AuthorityDenied as denial:
         return _denied(app, thread_id, trace_id, denial, t_run_start=t_run_start)
     return _settle(app, thread_id, trace_id, risk_store,

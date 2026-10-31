@@ -66,6 +66,7 @@ A LangGraph state machine that processes news headlines into structured supplier
 
 ```
 infer → decide → [retrieve] → analyze → validate → [fallback] → END
+(checkpointed lifecycle: … → validate → assess → [act] → END)
 ```
 
 - **infer**: maps headlines to candidate suppliers via `app/storage/supplier_graph.json` (graph traversal) and alias matching
@@ -73,7 +74,8 @@ infer → decide → [retrieve] → analyze → validate → [fallback] → END
 - **retrieve**: FAISS similarity search over `app/storage/supplier_profiles.json`
 - **analyze**: LLM call — returns structured JSON alert with supplier, risk_type, risk_level, impact
 - **validate**: checks required fields; routes to fallback on failure
-- **act** (checkpointed lifecycle only, `build_app(checkpointer, action_gate=...)`): governed privileged action (mock review ticket) for a valid `ok` alert, admitted only if the durable emergency authority item `agent#supplier-risk-agent` is `ACTIVE` **and** the materialized policy item `policy#supplier-risk-agent#open_review_ticket` allows it (Phase 3F). Both checks and the action-ledger claim are one DynamoDB transaction. With no materialized policy, `act` is denied (`POLICY_MISSING`); the materializer CLI is `python -m app.governance.policy_cli`. On denial the thread stays at `next=["act"]` and a later RESUME re-runs only `act`. The Phase 2 graph has no `act` node. See "Runtime authority and governed actions (Phase 3D)" in `docs/Architecture.md`; operator CLI: `python -m app.governance.authority_cli show|revoke|restore`
+- **assess** (checkpointed lifecycle only, `build_app(checkpointer, action_gate=..., risk_reader=...)`): read-only, strongly consistent read of the prior supplier-state row; classifies the alert (`classify_risk_change`) and routes only `new_alert` / `escalated` to `act`. `suppressed` / `downgraded` end without an action, but supplier state is still written after END. The checkpointed assessment (`eligibility_change_type`) is reused on RESUME and reported separately from the write-time `change_type`. Threads parked at `act` by the pre-assess graph proceed as before (`eligibility_basis=legacy_unassessed`). RESUME never rewrites state: the attempt `trace_id` is passed in `configurable`
+- **act** (checkpointed lifecycle only): governed privileged action (mock review ticket) for an action-eligible alert, admitted only if the durable emergency authority item `agent#supplier-risk-agent` is `ACTIVE` **and** the materialized policy item `policy#supplier-risk-agent#open_review_ticket` allows it (Phase 3F). Both checks and the action-ledger claim are one DynamoDB transaction. With no materialized policy, `act` is denied (`POLICY_MISSING`); the materializer CLI is `python -m app.governance.policy_cli`. On denial the thread stays at `next=["act"]` and a later RESUME re-runs only `act`. The Phase 2 graph has no `act` node. See "Runtime authority and governed actions (Phase 3D)" in `docs/Architecture.md`; operator CLI: `python -m app.governance.authority_cli show|revoke|restore`
 
 **Important**: `supplier_risk_agent.py` has module-level initialization that runs at import time — it loads the graph JSON, builds the FAISS index (calling `OpenAIEmbeddings()`), and instantiates the LLM. `OPENAI_API_KEY` must be set even when using Bedrock as the LLM provider.
 

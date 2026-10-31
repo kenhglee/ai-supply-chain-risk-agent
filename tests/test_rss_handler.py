@@ -151,6 +151,9 @@ def test_checkpoint_start_routes_with_pause_before_analyze(stubs):
         "action_id": None,
         "action_status": None,
         "authority_version": None,
+        "eligibility_change_type": None,
+        "action_eligible": None,
+        "eligibility_basis": None,
         "executor_id": "stream-1",
         "request_id": "req-1",
     }
