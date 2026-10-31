@@ -1,9 +1,9 @@
 # Same-Thread Ownership: AWS Rollout Plan (for review)
 
-**Status:** prepared, not executed.
+**Status:** step 1 (read-only preflight and plan) and experiment A are done; see [Results](#9-results). Still not done:
 - No Terraform has been applied.
-- Nothing has been deployed, invoked or adopted.
-- No AWS write has been made.
+- Nothing has been deployed or adopted.
+- The Lambda has not been invoked, and no historical thread has been resumed.
 
 Design: `docs/SAME_THREAD_OWNERSHIP_DESIGN.md` (§16 lists the requirements). Code: branch `assess-before-act`.
 
@@ -218,3 +218,61 @@ AWS_PROFILE=ken-ai-dev AWS_DEFAULT_REGION=us-west-2 AUTHORITY_TABLE=risk_agent_a
 - **`LEASE_TTL_MS` against the Lambda timeout** (120 s vs 123 s). A Lambda killed at its timeout releases nothing, so a retry within about 2 minutes is `contended`.
 - **Real-DynamoDB verification of the gaps in §4.**
 - **Explicitly out of scope:** X1 cross-thread deduplication and `IN_FLIGHT` reconciliation.
+
+## 9. Results
+
+### Preflight and plan (read-only)
+
+Evidence: [`docs/evidence/OWN-preflight-20261031T224222Z.json`](evidence/OWN-preflight-20261031T224222Z.json), redacted. Every call the preflight made was a read (the list is in the evidence file).
+
+- **Identity:** account `714781437949`, `AWSReservedSSO_AdministratorAccess_*`, us-west-2.
+- **Lambda `ai-supply-chain-risk-agent`:**
+  - image `sha256:a0500bbef2e4f5d1939b2d7815b37d2faa2f0f9ed065cbb2e9d11c8cb0a7b224` (pre-Phase 3D, pre-ownership), last modified 2026-10-11T20:46:55Z;
+  - timeout 123 s; 1028 MB;
+  - role `RiskAgentLambdaRole` (inline policies `BedrockInvoke`, `RiskCheckpointAccess`, `RiskStateAccess`, `RiskTraceAccess`, plus `AWSLambdaBasicExecutionRole`);
+  - both backends `dynamodb`; no governance tables; no `LEASE_TTL_MS`.
+- **Invocation sources: none.**
+  - No function URL, resource-based policy, event source mappings or async configuration.
+  - No EventBridge rules on the default bus, and no Scheduler schedules.
+  - The function can only be invoked directly by IAM principals. Rules on non-default event buses weren't listed; without a resource policy they couldn't invoke it anyway.
+- **Threads: 13, all `legacy_recognized`.**
+  - All are completed, with no lease and no marker, and all four evidence checks passed.
+  - No fork, no missing trace, no `IN_FLIGHT` or `DENIED` action.
+  - Limit: the evidence shows a completion trace exists. It can't rule out a business write that a later run overwrote (every `TSMC#earthquake` row has been rewritten since).
+- **Unfenced writers:**
+  - The deployed Lambda, only if invoked directly.
+  - Any pre-ownership code on other hosts, which isn't visible from here.
+  - The governed and Bedrock worker roles have no checkpoint-table access.
+- **`terraform plan -lock=false`:** `1 to add, 0 to change, 0 to destroy`, namely `aws_iam_role_policy.risk_checkpoint_ownership` exactly as in §3. No drift. The only warning is the pre-existing `hash_key` deprecation in `traces.tf`. **Not applied.**
+
+### Experiment A: owned contention
+
+**Accepted run `OWN-contention-20261031T231350Z`** ([evidence](evidence/OWN-contention-20261031T231350Z/)).
+- **Code:** commit `e699705`, clean tree, recorded in every attempt's events.
+- **The run:**
+  - START paused before `analyze` at epoch 1.
+  - The owner (trace `722b5f5b…`, epoch 2) inferred once (Bedrock request `ad28d7a7-…`) and held at `after-inference`.
+  - A contender attempt started during the hold and returned `contended`, with holder `722b5f5b…` at epoch 2. Its only AWS calls were `dynamodb:Query` ×3 and `dynamodb:UpdateItem` ×1 (the refused lease acquisition).
+  - Released, the owner completed: `suppressed`, final marker `finalized` at epoch 2, lease `RELEASED` at epoch 2 and still held by the owner at release.
+- **Verdict:**
+  - The original `verdict.json` (driver at `e699705`) failed `no_workflow_write_by_the_contender`, because it compared the whole lease item. The owner's heartbeat had advanced `expires_at_ms` by 40,162 ms; owner, epoch, state and checkpoint were unchanged.
+  - With the corrected check (`4b3ee87`), regenerated read-only from the same events as `verdict.regenerated.json`: **passed and complete, 9 of 9 acceptance checks.** Durable state was unchanged around the contender (no changed fields, lease held throughout), and the expiry advance is reported as a diagnostic.
+
+**Superseded run `OWN-contention-20261031T225042Z`** ([evidence](evidence/OWN-contention-20261031T225042Z/)).
+- Commit `e43c54c`, clean tree.
+- The contender snapshots were not taken. So, regenerated with `e699705`, `no_workflow_write_by_the_contender` is `not_evaluated` and the verdict is **incomplete** (`complete: false`, `passed: false`). The other 8 checks pass.
+- It is kept as the record of why both contender snapshots are now required.
+
+**What these runs don't show:**
+- Exactly one owner under **simultaneous** contenders on real DynamoDB: the contender here started during a hold, well after acquisition.
+- Transaction-conflict behavior between the owner's concurrent writes. They completed, but conflicts weren't counted.
+- Anything about the deployed Lambda, which wasn't involved.
+
+### Experiment B: kill, expiry and takeover (not reviewed)
+
+`~/ownership-runs/OWN-takeover-20261031T233348Z` exists locally, with a `verdict.json` reporting 11 of 11 passed. It has **not been reviewed and is not preserved here.**
+
+There is one open question. Its `contended` attempt (23:35:29Z) precedes the `after-kill` snapshot (23:36:28Z), and the kill time isn't in the event log. `ownership_contended_until_expiry` only requires a contended attempt between the hold and the takeover, so the run may show contention against a **live** owner rather than a dead one. Before accepting it, establish the kill time:
+- from the operator's shell record of `kill -9` and its exit status;
+- or by requiring an `after-kill` snapshot before any contender attempt.
+
