@@ -37,6 +37,12 @@ RELEASED = "RELEASED"
 DEFAULT_TTL_MS = 120_000
 # The request may or may not have been applied: resolved by reading the lease back.
 UNKNOWN_OUTCOME_EXCEPTIONS = (HTTPClientError, BotoConnectionError)
+# Not applied; retried. On real DynamoDB a single-item write to the lease fails
+# with TransactionConflictException while a fenced transaction (which
+# ConditionChecks the lease) is in flight, so acquire / renew / release retry it.
+RETRYABLE_LEASE_ERRORS = frozenset({"TransactionConflictException", "ProvisionedThroughputExceededException",
+                                    "ThrottlingException", "RequestLimitExceeded"})
+LEASE_RETRY_ATTEMPTS = 6
 
 
 class OwnershipError(RuntimeError):
@@ -90,11 +96,22 @@ class LeaseStore:
     """Acquire / renew / release the lease item. now_ms is injectable for tests."""
 
     def __init__(self, table_name: str, region: str | None = None, *, ttl_ms: int = DEFAULT_TTL_MS,
-                 now_ms=_now_ms, table=None) -> None:
+                 now_ms=_now_ms, table=None, sleep=time.sleep) -> None:
         self.ttl_ms = ttl_ms
         self.now_ms = now_ms
+        self._sleep = sleep
         self._table = table or boto3.resource(
             "dynamodb", region_name=region or os.getenv("AWS_DEFAULT_REGION", "us-west-2")).Table(table_name)
+
+    def _update(self, **kwargs):
+        """update_item, retrying transaction conflicts and throttling (not applied) with backoff."""
+        for attempt in range(LEASE_RETRY_ATTEMPTS):
+            try:
+                return self._table.update_item(**kwargs)
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] not in RETRYABLE_LEASE_ERRORS or attempt == LEASE_RETRY_ATTEMPTS - 1:
+                    raise
+            self._sleep(0.02 * (2 ** attempt))
 
     def read(self, thread_id: str) -> dict | None:
         items = self._table.query(
@@ -124,7 +141,7 @@ class LeaseStore:
         if not new_thread:
             values.update({":released": RELEASED, ":now": now})
         try:
-            response = self._table.update_item(
+            response = self._update(
                 Key={"thread_id": thread_id, "sk": LEASE_SK},
                 UpdateExpression=("SET #state = :held, #owner = :owner, owner_executor = :executor, "
                                   "expires_at_ms = :expires, acquired_at_ms = :at ADD epoch :one"),
@@ -157,7 +174,7 @@ class LeaseStore:
         """Extend expiry; allowed even after expiry as long as nobody took over (same epoch)."""
         now = self.now_ms()
         try:
-            self._table.update_item(
+            self._update(
                 Key={"thread_id": lease.thread_id, "sk": LEASE_SK},
                 UpdateExpression="SET expires_at_ms = :expires, renewed_at_ms = :at",
                 ConditionExpression="#owner = :owner AND epoch = :epoch AND #state = :held",
@@ -183,7 +200,7 @@ class LeaseStore:
     def release(self, lease: Lease) -> bool:
         """Mark RELEASED, keeping the item and its epoch. False if we no longer own it."""
         try:
-            self._table.update_item(
+            self._update(
                 Key={"thread_id": lease.thread_id, "sk": LEASE_SK},
                 UpdateExpression="SET #state = :released, released_at_ms = :at",
                 ConditionExpression="#owner = :owner AND epoch = :epoch",

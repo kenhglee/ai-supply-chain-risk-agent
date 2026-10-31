@@ -300,3 +300,37 @@ def test_legacy_forked_history_is_unverified(env):
 
     assert outcome["status"] == "completion_unverified"
     assert "forked_history" in outcome["unverified_reasons"]
+
+
+def test_moto_serialization_is_per_operation_not_per_attempt(env):
+    """tests/conftest.py locks each moto call, never a whole attempt: other operations proceed mid-attempt."""
+    import threading
+    import time
+
+    from tests.test_risk_workflow import OK_ALERT
+
+    started = _start_paused(env)
+    inside, release, result = threading.Event(), threading.Event(), {}
+
+    def held_risk_model(prompt):
+        env.risk.calls += 1
+        inside.set()
+        assert release.wait(20)
+        return json.dumps(OK_ALERT)
+
+    env.monkeypatch.setattr(agent, "_risk_llm", type("R", (), {"invoke": staticmethod(held_risk_model)}))
+    worker = threading.Thread(target=lambda: result.update(
+        outcome=risk_workflow.resume_workflow(started["thread_id"], **_new_executor())))
+    worker.start()
+    try:
+        assert inside.wait(20)
+        t0 = time.monotonic()
+        lease = _lease(started["thread_id"])  # reads and writes from another thread while the attempt is running
+        env.supplier_state.put_item(Item={"pk": "Other#flood", "current_risk_level": "Low"})
+        env.supplier_state.delete_item(Key={"pk": "Other#flood"})
+        assert time.monotonic() - t0 < 2
+        assert (lease["state"], lease["epoch"]) == ("HELD", 2)
+    finally:
+        release.set()
+        worker.join(30)
+    assert result["outcome"]["status"] == "completed"

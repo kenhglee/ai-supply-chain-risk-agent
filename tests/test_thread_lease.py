@@ -456,3 +456,38 @@ def test_graph_reuses_writes_stored_before_takeover_without_repeating_inference(
     assert {int(i["lease_epoch"]) for i in _items(table, "chk#")} == {1, 3}  # START, then B; A died first
     assert {int(i["lease_epoch"]) for i in _items(table, "wr#") if i["task_path"].endswith("analyze")} == {2}
     assert leases.read(THREAD)["state"] == HELD and leases.read(THREAD)["epoch"] == 3
+
+
+def _conflict():
+    return ClientError({"Error": {"Code": "TransactionConflictException", "Message": "in progress"}}, "UpdateItem")
+
+
+def test_lease_operations_retry_transaction_conflicts_from_in_flight_fenced_writes(table):
+    """Real DynamoDB rejects a lease UpdateItem while a transaction on it is in flight."""
+    leases = LeaseStore(TABLE, REGION, ttl_ms=10_000, now_ms=Clock(), sleep=lambda s: None)
+    real, script = leases._table.update_item, [_conflict(), _conflict()]
+
+    def flaky(**kwargs):
+        if script:
+            raise script.pop(0)
+        return real(**kwargs)
+
+    leases._table.update_item = flaky
+    lease = leases.acquire(THREAD, "owner-A")
+    script.extend([_conflict()])
+    renewed = leases.renew(lease)
+    script.extend([_conflict()])
+    with pytest.raises(LeaseContended):  # while A holds: contention after the retry, not a raw error
+        leases.acquire(THREAD, "owner-B")
+    script.extend([_conflict()])
+    assert leases.release(renewed) is True
+    script.extend([_conflict()])
+    assert leases.acquire(THREAD, "owner-B").epoch == 2
+    assert leases.read(THREAD)["owner"] == "owner-B"
+
+
+def test_lease_conflict_retries_are_bounded(table):
+    leases = LeaseStore(TABLE, REGION, now_ms=Clock(), sleep=lambda s: None)
+    leases._table.update_item = lambda **kw: (_ for _ in ()).throw(_conflict())
+    with pytest.raises(ClientError, match="TransactionConflict"):
+        leases.acquire(THREAD, "owner-A")

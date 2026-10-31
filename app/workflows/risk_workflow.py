@@ -487,26 +487,40 @@ def _recover_trace(attempt: _Attempt, marker: dict, snapshot) -> None:
         logger.warning("recovered trace %s conflicts with an existing record", marker["trace_id"])
 
 
-def _legacy_completion(attempt: _Attempt, snapshot) -> dict:
-    """A thread completed before ownership existed: recognize it from evidence, never refinalize."""
+def legacy_completion_evidence(checkpointer, thread_id: str, snapshot) -> dict:
+    """Read-only evidence (design §6, E1-E4) that a pre-ownership thread completed and was finalized.
+
+    Used by the lifecycle and by the rollout preflight; it writes nothing.
+    Returns {"reasons": [...], "source_trace_id": ..., "trace": ...}; an empty
+    reasons list means the completion is recognized.
+    """
     reasons = []
+    if _has_pending_tasks(snapshot):
+        reasons.append("pending_tasks")  # E1
     parents = [t.parent_config["configurable"]["checkpoint_id"]
-               for t in attempt.checkpointer.list(_config(attempt.thread_id)) if t.parent_config]
+               for t in checkpointer.list(_config(thread_id)) if t.parent_config]
     if len(parents) != len(set(parents)):
-        reasons.append("forked_history")
-    source_trace_id = (snapshot.metadata or {}).get("trace_id") or snapshot.values.get("trace_id")
+        reasons.append("forked_history")  # E2
+    source_trace_id = (snapshot.metadata or {}).get("trace_id") or snapshot.values.get("trace_id")  # E3
     trace = get_risk_trace_by_trace_id(source_trace_id) if source_trace_id else None
     if not source_trace_id:
         reasons.append("no_completing_trace_id")
-    elif trace is None or trace.get("trace_id") != source_trace_id:
+    elif trace is None or trace.get("trace_id") != source_trace_id:  # E4
         reasons.append("completion_trace_missing")
     else:
-        if trace.get("thread_id") != attempt.thread_id:
+        if trace.get("thread_id") != thread_id:
             reasons.append("completion_trace_thread_mismatch")
         if trace.get("workflow_event") not in ("started_completed", "resumed_completed"):
             reasons.append("completion_trace_event_mismatch")
         if not trace.get("change_type"):
             reasons.append("completion_trace_change_type_missing")
+    return {"reasons": reasons, "source_trace_id": source_trace_id, "trace": trace}
+
+
+def _legacy_completion(attempt: _Attempt, snapshot) -> dict:
+    """A thread completed before ownership existed: recognize it from evidence, never refinalize."""
+    evidence = legacy_completion_evidence(attempt.checkpointer, attempt.thread_id, snapshot)
+    reasons, source_trace_id, trace = evidence["reasons"], evidence["source_trace_id"], evidence["trace"]
     values = snapshot.values
     if reasons:
         attempt.record(values, COMPLETION_UNVERIFIED, snapshot=snapshot, unverified_reasons=",".join(reasons))
