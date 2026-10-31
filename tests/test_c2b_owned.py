@@ -103,3 +103,53 @@ def test_direct_invoke_is_refused_on_owned_dependencies(tmp_path):
     proc = run.child("attempt", "--thread-id", thread_id, "--events", str(run.events), "--hold", "none",
                      "--direct-invoke", check=False)
     assert proc.returncode == 2 and "refuse" in proc.stderr
+
+
+# ---- Contention verdict: missing vs unusable evidence ----
+
+def _evaluate(run, events, **durable):
+    return driver.evaluate_contention(events, final_state=durable.get("final_state"),
+                                      contender_traces=durable.get("contender_traces"),
+                                      owner_trace=durable.get("owner_trace"))["acceptance"]
+
+
+def test_contention_verdict_without_contender_snapshots_is_incomplete_not_passed(tmp_path):
+    run, thread_id, _ = _contention(tmp_path)
+    events = [e for e in driver.read_events(run.events) if e["event"] != "durable_snapshot"]
+    (tmp_path / "no-snapshots.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    proc = run.child("verdict", "--thread-id", thread_id, "--events", str(tmp_path / "no-snapshots.jsonl"),
+                     "--expect", "contention", check=False)
+    verdict = json.loads(proc.stdout)
+    check = verdict["checks"]["acceptance"]["no_workflow_write_by_the_contender"]
+    assert (check["ok"], check["status"]) == (None, "not_evaluated")
+    assert (verdict["complete"], verdict["passed"], proc.returncode) == (False, False, 1)
+    # The call-log check still reports what it can, as separate evidence.
+    assert verdict["checks"]["acceptance"]["contender_write_calls_limited_to_the_lease_attempt"]["ok"] is True
+
+
+def test_contention_snapshots_with_null_fields_fail_rather_than_match(tmp_path):
+    run, _, _ = _contention(tmp_path)
+    events = [dict(e, checkpoint_id=None, lease=None) if e["event"] == "durable_snapshot" else e
+              for e in driver.read_events(run.events)]
+    check = _evaluate(run, events)["no_workflow_write_by_the_contender"]
+    assert check["ok"] is False and "lack checkpoint_id or lease" in check["detail"]["reason"]
+
+
+def test_contention_snapshots_that_differ_fail(tmp_path):
+    run, _, _ = _contention(tmp_path)
+    events = [dict(e, checkpoint_id="changed") if e.get("label") == "after-contender" else e
+              for e in driver.read_events(run.events)]
+    assert _evaluate(run, events)["no_workflow_write_by_the_contender"]["ok"] is False
+
+
+def test_contender_write_calls_beyond_the_lease_attempt_fail(tmp_path):
+    run, _, _ = _contention(tmp_path)
+    events = driver.read_events(run.events)
+    exit_event = next(e for e in events if e["event"] == "attempt_exit" and e.get("status") == "contended")
+    assert set(exit_event["aws_calls"]) <= {"dynamodb:Query", "dynamodb:GetItem", "dynamodb:UpdateItem"} or \
+        exit_event["aws_calls"] == {}  # the real local run: reads plus at most the lease attempt
+    for extra in ({"dynamodb:TransactWriteItems": 1}, {"dynamodb:UpdateItem": 2}, {"dynamodb:PutItem": 1}):
+        altered = [dict(e, aws_calls={**(e.get("aws_calls") or {}), **extra}) if e is exit_event else e
+                   for e in events]
+        assert _evaluate(run, altered)["contender_write_calls_limited_to_the_lease_attempt"]["ok"] is False, extra

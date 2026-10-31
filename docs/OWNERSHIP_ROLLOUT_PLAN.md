@@ -129,7 +129,7 @@ Terminal 2, after Terminal 1 prints `HOLDING`:
 ```bash
 D=~/ownership-runs/<RUN>; E=$D/events.jsonl; T=thread-...
 $PY $C snapshot --thread-id $T --events $E --label before-contender
-$PY $C attempt --thread-id $T --events $E --hold none; echo "contender exit=$?"    # outcome: contended
+$PY $C attempt --thread-id $T --events $E --hold none    # read "status": exit is 0 for any outcome
 $PY $C snapshot --thread-id $T --events $E --label after-contender
 touch $D/release-owner
 ```
@@ -138,6 +138,10 @@ Terminal 1, after `owner exit=0`:
 ```bash
 $PY $C verdict --thread-id $T --events $E --expect contention --out $D/verdict.json
 ```
+Both contender snapshots are **required**: `before-contender` immediately before the contender attempt, and `after-contender` immediately after it, while the owner still holds. Without them, the durable no-write check is `not_evaluated` and the verdict is incomplete.
+
+The driver's exit code reports the driver's health, not the workflow outcome, so a `contended` attempt exits 0. Read the outcome's `status`. `risk_worker` exits 5 for `contended`.
+
 Acceptance:
 - the owner was held, then released, and completed;
 - the contender ran during the hold and was `contended` by the owner (same owner and epoch);

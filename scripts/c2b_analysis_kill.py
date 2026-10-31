@@ -73,7 +73,10 @@ OWNERSHIP (production dependencies are owned; docs/SAME_THREAD_OWNERSHIP_DESIGN.
     verdict --expect contention: an owner held (with --release-file) while a
     contender attempt ran; the contender must be `contended` with no analyze,
     no model call, no workflow write and no trace; the owner then completes
-    and finalizes at the same epoch.
+    and finalizes at the same epoch. Required snapshots, taken while the owner
+    holds: `snapshot --label before-contender` immediately before the
+    contender attempt and `--label after-contender` immediately after it.
+    Without them the durable no-write check is not_evaluated (never passed).
 
 EVENTS
     One JSON object per line, appended, flushed and fsynced before any hold,
@@ -85,6 +88,12 @@ EVENTS
 EXIT
     0 ok; 1 verdict failed; 2 usage; 3 thread not at the expected node;
     5 hook could not be installed; 6 tripwire hit; 75 hold expired.
+    These report the DRIVER's health. `attempt` exits 0 whenever the lifecycle
+    returned an outcome, whatever its status (paused, completed, contended,
+    lease_lost, ...): read `status` from its JSON line or the attempt_exit event.
+    app.workers.risk_worker maps outcome statuses to exit codes (5 contended,
+    6 lease lost, ...); the driver does not, because 3 and 5 already mean
+    driver failures here.
 """
 import argparse
 import inspect
@@ -748,6 +757,52 @@ def _owned_takeover_checks(acceptance: dict, killed, resumed, contended, final_s
         {"final": final, "lease": lease, "resume_trace_id": r_exit.get("trace_id")})
 
 
+REQUIRED_CONTENTION_SNAPSHOTS = ("before-contender", "after-contender")
+# DynamoDB operations that write. A contender may issue exactly one UpdateItem:
+# its (conditional, refused) lease acquisition.
+WRITE_OPERATIONS = ("dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:TransactWriteItems",
+                    "dynamodb:BatchWriteItem")
+
+
+def _snapshot_unchanged(before: dict, after: dict) -> dict:
+    """Durable evidence: the checkpoint and the lease are identical around the contender.
+
+    Missing snapshots are missing evidence (not_evaluated). Snapshots without a
+    checkpoint_id or lease cannot show "unchanged" (failed): null == null is
+    never success.
+    """
+    missing = [label for label, snap in zip(REQUIRED_CONTENTION_SNAPSHOTS, (before, after)) if not snap]
+    if missing:
+        return _not_evaluated(f"snapshots not recorded: {missing} (run `snapshot --label before-contender` "
+                              "and `--label after-contender` around the contender attempt)")
+    fields = {label: {k: snap.get(k) for k in ("checkpoint_id", "lease")}
+              for label, snap in zip(REQUIRED_CONTENTION_SNAPSHOTS, (before, after))}
+    incomplete = [label for label, f in fields.items() if f["checkpoint_id"] is None or not f["lease"]]
+    if incomplete:
+        return _check(False, {"reason": f"snapshots lack checkpoint_id or lease: {incomplete}", **fields})
+    return _check(fields["before-contender"] == fields["after-contender"], fields)
+
+
+def _contender_write_calls(contenders: list, find) -> dict:
+    """Event-log evidence: the contender's AWS calls after its hooks were installed.
+
+    Coverage: every botocore call the contender process made after
+    hooks_installed, by operation (counts). Limits: no item keys and no
+    success/failure per call; calls before hooks_installed (the precondition
+    reads) are not counted; nothing about other processes. A contender may
+    issue one UpdateItem, its refused lease acquisition; no other write.
+    """
+    detail, ok = [], bool(contenders)
+    for evs in contenders:
+        calls = (find(evs, "attempt_exit") or {}).get("aws_calls")
+        if calls is None:
+            return _not_evaluated("contender attempt_exit has no aws_calls (hooks not installed?)")
+        writes = {op: n for op, n in calls.items() if op in WRITE_OPERATIONS}
+        ok = ok and writes in ({}, {"dynamodb:UpdateItem": 1})
+        detail.append({"aws_calls": calls, "write_calls": writes})
+    return _check(ok, detail)
+
+
 def evaluate_contention(events: list[dict], *, final_state: dict | None, contender_traces: dict | None,
                         owner_trace: dict | None) -> dict:
     """An owner held (releasable) while a contender attempt ran; see module doc."""
@@ -767,7 +822,7 @@ def evaluate_contention(events: list[dict], *, final_state: dict | None, contend
     o_exit = find(owner, "attempt_exit") or {}
     owner_epoch = o_enter.get("lease_epoch")
     snapshots = {e["label"]: e for e in events if e["event"] == "durable_snapshot"}
-    before, after = snapshots.get("before-contender") or {}, snapshots.get("after-contender") or {}
+    before, after = snapshots.get("before-contender"), snapshots.get("after-contender")
     durable = final_state is not None and contender_traces is not None and owner_trace is not None
     forbidden = {"analyze_enter", "model_invoke_start", "model_return", "writes_committed", "checkpoint_committed",
                  "validate_enter", "tripwire_hit"}
@@ -799,11 +854,8 @@ def evaluate_contention(events: list[dict], *, final_state: dict | None, contend
         "one_inference_total": _check(
             sum(1 for e in events if e["event"] == "model_return") == 1,
             sum(1 for e in events if e["event"] == "model_return")),
-        "no_workflow_write_by_the_contender": _check(
-            bool(before) and bool(after) and before.get("checkpoint_id") == after.get("checkpoint_id")
-            and before.get("lease") == after.get("lease"),
-            {"before": {k: before.get(k) for k in ("checkpoint_id", "lease")},
-             "after": {k: after.get(k) for k in ("checkpoint_id", "lease")}}),
+        "no_workflow_write_by_the_contender": _snapshot_unchanged(before, after),
+        "contender_write_calls_limited_to_the_lease_attempt": _contender_write_calls(contenders, find),
     }
     if not durable:
         for name in ("contender_wrote_no_trace", "owner_finalized_at_its_epoch"):
@@ -815,6 +867,7 @@ def evaluate_contention(events: list[dict], *, final_state: dict | None, contend
     acceptance["owner_finalized_at_its_epoch"] = _check(
         final.get("trace_id") == o_exit.get("trace_id") and final.get("epoch") == owner_epoch == o_exit.get("lease_epoch")
         and lease.get("state") == "RELEASED" and lease.get("epoch") == owner_epoch
+        and lease.get("owner") == o_enter.get("trace_id")  # the contender never took the lease
         and (owner_trace or {}).get("workflow_event") == "resumed_completed",
         {"final": final, "lease": lease, "owner_epoch": owner_epoch,
          "owner_trace_event": (owner_trace or {}).get("workflow_event")})
