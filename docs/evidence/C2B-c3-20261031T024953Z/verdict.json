@@ -1,0 +1,119 @@
+{
+  "experiment": "C2b c3",
+  "thread_id": "thread-739b289350dd47d48c54cb32a35f856a",
+  "final_durable_state": {
+    "exists": true,
+    "checkpoint_id": "1f1d4d62-567e-6eae-8006-2d9a596df3ad",
+    "step": 6,
+    "next": [],
+    "tasks": [],
+    "nodes": [
+      "infer",
+      "decide",
+      "retrieve",
+      "analyze",
+      "validate",
+      "assess"
+    ],
+    "analyze_writes_stored": false,
+    "pending_write_task_count": 0
+  },
+  "final_outcome": {
+    "status": "completed",
+    "trace_id": "8e748cfdba3a426ba20db68d1bffd9aa",
+    "change_type": "suppressed",
+    "eligibility_change_type": "suppressed",
+    "action_eligible": false,
+    "action_status": null
+  },
+  "checks": {
+    "killed_attempt_reached_hold": {
+      "ok": true,
+      "detail": {
+        "hold": "after-analyze-writes",
+        "events": [
+          "attempt_start",
+          "precondition",
+          "hooks_installed",
+          "analyze_enter",
+          "model_invoke_start",
+          "aws_call",
+          "model_return",
+          "analyze_return",
+          "writes_committed",
+          "checkpoint_put_blocked",
+          "holding"
+        ]
+      }
+    },
+    "killed_attempt_entered_analyze_and_got_response": {
+      "ok": true,
+      "detail": {
+        "request_ids": [
+          "5a080a1f-54f5-46e7-9e19-0d78c9e8218b"
+        ]
+      }
+    },
+    "nothing_downstream_before_kill": {
+      "ok": true,
+      "detail": {
+        "after_hold": []
+      }
+    },
+    "no_tripwire_hits": {
+      "ok": true,
+      "detail": []
+    },
+    "retrieval_reused_from_start": {
+      "ok": true,
+      "detail": {
+        "retrieve_started_at": "2026-10-31T02:49:55.727+00:00",
+        "start_retrieve_started_at": "2026-10-31T02:49:55.727+00:00"
+      }
+    },
+    "analyze_writes_stored_without_new_checkpoint": {
+      "ok": true,
+      "detail": {
+        "after_kill": {
+          "checkpoint_id": "1f1d4d5c-1aa6-6cde-8003-3cbdd95e41f5",
+          "step": 3,
+          "next": [],
+          "tasks": [
+            {
+              "name": "analyze",
+              "has_result": true,
+              "error": false
+            }
+          ]
+        }
+      }
+    },
+    "langgraph_reuses_stored_writes": {
+      "ok": false,
+      "detail": {
+        "direct_invoke_events": "not run",
+        "analyze_ended_at": "2026-10-31T02:51:06.992+00:00",
+        "killed_attempt_analyze_return_logged_at": "2026-10-31T02:51:06.992+00:00"
+      }
+    },
+    "lifecycle_resume_continues_from_stored_writes": {
+      "ok": true,
+      "detail": {
+        "resume_status": "completed",
+        "resume_events": [
+          "attempt_start",
+          "precondition",
+          "hooks_installed",
+          "checkpoint_committed",
+          "validate_enter",
+          "checkpoint_committed",
+          "checkpoint_committed",
+          "writes_committed",
+          "writes_committed",
+          "attempt_exit"
+        ]
+      }
+    }
+  },
+  "passed": false
+}

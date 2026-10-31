@@ -617,7 +617,7 @@ Headline `TSMC halts wafer production after earthquake in Taiwan [C2-cluster-dem
 **What C2 does not show**
 - **EKS:** this was local kind.
 - **Workload identity:** temporary SSO credentials came from a Kubernetes Secret, for plumbing only.
-- **Mid-node crash recovery:** both handoffs happened at a durable pause before `analyze`. A force-kill during a node (C2b) is optional and parked.
+- **Mid-node crash recovery:** both handoffs happened at a durable pause before `analyze`. A force-kill during a node was tested later, in C2b (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b)).
 - **Exactly-once node execution:** execution is at-least-once.
 - **Safe concurrent RESUME.**
 - **SIGTERM / graceful-termination behavior.**
@@ -1108,7 +1108,7 @@ The same tripwires are covered under moto by `tests/test_risk_workflow.py`: paus
 **Superseded run `DR1-20261030T231953Z`** ([evidence](evidence/DR1-20261030T231953Z.json)). Its workflow executed fully: A paused, B completed, a ticket was created and the state row was written. The no-inference check failed only because its allowlist admitted DynamoDB alone, and B called `sso:GetRoleCredentials`. No tripwire fired and no Bedrock call was made. The check now admits exactly that one credential operation, and the experiment was re-run. That earlier write is why the accepted run reports `suppressed` rather than `new_alert`.
 
 **Not shown:**
-- **Kill during a node.** A exited at a durable pause. A process killed during `analyze` would re-run it on resume (at-least-once; C2b remains parked).
+- **Kill during a node.** A exited at a durable pause. Killing during `analyze` was tested later, in C2b: before its writes were stored, `analyze` re-ran; after, its stored result was reused (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b)).
 - **Least-privilege identity.** `RiskAgentGovernedWorkerRole` cannot reach the checkpoint, state or trace tables, and its ledger access is limited to `action#probe-*`. The IAM-boundary capabilities (`claude_inference`, `titan_embeddings`) therefore did not govern this executor; only the application-level `act` gate did.
 - **CSV business state, concurrent RESUME, `IN_FLIGHT` reconciliation:** out of scope.
 
@@ -1159,14 +1159,14 @@ A suppressed run passes only if it created no ledger item. `--expect-action requ
 
 This verifies only the `suppressed` (no-action) route on AWS. **Live verification of a `new_alert` or `escalated` run, where `act` executes after `assess`, is still pending.**
 
-### Mid-node kill experiment (C2b, local)
+### Mid-node kill experiment (C2b)
 
 **Driver.** `scripts/c2b_analysis_kill.py` runs separately from normal execution. It installs hooks in its own process only, then calls the unmodified lifecycle; normal execution has no hooks and no delays.
 - **Process roles.** START pauses before `analyze`. A held attempt is killed with `kill -9`. A fresh process then resumes.
 - **Tripwires.** Triage, retrieval, embeddings and any model other than risk inference are blocked.
 - **Event log.** Events are fsynced JSONL: attempts, `analyze` entry and return, model return (request ID and token usage only), the hold point, and stored writes and checkpoints. No prompts, response bodies or credentials are recorded. A killed attempt has no completion trace; the event log is its record.
 
-**Local tests** (`tests/test_c2b_driver.py`). Each attempt is a separate Python process (`tests/c2b_local_child.py`) killed with SIGKILL. Only fsynced files carry state between processes: a test-only `FileCheckpointSaver`, CSV supplier state and JSONL traces. These tests do not exercise `DynamoCheckpointSaver`. **Nothing has been run against AWS.**
+**Local tests** (`tests/test_c2b_driver.py`). Each attempt is a separate Python process (`tests/c2b_local_child.py`) killed with SIGKILL. Only fsynced files carry state between processes: a test-only `FileCheckpointSaver`, CSV supplier state and JSONL traces. These tests do not exercise `DynamoCheckpointSaver`; the AWS runs below do.
 
 - **c1: hold after the risk model returns, inside `analyze`. Passes locally.**
   - The durable checkpoint is unchanged by the killed attempt.
@@ -1182,6 +1182,58 @@ This verifies only the `suppressed` (no-action) route on AWS. **Live verificatio
   - **Behavior now.** A thread killed after a node's writes are stored resumes without re-running that node. The same holds for `act`: the stored action result is reused, and the action does not run again.
   - **Regression tests.** `tests/test_risk_workflow.py` simulates the crash with a checkpoint `put` that fails after the target node's writes are stored, for both `analyze` and `act`. The c3 subprocess test now passes.
 
+**Verdict.** `verdict` reports two groups. `acceptance` decides `passed`. `diagnostics` holds the optional `--direct-invoke` check, which bypasses the lifecycle and never stands in for a lifecycle recovery.
+
+c3 acceptance establishes reuse from the normal lifecycle evidence:
+- analyze's writes were durable before recovery;
+- the resume, with hooks installed, did not enter `analyze` or invoke the model;
+- the final `analyze` step is the persisted original;
+- downstream execution and finalization completed.
+
+`--offline` reads no durable state; the checks that need it are reported `not_evaluated`, and the verdict cannot pass.
+
+#### AWS runs (manual, two terminals)
+
+Both runs were operated manually with `ken-ai-dev` credentials in us-west-2, using the TSMC earthquake headline. Each resume assessed `suppressed`, so neither reached `act`; action execution was verified separately. By timestamp, both runs started after the completion fix (`a91e845`) was committed. The event log does not record the commit that ran.
+
+The evidence is in `docs/evidence/`, redacted: host names are replaced with `<host>`. No credentials, prompts or response bodies were recorded.
+
+**c1 (`C2B-c1-20261031T023933Z`): passed.** Evidence: [`events.jsonl`](evidence/C2B-c1-20261031T023933Z/events.jsonl), [`verdict.json`](evidence/C2B-c1-20261031T023933Z/verdict.json).
+
+| | |
+|---|---|
+| Thread | `thread-a5b87fd9b706499f83955f619fcfb013` |
+| Processes | START `76619`; killed attempt `77661`; resume `79554` |
+| Killed attempt | Entered `analyze`. Bedrock Converse returned (request `eb72a7ba-…`, 223 output tokens). It held at `after-inference` on the main thread and was killed. Its log ends at `holding`; there is no exit event and no completion trace |
+| Durable state across the kill | Unchanged: checkpoint `1f1d4d45-0b36-…`, step 3, next `analyze`, no stored analyze writes |
+| Resume | Entered `analyze` again with a **second inference** (request `6b4feae2-…`, 240 output tokens). It completed `suppressed`, with state written. Final checkpoint: step 6, no pending tasks |
+| Retrieval | Not repeated. The final trace's `retrieve` step (`02:39:36.743Z`) is START's. No tripwire hits |
+
+The verdict predates the acceptance/diagnostics structure (`ed3f486`) and uses the earlier flat check list. All 8 checks passed.
+
+**c3 (`C2B-c3-20261031T024953Z`): passed on regeneration.** Evidence: [`events.jsonl`](evidence/C2B-c3-20261031T024953Z/events.jsonl), the original [`verdict.json`](evidence/C2B-c3-20261031T024953Z/verdict.json) (superseded), [`verdict.regenerated-offline.json`](evidence/C2B-c3-20261031T024953Z/verdict.regenerated-offline.json) and [`verdict.regenerated.json`](evidence/C2B-c3-20261031T024953Z/verdict.regenerated.json).
+
+| | |
+|---|---|
+| Thread | `thread-739b289350dd47d48c54cb32a35f856a` |
+| Processes | START `82460`; killed attempt `83470`; resume `84680` |
+| Killed attempt | Entered `analyze`. Bedrock Converse returned (request `5a080a1f-…`), and analyze returned. analyze's writes were committed to DynamoDB (task `062531a3-…`, 14 writes). The step-4 checkpoint put was then blocked and the attempt held and was killed. Nothing downstream ran |
+| Durable state across the kill | Checkpoint unchanged (`1f1d4d5c-1aa6-…`, step 3). `next=()`, and the `analyze` task holds its result: the state the old completion check misread |
+| Resume | Hooks were installed. No `analyze` entry and no model call; one inference in total. `validate` and `assess` ran and their writes were committed. It completed `suppressed`, with state written. Final checkpoint: step 6, no pending tasks, trace `resumed_completed` |
+
+- **Original verdict:** failed one check, `langgraph_reuses_stored_writes`, because the `--direct-invoke` diagnostic had not been run. That requirement was stale: the diagnostic existed only because the lifecycle could not continue such a thread before the fix.
+- **Regenerated from the same event file** with `ed3f486`, without executing the workflow again:
+  - **Offline:** 6 checks passed and 3 were not evaluated; `complete: false`.
+  - **Full** (read-only DynamoDB reads): all 9 acceptance checks passed; `complete: true`. The diagnostic was `not_run`.
+
+**Limitation: fallback basis for the persisted analysis step.** This c3 run's after-kill snapshot predates step capture, so it holds no copy of the stored `analyze` step. `final_analysis_step_is_persisted_original` therefore used the fallback basis. The final trace's `analyze` step (`02:51:04.958Z` → `02:51:06.992Z`) lies within the killed attempt's logged `analyze` window (`02:51:04.957Z` → `02:51:06.992Z`). It ended before the resume started, and its alert status matches.
+
+That is consistent with the persisted original, but weaker than an exact comparison:
+- It shows the step was produced during the killed attempt's analysis and not by the resume.
+- It does not compare the stored step with the final one field by field.
+
+Snapshots taken now record the stored step (`pending_analyze_step`), and the verdict then requires an exact match. A new c3 run is needed for that stronger evidence.
+
 Transport-level holds and in-flight termination are deferred.
 
 ### Phase 3 status
@@ -1195,7 +1247,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] C1: local Docker runtime portability (Lambda START → Docker RESUME, same image digest)
   - [x] C2a: Kubernetes executor replacement (Pod A START → delete → Pod B RESUME → Pod C no-op)
   - [x] C2+: whole-cluster destruction/recreation (`risk-c2` deleted → `risk-c2-resume` completes the workflow)
-  - [ ] C2b: force-kill mid-node. Local driver: c1 passes; the c3 control exposed a lifecycle completion defect, now fixed (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b-local)); not run against AWS
+  - [x] C2b: force-kill mid-node (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b)). Local driver: c1 and c3 pass; the c3 control exposed a lifecycle completion defect, now fixed. AWS: c1 passed (`C2B-c1-20261031T023933Z`); c3 passed on regeneration (`C2B-c3-20261031T024953Z`), with the persisted-step check on the fallback window basis. Exact persisted-step comparison and in-flight termination are still pending
   - [x] Same external state model preserved across Lambda, Docker and Kubernetes executors
 - [ ] Workload identity for the worker (least privilege, no developer credentials)
 - [x] 3D1: authority store, transactional action ledger, governed `act` node, fail-closed configuration, `session` worker (proven under moto)

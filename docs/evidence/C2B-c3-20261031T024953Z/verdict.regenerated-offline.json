@@ -1,0 +1,124 @@
+{
+  "experiment": "C2b c3",
+  "thread_id": "thread-739b289350dd47d48c54cb32a35f856a",
+  "durable_state_read": false,
+  "final_durable_state": null,
+  "final_outcome": {
+    "status": "completed",
+    "trace_id": "8e748cfdba3a426ba20db68d1bffd9aa",
+    "change_type": "suppressed",
+    "eligibility_change_type": "suppressed",
+    "action_eligible": false,
+    "action_status": null
+  },
+  "checks": {
+    "acceptance": {
+      "killed_attempt_reached_hold": {
+        "ok": true,
+        "detail": {
+          "hold": "after-analyze-writes",
+          "events": [
+            "attempt_start",
+            "precondition",
+            "hooks_installed",
+            "analyze_enter",
+            "model_invoke_start",
+            "aws_call",
+            "model_return",
+            "analyze_return",
+            "writes_committed",
+            "checkpoint_put_blocked",
+            "holding"
+          ]
+        }
+      },
+      "killed_attempt_entered_analyze_and_got_response": {
+        "ok": true,
+        "detail": {
+          "request_ids": [
+            "5a080a1f-54f5-46e7-9e19-0d78c9e8218b"
+          ]
+        }
+      },
+      "nothing_downstream_before_kill": {
+        "ok": true,
+        "detail": {
+          "after_hold": []
+        }
+      },
+      "no_tripwire_hits": {
+        "ok": true,
+        "detail": []
+      },
+      "retrieval_reused_from_start": {
+        "ok": null,
+        "status": "not_evaluated",
+        "detail": "verdict did not read durable state (--offline)"
+      },
+      "analysis_writes_durable_before_recovery": {
+        "ok": true,
+        "detail": {
+          "analyze_task_id": "062531a3-b85a-e115-5374-4dc5becf81eb",
+          "writes_committed_seq": 9,
+          "hold_seq": 11,
+          "after_kill": {
+            "checkpoint_id": "1f1d4d5c-1aa6-6cde-8003-3cbdd95e41f5",
+            "step": 3,
+            "next": [],
+            "tasks": [
+              {
+                "name": "analyze",
+                "has_result": true,
+                "error": false
+              }
+            ],
+            "analyze_writes_stored": true
+          }
+        }
+      },
+      "resume_did_not_execute_analyze_or_invoke_model": {
+        "ok": true,
+        "detail": {
+          "resume_events": [
+            "attempt_start",
+            "precondition",
+            "hooks_installed",
+            "checkpoint_committed",
+            "validate_enter",
+            "checkpoint_committed",
+            "checkpoint_committed",
+            "writes_committed",
+            "writes_committed",
+            "attempt_exit"
+          ],
+          "model_returns": [
+            {
+              "attempt": "resume-after-analyze-writes-83470",
+              "request_id": "5a080a1f-54f5-46e7-9e19-0d78c9e8218b"
+            }
+          ]
+        }
+      },
+      "final_analysis_step_is_persisted_original": {
+        "ok": null,
+        "status": "not_evaluated",
+        "detail": "verdict did not read durable state (--offline)"
+      },
+      "downstream_and_finalization_completed": {
+        "ok": null,
+        "status": "not_evaluated",
+        "detail": "verdict did not read durable state (--offline); event-log evidence alone is complete"
+      }
+    },
+    "diagnostics": {
+      "langgraph_direct_invoke_reuses_stored_writes": {
+        "ok": null,
+        "status": "not_run",
+        "detail": "attempt --direct-invoke was not run (optional)"
+      }
+    }
+  },
+  "complete": false,
+  "passed": false,
+  "diagnostics_ok": null
+}
