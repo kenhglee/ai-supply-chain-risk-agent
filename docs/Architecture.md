@@ -435,7 +435,7 @@ Outcomes also carry `action_id`, `action_status` and `authority_version` (all `n
 **Guarantees and limits**
 - **Durable continuation with at-least-once node execution.** A node interrupted mid-run (for example an LLM call) runs again on resume. A node whose writes were stored before the process died is not re-run; its stored result is reapplied. Completion is decided from `snapshot.tasks`, not `snapshot.next`.
 - **Not exactly-once between graph completion and business state.** If the process dies after the graph reaches END but before supplier state is written, the checkpoint already shows completion. RESUME then returns `already_completed` and that state write is lost.
-- **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent. (The action ledger does stop the governed action itself from being claimed twice; see Phase 3D.) This is separate from cross-thread business deduplication; see [Action eligibility](#action-eligibility-assess-before-act).
+- **Concurrent RESUME of the same thread:** handled by same-thread ownership, which is implemented and tested locally but **not deployed** (`docs/SAME_THREAD_OWNERSHIP_DESIGN.md`). Under ownership, a second executor is `contended`, and a stale one is fenced out of every durable workflow mutation. Until rollout (§16 there), the deployed executors run pre-ownership code, where two executors can both run `analyze` and both write supplier state. Cross-thread business deduplication is separate and unresolved; see [Action eligibility](#action-eligibility-assess-before-act).
 - **RESUME does not rewrite workflow state.** The attempt's `trace_id` travels in config (`configurable.trace_id`) and is recorded in each checkpoint's metadata. State `trace_id` stays the starting attempt's. Earlier versions stamped it with `update_state`, which re-ran the last node's routing under the current graph.
 - **`executor_id` is audit only** (`AWS_LAMBDA_LOG_STREAM_NAME`, or `host:pid` locally). A warm Lambda environment can run several attempts.
 - **Not handled yet:** checkpoint TTL/cleanup, batching checkpoint writes (one run is roughly 80 `PutItem` calls), and a concurrency lease.
@@ -1310,6 +1310,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] F2d: Phase 3F documentation
 - [ ] Separation of duties and IAM-level enforcement of authority (operator vs agent principals)
 - [x] DR1: two-process resume after checkpointed analysis; no retrieval, embedding or model call on resume (`DR1-20261030T232053Z`)
+- [x] Same-thread ownership: lease with monotonic epochs, fenced checkpoints, pending writes, actions and finalization, once-only `final` marker, recovery and legacy rules, lineage-bound outcomes; R1–R4 protected across processes (local only; **not deployed**; X1 and `IN_FLIGHT` reconciliation open)
 - [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); AWS: suppressed route verified manually (`thread-68cb0fe1…`), action-eligible route pending
 
 ## Data Models and Storage

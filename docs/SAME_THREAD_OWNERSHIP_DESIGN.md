@@ -1,6 +1,6 @@
 # Same-Thread Ownership: Design (Draft)
 
-**Status:** draft. **Slice 1 is implemented and tested locally:** the lease, and fenced checkpoint and pending writes with retries (§14). Action fencing, finalization, compatibility and lifecycle integration are **not** implemented, so end-to-end same-thread ownership is **not** complete. No IAM, schema, infrastructure or AWS change has been made.
+**Status:** **implemented and tested locally, not deployed.** Slices 1 and 2 (§14, §15) cover the lease, fenced checkpoint and pending writes, the fenced action ledger, once-only finalization, recovery, legacy compatibility, lineage-bound outcomes and lifecycle integration. **Nothing has run against AWS.** No IAM, schema, infrastructure or deployment change has been made. Same-thread ownership is complete locally; in AWS it is not in effect until the rollout in §16 is done.
 **Baseline:** `assess-before-act` at `2517e9a`. The races this design addresses are reproduced in `tests/test_concurrent_resume.py`; see "Concurrent resume reproduction (local)" in `docs/Architecture.md`.
 
 **Goal:** at most one owner executes and mutates a checkpointed thread at a time. A stale owner cannot change durable workflow state after another owner takes over.
@@ -342,4 +342,76 @@ The SQLite stand-ins get extended with `lease` and `final` and these conditions,
 5. **Lineage-bound outcomes (§9)** and the new `workflow_event` values for trace consumers.
 6. **Converting the R1–R4 strict xfails** to regressions through the integrated lifecycle.
 7. **Approvals, then rollout:** schema, IAM and transaction cost; deploying fenced code everywhere before adoption (§6).
+
+## 15. Slice 2: lifecycle integration (implemented and tested locally)
+
+- **`risk_workflow.start_workflow` / `resume_workflow`:**
+  - START creates the lease (epoch 1). RESUME acquires it or returns `contended`, running and writing nothing.
+  - The token (owner = attempt `trace_id`, epoch) travels in `configurable`.
+  - A heartbeat renews the lease for the whole attempt.
+  - Shutdown follows §8. `saver.lost` is checked on every exit path, including while another exception propagates. Lost ownership becomes `lease_lost`: no finalization, no successful outcome, no release.
+- **Production dependencies** (`checkpoint_dependencies_from_env`):
+  - Always owned: fenced saver, fenced ledger (`lease_table`), `LeaseStore` (`LEASE_TTL_MS`, default 120 s) and `FinalizationStore`.
+  - They refuse to run unless `RISK_STATE_BACKEND` and `TRACE_STORE_BACKEND` are `dynamodb`. There is no fallback to unfenced writes. Missing permissions surface as AWS errors at the first fenced operation.
+  - The unfenced lifecycle is reachable only with an explicit `unfenced_baseline=True`, which is used by baseline tests.
+- **Action ledger:**
+  - Admission, replay and denial are fenced.
+  - Completion is not fenced, so an admitted effect's completion is recorded even after ownership loss. The stale worker still can't advance the graph, because its next write is fenced out.
+  - `ActionInFlight` becomes the `action_in_flight` outcome.
+- **Finalization:**
+  - The marker and the supplier row are one transaction; the completion trace is write-once.
+  - RESUME with no pending tasks follows §7 exactly: report from the marker; recover the trace with the original `trace_id`; recover finalization when the final checkpoint carries `lease_epoch`; otherwise apply the legacy rule in §6.
+  - Evidence and recovery look traces up **by exact `trace_id`** (`get_by_trace_id`), never through the alert-ID index.
+- **Lineage:** outcomes come from the attempt's own last checkpoint, or from the marker for `already_completed`. Traces carry `lease_epoch` and `lineage_checkpoint_id`.
+- **Surfaces:**
+  - Worker exit codes: 5 `contended`, 6 `lease_lost` or `action_in_flight`, 7 `completion_unverified`, 8 `attempt_failed`.
+  - Lambda: 409 for `contended`, `lease_lost`, `action_in_flight` and `completion_unverified`; 500 for `attempt_failed`.
+  - Trace consumers (Python and web) treat `lease_lost`, `action_in_flight`, `attempt_failed` and `completion_unverified` as incomplete.
+- **Tests:**
+  - `tests/test_owned_lifecycle.py` (moto, in-process).
+  - `tests/test_ownership_storage.py` (ledger, finalization and traces).
+  - `tests/test_ownership_processes.py` and `tests/test_protected_races.py`: separate processes on persistent SQLite stand-ins. These cover R1–R4 protected, the stale owner, and kills K3 and K4.
+  - The unfenced R1–R4 reproductions remain explicit baselines in `tests/test_concurrent_resume.py`.
+  - X1 remains a strict xfail in both baseline and owned runs.
+
+**Remaining limits (not addressed by this milestone):**
+- X1, cross-thread business deduplication.
+- `IN_FLIGHT` reconciliation.
+- Clock skew in lease expiry: wasted work, never a second durable mutation.
+- Audit traces for `lease_lost` and `attempt_failed` are not fenced.
+- JSONL `append_once` is not atomic across processes. Production requires DynamoDB traces.
+- The late-load behavior recorded in `2517e9a` is no longer reachable under ownership (the late worker is `contended`), but it remains unexplained for the unfenced baseline.
+- C2b's local tests characterize the **unfenced** baseline's crash recovery. Owned crash recovery is covered by K3, K4 and the process tests.
+
+## 16. AWS preflight and rollout (not done)
+
+**Every executor needs these permissions.** The table rows are what the owned lifecycle calls today:
+
+| Table | Operations | Lambda role today | `RiskAgentGovernedWorkerRole` today |
+|---|---|---|---|
+| `risk_agent_checkpoints` | `Query`, `GetItem`, `PutItem`, `UpdateItem`, `ConditionCheckItem` (the lease, `final`, `chk#`, `wr#`); `DeleteItem` only for operator `delete_thread` | `Query`, `PutItem` only: **add** `GetItem`, `UpdateItem`, `ConditionCheckItem` | none: **add all** |
+| `supplier_risk_state` | `GetItem` (consistent read), `PutItem` (inside the finalization transaction) | ✓ | none: **add** |
+| `risk_traces` | `PutItem` (conditional), `GetItem` (by `trace_id`) | ✓ | none: **add** |
+| `risk_agent_actions` | `GetItem`, `UpdateItem` (claim, replay, deny and complete, partly inside transactions), keys `action#thread-*` | none: **add** (also needs `AUTHORITY_TABLE` and `ACTIONS_TABLE` in its environment) | `action#probe-*` only: **extend the keys** |
+| `risk_agent_authority` | `GetItem`, `ConditionCheckItem` (`agent#…`, `policy#…`) | none: **add** | ✓ |
+
+**Preflight, read-only, before any run:**
+1. Confirm the deployed image digest and environment. Lambda already sets both backends to `dynamodb`. Workers use `docker/worker.env`.
+2. List checkpointed threads that have no `lease` item.
+3. Classify each:
+   - **Paused** (pending tasks): it will be adopted.
+   - **Completed:** it will be recognized from evidence, or reported `completion_unverified`.
+4. Spot-check E1–E4 (§6) for the completed ones, using `get_by_trace_id` on `risk_traces`.
+5. Confirm the Lambda timeout (123 s) against `LEASE_TTL_MS` (120 s). A Lambda killed at its timeout releases nothing, so its lease expires about 2 minutes later, and a retry inside that window is `contended`.
+
+**Rollout order:**
+1. Approve the schema (the `lease` and `final` items), the IAM changes above, and the transaction cost (about twice the write units for each step and each task's writes).
+2. Apply IAM through Terraform. **Don't change live IAM by hand.**
+3. Build one image from this branch, and deploy it to **every** executor before running any owned attempt: the Lambda, containers and Kubernetes. Stop or drain anything still running pre-ownership code (§6 precondition).
+4. Run the DR1 harness and the C2b driver against dev:
+   - DR1 now exercises owned START and RESUME.
+   - C2b's c1/c3 holds run on the owned lifecycle.
+   - Record the evidence, as before.
+5. Run an owned R1 contention check on AWS: two workers, one thread. Expect one `contended`, one inference and one final marker.
+6. Only then treat legacy adoption and `completion_unverified` reports as authoritative.
 
