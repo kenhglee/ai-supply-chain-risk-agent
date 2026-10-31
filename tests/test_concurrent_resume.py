@@ -59,10 +59,11 @@ class Race:
         assert proc.returncode == 0, proc.stderr[-2000:]
         return json.loads(proc.stdout.strip().splitlines()[-1])["thread_id"]
 
-    def spawn(self, worker, role, *, gates, risk_level="High", thread_id=None):
+    def spawn(self, worker, role, *, gates, risk_level="High", thread_id=None, extra=()):
         err = open(self.base / f"{worker}.stderr", "w")
         self.procs[worker] = subprocess.Popen(
-            self._cmd(worker, role, thread_id=thread_id, risk_level=risk_level, gates=",".join(gates)),
+            self._cmd(worker, role, thread_id=thread_id, risk_level=risk_level, gates=",".join(gates))
+            + list(extra),
             cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=err)
         err.close()
 

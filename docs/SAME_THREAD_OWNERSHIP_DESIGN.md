@@ -1,6 +1,6 @@
 # Same-Thread Ownership: Design (Draft)
 
-**Status:** draft for review. Nothing here is implemented. No IAM, schema or infrastructure change has been made.
+**Status:** draft. **Slice 1 is implemented and tested locally:** the lease, and fenced checkpoint and pending writes with retries (§14). Action fencing, finalization, compatibility and lifecycle integration are **not** implemented, so end-to-end same-thread ownership is **not** complete. No IAM, schema, infrastructure or AWS change has been made.
 **Baseline:** `assess-before-act` at `2517e9a`. The races this design addresses are reproduced in `tests/test_concurrent_resume.py`; see "Concurrent resume reproduction (local)" in `docs/Architecture.md`.
 
 **Goal:** at most one owner executes and mutates a checkpointed thread at a time. A stale owner cannot change durable workflow state after another owner takes over.
@@ -127,6 +127,11 @@ Notation:
 - **Why not finalize when evidence is missing:** before this protocol, a crash between END and the state write lost the write, and a crash after it left no trace. The two cases can't be told apart from the trace store, and finalizing could apply a business change twice. The supplier row isn't used as evidence, because other threads overwrite it.
 - **Expected scope:** runs whose traces went only to local JSONL (the default before DynamoDB traces) report `completion_unverified`. That is the intended conservative result.
 
+**Precondition for any legacy adoption: stop every unfenced worker first.** A worker running code from before this protocol writes checkpoints and pending writes without the lease check. Adoption creates a lease, but that lease cannot fence a worker that never checks it. Until all such workers (the Lambda image, containers, sessions) are stopped or upgraded, two writers can still interleave on an adopted thread. Rollout order:
+1. Deploy fenced code everywhere.
+2. Drain or stop the old workers.
+3. Only then rely on adoption.
+
 **Legacy paused or parked threads** (pending tasks remain) are adopted and continue normally under the lease.
 - Their pending writes were stored without fencing. They're reused as today, and the attempt's trace carries `legacy_pending_writes = true`.
 - Threads parked at `act` with no assessment keep the existing `legacy_unassessed` behavior.
@@ -145,8 +150,9 @@ Notation:
 ## 8. Shutdown ordering and cleanup
 
 **Normal completion or pause.** The steps run in this order:
-1. **Drain checkpoint writers.** `invoke()` has returned. The saver keeps a per-attempt count of in-flight writes and their errors; wait for zero with a deadline. An error recorded by a background writer is raised now and handled below.
-   - **To verify:** whether LangGraph 1.2.2 joins its background writer before `invoke()` returns. The C2b probe suggests it does. The drain step is required either way, because the lifecycle must not rely on it.
+1. **Drain checkpoint writers, then check recorded loss.** `invoke()` has returned. LangGraph 1.2.2's `BackgroundExecutor.__exit__` waits for every submitted write (checkpoint puts and `put_writes`), then re-raises the first write error, **but only if no other exception is already propagating**.
+   - So a `LeaseLost` from a background writer can be swallowed when a node also raised. This was reproduced in `test_takeover_rejects_a_stale_special_error_write_even_when_its_exception_is_swallowed`.
+   - The fenced saver therefore records every lost `(thread, owner, epoch)` in `saver.lost`. After `invoke()` returns or raises, the lifecycle must check `saver.lost` and treat any entry as `lease_lost`, whatever exception it saw.
 2. **Settle.** If paused: write the paused trace. If completed: finalization (§3, §5), then the completion trace.
 3. **Stop the heartbeat**, then join it with a deadline. It stays alive through finalization and the trace, so the lease can't expire mid-finalization.
 4. **Release conditionally** (§2).
@@ -267,8 +273,73 @@ The SQLite stand-ins get extended with `lease` and `final` and these conditions,
 
 ## 13. Open questions and limits
 
-- Whether LangGraph 1.2.2 joins its background writers before `invoke()` returns (§8, step 1).
+- ~~Whether LangGraph joins its background writers before `invoke()` returns.~~ Resolved: it does, but it may swallow their errors (§8, step 1).
 - The unexplained late-load behavior recorded in `2517e9a`. It should be re-run under the protocol, where the late worker would be `contended`.
 - TTL choice (proposed 120 s) against the longest step, and against Lambda's timeout.
 - **Approval required before implementation:** the schema (two new item types), IAM (§10), and the transaction cost.
 - **Out of scope here:** X1 and `IN_FLIGHT` reconciliation; operator resolution of `completion_unverified`; fencing of audit traces.
+
+## 14. Slice 1: implemented and tested locally
+
+**Implemented:**
+- **`app/storage/thread_lease.py`:**
+  - `LeaseStore`: acquire, renew and release, with the conditions in §2, monotonic epochs, an injectable clock, and read-back after unknown outcomes.
+  - `LeaseHeartbeat`.
+  - Errors: `LeaseContended`, `LeaseLost`, `OwnershipRequired`, `WriteConflict` and `WriteOutcomeUnknown`.
+- **`DynamoCheckpointSaver(fenced=True)`:**
+  - Each checkpoint put, and each task's full write batch (regular and special), is one transaction with the lease check.
+  - Retries follow §5: one serialized payload, a deterministic `ClientRequestToken`, classification of lost ownership, data conflicts, transaction conflicts, throttling and unknown outcomes, and read-back verification of the complete batch.
+  - `saver.lost` records ownership loss.
+  - `delete_thread` keeps the `lease` and `final` items.
+- **Unfenced mode stays the default.** The workflow lifecycle, Lambda handler and worker still use it, so their behavior is unchanged.
+
+**Verified against LangGraph 1.2.2:**
+- **One `put_writes` call per task per attempt**, holding all of that task's writes:
+  - success: regular writes, or `__no_writes__`;
+  - error: the writes so far plus `__error__` (and `__error_source_node__` when routed to an error handler);
+  - interrupt: `__interrupt__` plus `__resume__`.
+- **The same task can be written again in a later attempt** under the same checkpoint. A denied `act` stored `__error__`, and a later successful `act` stored 13 regular writes. So batch verification covers only that batch's own indexes. An earlier special write of the same task may coexist with it.
+- **The batch limit is 99 per task** (the lease check takes one transaction item); the largest observed is 14.
+- **LangGraph does not retry `put_writes` itself.**
+- **`put` and `put_writes` run concurrently** on different background threads. Fenced transactions use a dedicated low-level client (boto3 clients are thread-safe) with explicit serialization. The concurrent-transaction failure seen while testing was in moto's in-memory backend, not in the client.
+
+**Tests:**
+- **`tests/test_thread_lease.py`** (moto, in-process):
+  - lease lifecycle;
+  - epochs never reset across release;
+  - expired-owner renewal;
+  - heartbeat;
+  - takeover rejecting stale checkpoint, pending and special writes;
+  - writes stored before takeover remaining readable and reused by the compiled graph without re-inference;
+  - lost acknowledgments, with no duplicate and no corruption;
+  - partial or different batches as conflicts;
+  - retried transaction conflicts and throttling;
+  - unknown outcomes;
+  - non-retried request errors.
+- **`tests/test_ownership_processes.py`** (separate processes, persistent SQLite stand-ins with the same conditions):
+  - two simultaneous acquisitions yield one owner, and the contender does no inference;
+  - takeover rejects the stale owner's pending and checkpoint writes;
+  - a stale `__error__` write is rejected even when its exception is swallowed;
+  - writes stored before takeover are reused without re-inference;
+  - release and reacquisition give epochs 1, 2, 3.
+
+**Test-only accommodations:**
+- moto doesn't implement `ClientRequestToken` idempotency, so retries are verified by read-back. Real DynamoDB may acknowledge them directly.
+- moto's `transact_write_items` isn't safe against concurrent transactions, so the moto tests serialize them with a test-only lock. Production code has none.
+- Acquisition in the process tests happens in the harness, because the lifecycle doesn't acquire yet.
+- The unprotected race reproduction (`tests/test_concurrent_resume.py`) is unchanged and still demonstrates today's races.
+
+**Remaining before end-to-end ownership can be claimed:**
+1. **Lifecycle integration:**
+   - `start_workflow` and `resume_workflow` acquire the lease and pass the token in `configurable`;
+   - the fenced saver is enabled in `checkpoint_dependencies_from_env`;
+   - heartbeat;
+   - the §8 shutdown order, including the `saver.lost` check;
+   - the `contended` and `lease_lost` outcomes, exit codes and Lambda 409.
+2. **Action fencing:** lease checks in admission, replay and denial; `action_in_flight` as an outcome.
+3. **Finalization:** the once-only `final` marker in the finalization transaction; recovery after END; trace recovery.
+4. **Compatibility:** legacy recognition and `completion_unverified` (§6).
+5. **Lineage-bound outcomes (§9)** and the new `workflow_event` values for trace consumers.
+6. **Converting the R1–R4 strict xfails** to regressions through the integrated lifecycle.
+7. **Approvals, then rollout:** schema, IAM and transaction cost; deploying fenced code everywhere before adoption (§6).
+

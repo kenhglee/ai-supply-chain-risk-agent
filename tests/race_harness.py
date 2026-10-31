@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS actions (
   action_id TEXT PRIMARY KEY, status TEXT, thread_id TEXT, claimed_by_trace_id TEXT,
   attempt_count INTEGER, subject TEXT, effect TEXT, created_at TEXT, completed_at TEXT);
 CREATE TABLE IF NOT EXISTS claim_attempts (action_id TEXT, trace_id TEXT, outcome TEXT, at TEXT);
+CREATE TABLE IF NOT EXISTS lease (
+  thread_id TEXT PRIMARY KEY, epoch INTEGER, state TEXT, owner TEXT, expires_at_ms INTEGER);
+CREATE TABLE IF NOT EXISTS fenced_log (
+  kind TEXT, thread_id TEXT, checkpoint_id TEXT, task_path TEXT, owner TEXT, epoch INTEGER,
+  outcome TEXT, at TEXT);
 """
 
 
@@ -189,6 +194,118 @@ class SqliteCheckpointSaver(BaseCheckpointSaver):
                              (thread_id, checkpoint_id, task_id, task_path, writer, cur.rowcount, int(idx < 0), _now()))
 
 
+class SqliteLeaseStore:
+    """Lease rules of app.storage.thread_lease.LeaseStore, in one SQLite IMMEDIATE transaction each."""
+
+    def __init__(self, path: Path, ttl_ms: int):
+        self.path, self.ttl_ms = path, ttl_ms
+
+    def acquire(self, thread_id: str, owner: str):
+        from app.storage.thread_lease import HELD, Lease, LeaseContended
+
+        now = int(time.time() * 1000)
+        conn = connect(self.path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT epoch, state, owner, expires_at_ms FROM lease WHERE thread_id=?",
+                               (thread_id,)).fetchone()
+            if row and row[1] == HELD and row[3] >= now:
+                conn.execute("ROLLBACK")
+                raise LeaseContended(thread_id, {"epoch": row[0], "owner": row[2], "expires_at_ms": row[3]})
+            epoch = (row[0] if row else 0) + 1
+            conn.execute("INSERT OR REPLACE INTO lease VALUES (?,?,?,?,?)",
+                         (thread_id, epoch, HELD, owner, now + self.ttl_ms))
+            conn.execute("COMMIT")
+            return Lease(thread_id, owner, epoch, now + self.ttl_ms)
+        finally:
+            conn.close()
+
+    def release(self, lease) -> bool:
+        with connect(self.path) as conn:
+            cur = conn.execute("UPDATE lease SET state='RELEASED' WHERE thread_id=? AND owner=? AND epoch=?",
+                               (lease.thread_id, lease.owner, lease.epoch))
+            return cur.rowcount == 1
+
+    def read(self, thread_id: str) -> dict | None:
+        with connect(self.path) as conn:
+            row = conn.execute("SELECT epoch, state, owner, expires_at_ms FROM lease WHERE thread_id=?",
+                               (thread_id,)).fetchone()
+        return dict(zip(("epoch", "state", "owner", "expires_at_ms"), row)) if row else None
+
+
+class FencedSqliteCheckpointSaver(SqliteCheckpointSaver):
+    """Fenced writes (DynamoCheckpointSaver fenced=True): the lease check and the
+    write commit together in one IMMEDIATE transaction. Retry and read-back are
+    exercised against DynamoDB (moto), not here."""
+
+    def __init__(self, path: Path):
+        super().__init__(path)
+        self.lost: dict = {}
+
+    def _fenced(self, config, kind, task_path, write):
+        from app.storage.thread_lease import HELD, LeaseLost, OwnershipRequired
+
+        c = config["configurable"]
+        if not c.get("lease_owner") or c.get("lease_epoch") is None:
+            raise OwnershipRequired("fenced write without lease_owner/lease_epoch")
+        token = (c["thread_id"], c["lease_owner"], int(c["lease_epoch"]))
+        if token in self.lost:
+            raise self.lost[token]
+        conn = connect(self.path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT owner, epoch, state FROM lease WHERE thread_id=?", (token[0],)).fetchone()
+            owned = bool(row) and row[0] == token[1] and row[1] == token[2] and row[2] == HELD
+            log = (kind, token[0], c.get("checkpoint_id"), task_path, token[1], token[2])
+            if not owned:
+                conn.execute("INSERT INTO fenced_log VALUES (?,?,?,?,?,?,?,?)", (*log, "rejected", _now()))
+                conn.execute("COMMIT")
+                self.lost[token] = LeaseLost(token[0], token[1], token[2], kind)
+                raise self.lost[token]
+            result = write(conn)
+            conn.execute("INSERT INTO fenced_log VALUES (?,?,?,?,?,?,?,?)", (*log, "stored", _now()))
+            conn.execute("COMMIT")
+            return result
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def put(self, config, checkpoint, metadata, new_versions):
+        thread_id, ns = config["configurable"]["thread_id"], self._ns(config)
+        metadata = get_checkpoint_metadata(config, metadata)
+        ctype, cblob = self.serde.dumps_typed(checkpoint)
+        mtype, mblob = self.serde.dumps_typed(metadata)
+
+        def write(conn):
+            conn.execute("INSERT INTO checkpoints VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                         (thread_id, ns, checkpoint["id"], config["configurable"].get("checkpoint_id"),
+                          metadata.get("step"), metadata.get("trace_id"), ctype, cblob, mtype, mblob, _now()))
+        self._fenced({**config, "configurable": {**config["configurable"], "checkpoint_id": checkpoint["id"]}},
+                     "checkpoint", None, write)
+        return {"configurable": {"thread_id": thread_id, "checkpoint_ns": ns, "checkpoint_id": checkpoint["id"]}}
+
+    def put_writes(self, config, writes, task_id, task_path=""):
+        thread_id, ns = config["configurable"]["thread_id"], self._ns(config)
+        checkpoint_id = config["configurable"]["checkpoint_id"]
+        writer = config["configurable"].get("trace_id")
+
+        def write(conn):
+            for i, (channel, value) in enumerate(writes):
+                idx = WRITES_IDX_MAP.get(channel, i)
+                vtype, vblob = self.serde.dumps_typed(value)
+                verb = "INSERT OR REPLACE" if idx < 0 else "INSERT OR IGNORE"
+                cur = conn.execute(f"{verb} INTO writes VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                   (thread_id, ns, checkpoint_id, task_id, idx, task_path, channel, vtype, vblob,
+                                    writer))
+                conn.execute("INSERT INTO write_attempts VALUES (?,?,?,?,?,?,?,?)",
+                             (thread_id, checkpoint_id, task_id, task_path, writer, cur.rowcount, int(idx < 0),
+                              _now()))
+        self._fenced(config, "writes", task_path, write)
+
+
 class SqliteRiskStateStore:
     """Read, then unconditional whole-row put (DynamoRiskStateStore semantics)."""
 
@@ -287,6 +404,11 @@ def run_child(argv: list[str]) -> int:
     parser.add_argument("--risk-level", default="High")
     parser.add_argument("--pause-before", default="")
     parser.add_argument("--gates", default="")
+    # Ownership mode: acquire the thread's lease first (harness-side; the
+    # lifecycle does not acquire yet) and run with the fenced saver.
+    parser.add_argument("--ownership", action="store_true")
+    parser.add_argument("--lease-ttl-ms", type=int, default=120_000)
+    parser.add_argument("--fail-analyze", action="store_true", help="raise inside analyze after its gates")
     args = parser.parse_args(argv)
 
     os.environ["RISK_STATE_BACKEND"] = "csv"  # unused: stores are injected
@@ -326,6 +448,11 @@ def run_child(argv: list[str]) -> int:
             log.emit("model_invoke", risk_level=args.risk_level)
             return json.dumps({**RISK_ALERT, "risk_level": args.risk_level})
 
+    def failing_analyze_point():
+        if args.fail_analyze:
+            log.emit("analyze_raising")
+            raise RuntimeError("injected analyze failure")
+
     retriever = SimpleNamespace(retriever_id="fake", retriever_version="v0", embedding_provider="fake", top_k=2,
                                 retrieve=lambda q, s: SimpleNamespace(context="TSMC fabs are in Taiwan."))
     agent._triage_llm, agent._risk_llm = Triage(), Risk()
@@ -358,6 +485,7 @@ def run_child(argv: list[str]) -> int:
         result = original_analyze(state)
         log.emit("analyze_return", risk_level=result["alert"].get("risk_level"))
         gate("after-analyze")
+        failing_analyze_point()
         return result
 
     agent.analyze_risk = analyze
@@ -398,9 +526,43 @@ def run_child(argv: list[str]) -> int:
 
     risk_workflow.finalize_completed_run = finalize
 
-    deps = {"checkpointer": SqliteCheckpointSaver(db), "risk_store": SqliteRiskStateStore(db),
-            "action_gate": SqliteActionGate(db)}
-    log.emit("attempt_start", role=args.role, thread_id=args.thread_id)
+    saver = FencedSqliteCheckpointSaver(db) if args.ownership else SqliteCheckpointSaver(db)
+    deps = {"checkpointer": saver, "risk_store": SqliteRiskStateStore(db), "action_gate": SqliteActionGate(db)}
+    log.emit("attempt_start", role=args.role, thread_id=args.thread_id, ownership=args.ownership)
+
+    lease = None
+    if args.ownership:
+        from app.storage.thread_lease import LeaseContended, LeaseLost
+        import uuid as _uuid
+
+        leases = SqliteLeaseStore(db, args.lease_ttl_ms)
+        gate("before-acquire")
+        try:
+            lease = leases.acquire(args.thread_id, f"owner-{worker}-{_uuid.uuid4().hex[:8]}")
+        except LeaseContended as exc:
+            log.emit("contended", holder_epoch=exc.holder.get("epoch"), holder=exc.holder.get("owner"))
+            return 5
+        log.emit("acquired", epoch=lease.epoch, owner=lease.owner)
+        original_config = risk_workflow._config
+
+        def owned_config(thread_id, trace_id=None):
+            cfg = original_config(thread_id, trace_id)
+            cfg["configurable"].update(lease_owner=lease.owner, lease_epoch=lease.epoch)
+            return cfg
+
+        risk_workflow._config = owned_config
+
+        # Hold point after analyze's writes are stored, before the next checkpoint
+        # (the main thread waits on that put). Recognized by checkpoint contents.
+        original_put = saver.put
+
+        def put(config, checkpoint, metadata, new_versions):
+            steps = checkpoint["channel_values"].get("trace_steps") or []
+            if steps and steps[-1]["node_name"] == "analyze":
+                gate("after-analyze-writes")
+            return original_put(config, checkpoint, metadata, new_versions)
+
+        saver.put = put
     try:
         if args.role == "start":
             outcome = risk_workflow.start_workflow(
@@ -409,9 +571,14 @@ def run_child(argv: list[str]) -> int:
         else:
             outcome = risk_workflow.resume_workflow(args.thread_id, **deps)
     except Exception as exc:  # report, then fail the process as an unhandled error would
-        log.emit("attempt_error", error_type=type(exc).__name__, error=str(exc)[:300])
+        log.emit("attempt_error", error_type=type(exc).__name__, error=str(exc)[:300],
+                 ownership_lost=[list(k) for k in getattr(saver, "lost", {})])
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        if args.ownership and type(exc).__name__ == "LeaseLost":
+            return 6
         return EXIT_ERROR
+    if lease is not None:
+        log.emit("released", ok=leases.release(lease), epoch=lease.epoch)
     log.emit("attempt_exit", **{k: outcome.get(k) for k in (
         "status", "thread_id", "trace_id", "next", "change_type", "state_written", "risk_level",
         "eligibility_change_type", "action_eligible", "action_id", "action_status")})
