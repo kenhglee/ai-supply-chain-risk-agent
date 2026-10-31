@@ -174,19 +174,21 @@ def test_c3_langgraph_reuses_stored_writes_without_rerunning_analysis(tmp_path):
     _assert_no_content_recorded(run.events)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Known defect found by C2b c3: resume_workflow treats get_state().next == () as completed, but "
-    "after a kill between a node's stored writes and the next checkpoint, next is () while the node's "
-    "task still holds a result. RESUME returns already_completed and the workflow never finishes."))
 def test_c3_lifecycle_resume_continues_from_stored_writes(tmp_path):
+    """Regression: RESUME used to report already_completed here (next=() with analyze's result stored)."""
     run = Run(tmp_path)
     thread_id, _ = _c3_killed(run)
     run.snapshot(thread_id, "after-kill")
 
     resumed = run.attempt(thread_id)
 
-    assert resumed["status"] == "completed"
-    assert run.verdict(thread_id, "c3")["checks"]["lifecycle_resume_continues_from_stored_writes"]["ok"]
+    assert (resumed["status"], resumed["eligibility_change_type"]) == ("completed", "suppressed")
+    assert resumed["state_written"] is True
+    result = run.verdict(thread_id, "c3")
+    failed = {k: v for k, v in result["checks"].items() if not v["ok"] and k != "langgraph_reuses_stored_writes"}
+    assert not failed, failed  # the LangGraph diagnostic was not run in this test
+    assert result["checks"]["lifecycle_resume_continues_from_stored_writes"]["ok"]
+    _assert_no_content_recorded(run.events)
 
 
 # ---- Unit tests (in-process; nothing is killed) ----

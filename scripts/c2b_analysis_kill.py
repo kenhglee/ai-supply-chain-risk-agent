@@ -20,14 +20,13 @@ Windows covered (transport-level holds and in-flight termination are deferred):
                          reapplies the stored writes: analyze does not run
                          again and there is no new inference.
 
-                         Finding (local): the lifecycle does not continue such
-                         a thread. get_state() reports next=() with the
-                         analyze task already holding a result, and
-                         resume_workflow treats an empty next as completed, so
-                         RESUME returns already_completed and validate, assess
-                         and the supplier-state write never run. The c3
-                         verdict checks the lifecycle and LangGraph separately
-                         (attempt --direct-invoke), so this stays visible.
+                         get_state() then reports next=() while the analyze
+                         task already holds a result. The c3 control found
+                         that resume_workflow treated that as completed
+                         (already_completed); completion is now decided from
+                         snapshot.tasks. The c3 verdict still checks the
+                         lifecycle and LangGraph (attempt --direct-invoke)
+                         separately.
 
 What the holds prove: c1 shows at-least-once re-execution with duplicate
 inference after the client received a complete response. It is not an

@@ -433,7 +433,7 @@ Outcomes also carry `action_id`, `action_status` and `authority_version` (all `n
 - Only the sync API is implemented: `get_tuple`, `put`, `put_writes`, thread-scoped `list`, and `delete_thread`.
 
 **Guarantees and limits**
-- **Durable continuation with at-least-once node execution.** A node interrupted mid-run (for example an LLM call) runs again on resume.
+- **Durable continuation with at-least-once node execution.** A node interrupted mid-run (for example an LLM call) runs again on resume. A node whose writes were stored before the process died is not re-run; its stored result is reapplied. Completion is decided from `snapshot.tasks`, not `snapshot.next`.
 - **Not exactly-once between graph completion and business state.** If the process dies after the graph reaches END but before supplier state is written, the checkpoint already shows completion. RESUME then returns `already_completed` and that state write is lost.
 - **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent. (The action ledger does stop the governed action itself from being claimed twice; see Phase 3D.) This is separate from cross-thread business deduplication; see [Action eligibility](#action-eligibility-assess-before-act).
 - **RESUME does not rewrite workflow state.** The attempt's `trace_id` travels in config (`configurable.trace_id`) and is recorded in each checkpoint's metadata. State `trace_id` stays the starting attempt's. Earlier versions stamped it with `update_state`, which re-ran the last node's routing under the current graph.
@@ -1177,7 +1177,10 @@ This verifies only the `suppressed` (no-action) route on AWS. **Live verificatio
   - The hold sits in the checkpoint `put`, which the main thread waits on. A hold in the background writer does not stop the graph: in a probe, `validate`, `assess` and later checkpoints ran during it.
   - Nothing downstream ran during the hold.
   - LangGraph itself reuses the stored writes. A direct `invoke(None)` diagnostic continued without running `analyze` or calling the model.
-  - **The lifecycle did not.** `get_state()` reports `next=()` while the `analyze` task still holds its result. `resume_workflow` treated an empty `next` as completed and returned `already_completed`, so `validate`, `assess` and the supplier-state write never ran.
+  - **The lifecycle did not, and this is now fixed.** `get_state()` reports `next=()` while the `analyze` task still holds its result. `resume_workflow` treated an empty `next` as completed and returned `already_completed`, so `validate`, `assess` and the supplier-state write never ran.
+  - **The fix.** `risk_workflow._has_pending_tasks` decides completion from `snapshot.tasks`, both in `resume_workflow` and in `_settle`'s paused-versus-completed branch. In LangGraph 1.2.x, `tasks` holds every task scheduled from the latest checkpoint. `next` omits tasks whose writes are already stored; error and interrupt writes don't count as stored, so a denied `act` stays in `next`.
+  - **Behavior now.** A thread killed after a node's writes are stored resumes without re-running that node. The same holds for `act`: the stored action result is reused, and the action does not run again.
+  - **Regression tests.** `tests/test_risk_workflow.py` simulates the crash with a checkpoint `put` that fails after the target node's writes are stored, for both `analyze` and `act`. The c3 subprocess test now passes.
 
 Transport-level holds and in-flight termination are deferred.
 
@@ -1192,7 +1195,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] C1: local Docker runtime portability (Lambda START → Docker RESUME, same image digest)
   - [x] C2a: Kubernetes executor replacement (Pod A START → delete → Pod B RESUME → Pod C no-op)
   - [x] C2+: whole-cluster destruction/recreation (`risk-c2` deleted → `risk-c2-resume` completes the workflow)
-  - [ ] C2b: force-kill mid-node. Local driver: c1 passes; the c3 control exposed a lifecycle completion defect (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b-local)); not run against AWS
+  - [ ] C2b: force-kill mid-node. Local driver: c1 passes; the c3 control exposed a lifecycle completion defect, now fixed (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b-local)); not run against AWS
   - [x] Same external state model preserved across Lambda, Docker and Kubernetes executors
 - [ ] Workload identity for the worker (least privilege, no developer credentials)
 - [x] 3D1: authority store, transactional action ledger, governed `act` node, fail-closed configuration, `session` worker (proven under moto)

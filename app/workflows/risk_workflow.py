@@ -94,6 +94,19 @@ def _gate(action_gate):
     return action_gate if action_gate is not None else UnconfiguredActionGate()
 
 
+def _has_pending_tasks(snapshot) -> bool:
+    """Whether the thread still has work, i.e. is not complete.
+
+    In LangGraph 1.2.x, StateSnapshot.tasks holds every task scheduled from
+    the latest checkpoint, while StateSnapshot.next names only those without
+    stored successful writes. If a process dies after a node's writes are
+    stored but before the next checkpoint, next is () while that node's task
+    still holds its result; invoke(None) reapplies the writes without
+    re-running the node. Only an empty tasks tuple means the graph reached END.
+    """
+    return bool(snapshot.tasks)
+
+
 def _config(thread_id: str, trace_id: str | None = None) -> dict:
     configurable = {"thread_id": thread_id}
     if trace_id:
@@ -160,7 +173,7 @@ def _settle(app, thread_id: str, trace_id: str, risk_store, *,
     snapshot = app.get_state(cfg)
     trace_extras = {"thread_id": thread_id, "executor_id": get_executor_id()}
 
-    if snapshot.next:
+    if _has_pending_tasks(snapshot):
         append_risk_trace(build_trace_record(
             snapshot.values,
             alert_id=snapshot.values["alert_id"],
@@ -270,7 +283,7 @@ def resume_workflow(thread_id: str, *, checkpointer, risk_store, action_gate=Non
 
     app = build_app(checkpointer, action_gate=_gate(action_gate), risk_reader=risk_store)
     snapshot = app.get_state(cfg)
-    if not snapshot.next:
+    if not _has_pending_tasks(snapshot):
         # The attempt that completed it: checkpoint metadata, else (older threads) state.
         last_trace_id = (snapshot.metadata or {}).get("trace_id") or snapshot.values.get("trace_id")
         return _outcome(ALREADY_COMPLETED, thread_id=thread_id,

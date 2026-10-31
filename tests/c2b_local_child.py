@@ -25,8 +25,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
-os.environ["RISK_STATE_BACKEND"] = "csv"
-os.environ["TRACE_STORE_BACKEND"] = "jsonl"
 
 from langchain_core.messages import AIMessage  # noqa: E402
 from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
@@ -112,6 +110,9 @@ def seed_state_csv(path: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
+    # Set only in the child process (importing this module from a test must not change env).
+    os.environ["RISK_STATE_BACKEND"] = "csv"
+    os.environ["TRACE_STORE_BACKEND"] = "jsonl"
     base = Path(os.environ["C2B_DIR"])
     state_csv = base / "risk_state.csv"
     seed_state_csv(state_csv)

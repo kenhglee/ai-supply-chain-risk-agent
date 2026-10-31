@@ -660,3 +660,140 @@ def test_harness_resume_checks_accept_both_resume_shapes(env, prior_level):
     assert _all_ok(checks), {k: v for k, v in checks.items() if not v["ok"]}
     expected_tail = ["validate", "assess"] if prior_level else ["validate", "assess", "act"]
     assert checks["b_reused_checkpointed_steps"]["detail"]["b_trace_nodes"][4:] == expected_tail
+
+
+# ---- Completion detection: pending node writes without a newer checkpoint ----
+# In-process simulation: the saver raises on the checkpoint put that follows
+# the target node's stored writes, which leaves the durable state a crash at
+# that point would leave. The process-kill version is tests/test_c2b_driver.py.
+
+class SimulatedCrash(Exception):
+    pass
+
+
+def _crash_after_writes_of(saver, node: str):
+    """Make saver fail the checkpoint that follows `node`, once `node`'s writes are stored.
+
+    LangGraph writes a task's pending writes and the next checkpoint from
+    separate background threads, in no guaranteed order, so the checkpoint
+    is recognised by its contents and the put waits for the writes first.
+    """
+    import threading
+    original_put_writes, original_put = saver.put_writes, saver.put
+    stored = threading.Event()
+
+    def put_writes(config, writes, task_id, task_path=""):
+        original_put_writes(config, writes, task_id, task_path)
+        if task_path.rsplit(",", 1)[-1].strip() == node:
+            stored.set()
+
+    def put(config, checkpoint, metadata, new_versions):
+        steps = checkpoint["channel_values"].get("trace_steps") or []
+        if steps and steps[-1]["node_name"] == node:
+            assert stored.wait(10), f"{node} writes were never stored"
+            raise SimulatedCrash(f"checkpoint after {node} not written")
+        return original_put(config, checkpoint, metadata, new_versions)
+
+    saver.put_writes, saver.put = put_writes, put
+    return saver
+
+
+def _governed_app():
+    deps = _new_executor()
+    return agent.build_app(deps["checkpointer"], action_gate=deps["action_gate"], risk_reader=deps["risk_store"])
+
+
+def _cfg(thread_id):
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def test_langgraph_snapshot_semantics_relied_on_by_completion_detection(env):
+    """Pins LangGraph 1.2.x: next omits tasks with stored writes; tasks lists all scheduled tasks."""
+    paused = _start_paused(env)
+    snap = _governed_app().get_state(_cfg(paused["thread_id"]))
+    assert snap.next == ("analyze",)
+    assert [(t.name, t.result is None) for t in snap.tasks] == [("analyze", True)]
+
+    env.authority.revoke(reason="incident", actor="pytest")
+    denied = risk_workflow.resume_workflow(paused["thread_id"], **_new_executor())
+    snap = _governed_app().get_state(_cfg(denied["thread_id"]))
+    assert denied["status"] == "authority_denied"
+    assert snap.next == ("act",)
+    assert [(t.name, bool(t.error)) for t in snap.tasks] == [("act", True)]
+
+    env.authority.restore(reason="resolved", actor="pytest")
+    completed = risk_workflow.resume_workflow(paused["thread_id"], **_new_executor())
+    snap = _governed_app().get_state(_cfg(paused["thread_id"]))
+    assert completed["status"] == "completed"
+    assert (snap.next, snap.tasks) == ((), ())
+
+
+def test_resume_continues_from_pending_analyze_writes_without_repeating_inference(env):
+    _seed_state("High")
+    started = _start_paused(env)  # pauses before analyze
+    deps = _new_executor()
+    _crash_after_writes_of(deps["checkpointer"], "analyze")
+    with pytest.raises(SimulatedCrash):
+        risk_workflow.resume_workflow(started["thread_id"], **deps)
+    assert _calls(env) == (1, 1, 1)  # analyze ran once and its writes were stored
+
+    snap = _governed_app().get_state(_cfg(started["thread_id"]))
+    assert snap.next == ()  # the state the old completion check misread
+    assert [(t.name, t.result is not None) for t in snap.tasks] == [("analyze", True)]
+
+    outcome = risk_workflow.resume_workflow(started["thread_id"], **_new_executor())
+
+    assert outcome["status"] == "completed"
+    assert (outcome["eligibility_change_type"], outcome["change_type"]) == ("suppressed", "suppressed")
+    assert outcome["state_written"] is True
+    assert _calls(env) == (1, 1, 1)  # no second inference, no retrieval
+    trace = _trace(outcome["trace_id"])
+    assert _nodes(trace) == ["infer", "decide", "retrieve", "analyze", "validate", "assess"]
+    assert _state_row()["last_headline"] == HEADLINE
+    assert _governed_app().get_state(_cfg(started["thread_id"])).tasks == ()
+
+
+def test_resume_reuses_completed_action_from_pending_act_writes_and_finalizes(env):
+    tickets = []
+    real_ticket = agent.create_servicenow_ticket
+    env.monkeypatch.setattr(agent, "create_servicenow_ticket",
+                            lambda event, decision: tickets.append(1) or real_ticket(event, decision))
+    deps = _new_executor()
+    _crash_after_writes_of(deps["checkpointer"], "act")
+    with pytest.raises(SimulatedCrash):
+        risk_workflow.start_workflow({"headline": HEADLINE, "alert_id": "alert-1"}, **deps)
+    [action] = env.actions.scan()["Items"]
+    assert action["status"] == "COMPLETED" and len(tickets) == 1
+    assert env.supplier_state.scan()["Items"] == []  # finalization never ran
+    thread_id = action["thread_id"]
+    snap = _governed_app().get_state(_cfg(thread_id))
+    assert snap.next == () and [(t.name, t.result is not None) for t in snap.tasks] == [("act", True)]
+
+    executes = []
+    resume_deps = _new_executor()
+    gate = resume_deps["action_gate"]
+    original_execute = gate.execute
+    gate.execute = lambda *a, **k: executes.append(1) or original_execute(*a, **k)
+    outcome = risk_workflow.resume_workflow(thread_id, **resume_deps)
+
+    assert outcome["status"] == "completed"
+    assert executes == [] and len(tickets) == 1  # act did not run again
+    assert (outcome["action_id"], outcome["action_status"]) == (action["action_id"], "COMPLETED")
+    assert (outcome["eligibility_change_type"], outcome["change_type"]) == ("new_alert", "new_alert")
+    assert outcome["state_written"] is True
+    assert _state_row()["current_risk_level"] == "High"
+    trace = _trace(outcome["trace_id"])
+    assert trace["workflow_event"] == "resumed_completed"
+    assert _nodes(trace)[-2:] == ["assess", "act"]
+    assert risk_workflow.resume_workflow(thread_id, **_new_executor())["status"] == "already_completed"
+
+
+def test_truly_completed_thread_is_still_already_completed(env):
+    completed = _start_completed(env, "High")
+    assert _governed_app().get_state(_cfg(completed["thread_id"])).tasks == ()
+
+    again = risk_workflow.resume_workflow(completed["thread_id"], **_new_executor())
+
+    assert again["status"] == "already_completed"
+    assert again["trace_id"] == completed["trace_id"]
+    assert len(env.actions.scan()["Items"]) == 1
