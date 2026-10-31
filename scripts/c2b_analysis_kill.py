@@ -764,23 +764,53 @@ WRITE_OPERATIONS = ("dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteI
                     "dynamodb:BatchWriteItem")
 
 
-def _snapshot_unchanged(before: dict, after: dict) -> dict:
-    """Durable evidence: the checkpoint and the lease are identical around the contender.
+# Snapshot fields that must be identical around the contender. `final` must be
+# recorded (None means "no marker" was observed); the lease's owner, epoch and
+# HELD state must not change, while its expiry may advance (heartbeat renewal).
+UNCHANGED_SNAPSHOT_FIELDS = ("checkpoint_id", "step", "next", "tasks", "analyze_writes_stored",
+                             "pending_write_task_count", "final")
+UNCHANGED_LEASE_FIELDS = ("owner", "epoch", "state")
 
-    Missing snapshots are missing evidence (not_evaluated). Snapshots without a
-    checkpoint_id or lease cannot show "unchanged" (failed): null == null is
-    never success.
+
+def _snapshot_unchanged(before: dict | None, after: dict | None) -> dict:
+    """Durable evidence that nothing changed around the contender, apart from lease renewal.
+
+    Missing snapshots are missing evidence (not_evaluated). A snapshot that
+    lacks a required field cannot show "unchanged" and fails. The lease must
+    stay HELD by the same owner at the same epoch; its expiry may only move
+    forward (the owner's heartbeat). These snapshots show that durable state
+    did not change; they do not identify who would have written had it
+    changed. The contender call-log and no-trace checks complement them.
     """
     missing = [label for label, snap in zip(REQUIRED_CONTENTION_SNAPSHOTS, (before, after)) if not snap]
     if missing:
         return _not_evaluated(f"snapshots not recorded: {missing} (run `snapshot --label before-contender` "
                               "and `--label after-contender` around the contender attempt)")
-    fields = {label: {k: snap.get(k) for k in ("checkpoint_id", "lease")}
-              for label, snap in zip(REQUIRED_CONTENTION_SNAPSHOTS, (before, after))}
-    incomplete = [label for label, f in fields.items() if f["checkpoint_id"] is None or not f["lease"]]
+
+    def missing_fields(snap: dict) -> list[str]:
+        lease = snap.get("lease") if isinstance(snap.get("lease"), dict) else {}
+        absent = [f for f in UNCHANGED_SNAPSHOT_FIELDS if f not in snap]
+        if snap.get("checkpoint_id") is None:
+            absent.append("checkpoint_id")
+        return absent + [f"lease.{f}" for f in (*UNCHANGED_LEASE_FIELDS, "expires_at_ms") if lease.get(f) is None]
+
+    incomplete = {label: missing_fields(snap)
+                  for label, snap in zip(REQUIRED_CONTENTION_SNAPSHOTS, (before, after)) if missing_fields(snap)}
     if incomplete:
-        return _check(False, {"reason": f"snapshots lack checkpoint_id or lease: {incomplete}", **fields})
-    return _check(fields["before-contender"] == fields["after-contender"], fields)
+        return _check(False, {"reason": f"snapshots lack required fields: {incomplete}"})
+
+    changed = [f for f in UNCHANGED_SNAPSHOT_FIELDS if before[f] != after[f]]
+    changed += [f"lease.{f}" for f in UNCHANGED_LEASE_FIELDS if before["lease"][f] != after["lease"][f]]
+    held = before["lease"]["state"] == "HELD" == after["lease"]["state"]
+    expiry_change_ms = after["lease"]["expires_at_ms"] - before["lease"]["expires_at_ms"]
+    return _check(not changed and held and expiry_change_ms >= 0, {
+        "changed_fields": changed,
+        "lease_held_throughout": held,
+        "lease_expiry_change_ms": expiry_change_ms,  # reported separately: renewal is permitted, rollback is not
+        "compared": {f: before[f] for f in UNCHANGED_SNAPSHOT_FIELDS}
+        | {f"lease.{f}": before["lease"][f] for f in UNCHANGED_LEASE_FIELDS},
+        "scope": "durable state unchanged around the contender; does not identify a writer",
+    })
 
 
 def _contender_write_calls(contenders: list, find) -> dict:
@@ -857,10 +887,17 @@ def evaluate_contention(events: list[dict], *, final_state: dict | None, contend
         "no_workflow_write_by_the_contender": _snapshot_unchanged(before, after),
         "contender_write_calls_limited_to_the_lease_attempt": _contender_write_calls(contenders, find),
     }
+    # Reported separately: the owner's heartbeat renewing the lease while the contender ran.
+    snapshot_detail = acceptance["no_workflow_write_by_the_contender"]["detail"]
+    expiry_change = snapshot_detail.get("lease_expiry_change_ms") if isinstance(snapshot_detail, dict) else None
+    diagnostics = {"lease_expiry_during_contender": {
+        "ok": None if expiry_change is None else expiry_change >= 0,
+        "detail": {"lease_expiry_change_ms": expiry_change,
+                   "meaning": "owner heartbeat renewal (expected); not a workflow write"}}}
     if not durable:
         for name in ("contender_wrote_no_trace", "owner_finalized_at_its_epoch"):
             acceptance[name] = _not_evaluated("verdict did not read durable state (--offline)")
-        return {"acceptance": acceptance, "diagnostics": {}}
+        return {"acceptance": acceptance, "diagnostics": diagnostics}
     final, lease = final_state.get("final") or {}, final_state.get("lease") or {}
     acceptance["contender_wrote_no_trace"] = _check(
         all(t is None for t in contender_traces.values()), {k: v is not None for k, v in contender_traces.items()})
@@ -871,7 +908,7 @@ def evaluate_contention(events: list[dict], *, final_state: dict | None, contend
         and (owner_trace or {}).get("workflow_event") == "resumed_completed",
         {"final": final, "lease": lease, "owner_epoch": owner_epoch,
          "owner_trace_event": (owner_trace or {}).get("workflow_event")})
-    return {"acceptance": acceptance, "diagnostics": {}}
+    return {"acceptance": acceptance, "diagnostics": diagnostics}
 
 
 def cmd_verdict(args, deps_factory) -> int:

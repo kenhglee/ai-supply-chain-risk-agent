@@ -4,11 +4,14 @@ Runs scripts/c2b_analysis_kill.py through tests/c2b_local_child.py with
 C2B_OWNED=1 (SQLite stand-ins of every owned store). These are the local
 rehearsals of the manual AWS experiments.
 """
+import copy
 import json
 import os
 import subprocess
 import sys
 import time
+
+import pytest
 
 from scripts import c2b_analysis_kill as driver
 from tests.test_c2b_driver import CHILD, PROJECT_ROOT, Run
@@ -133,7 +136,7 @@ def test_contention_snapshots_with_null_fields_fail_rather_than_match(tmp_path):
     events = [dict(e, checkpoint_id=None, lease=None) if e["event"] == "durable_snapshot" else e
               for e in driver.read_events(run.events)]
     check = _evaluate(run, events)["no_workflow_write_by_the_contender"]
-    assert check["ok"] is False and "lack checkpoint_id or lease" in check["detail"]["reason"]
+    assert check["ok"] is False and "lack required fields" in check["detail"]["reason"]
 
 
 def test_contention_snapshots_that_differ_fail(tmp_path):
@@ -153,3 +156,80 @@ def test_contender_write_calls_beyond_the_lease_attempt_fail(tmp_path):
         altered = [dict(e, aws_calls={**(e.get("aws_calls") or {}), **extra}) if e is exit_event else e
                    for e in events]
         assert _evaluate(run, altered)["contender_write_calls_limited_to_the_lease_attempt"]["ok"] is False, extra
+
+
+# ---- Snapshot comparison: heartbeat renewal vs ownership or workflow changes (pure) ----
+
+# The shape OWN-contention-20261031T231350Z recorded, with the owner holding at epoch 2.
+SNAPSHOT = {
+    "label": "before-contender", "checkpoint_id": "1f1d580b-daee-608c-8003-a007970bc57f", "step": 3,
+    "next": ["analyze"], "tasks": [{"name": "analyze", "has_result": False, "error": False}],
+    "analyze_writes_stored": False, "pending_write_task_count": 0,
+    "lease": {"epoch": 2, "state": "HELD", "owner": "722b5f5b0a1047a49b76581d7c6b4f47",
+              "expires_at_ms": 1793488789645},
+    "final": None,
+}
+
+
+def _pair(**after_changes):
+    before, after = copy.deepcopy(SNAPSHOT), copy.deepcopy(SNAPSHOT)
+    after["label"] = "after-contender"
+    after["lease"]["expires_at_ms"] += 40_162  # the owner's heartbeat renewed the lease meanwhile
+    for path, value in after_changes.items():
+        target, key = (after["lease"], path[6:]) if path.startswith("lease.") else (after, path)
+        target[key] = value
+    return before, after
+
+
+def test_heartbeat_renewal_between_the_snapshots_passes():
+    check = driver._snapshot_unchanged(*_pair())
+    assert check["ok"] is True
+    assert (check["detail"]["changed_fields"], check["detail"]["lease_expiry_change_ms"]) == ([], 40_162)
+
+
+@pytest.mark.parametrize("change, field", [
+    ({"lease.owner": "someone-else"}, "lease.owner"),
+    ({"lease.epoch": 3}, "lease.epoch"),
+    ({"lease.state": "RELEASED"}, "lease.state"),
+    ({"checkpoint_id": "1f1d580c-0000-6000-8004-000000000000"}, "checkpoint_id"),
+    ({"step": 4}, "step"),
+    ({"next": ["validate"]}, "next"),
+    ({"tasks": [{"name": "analyze", "has_result": True, "error": False}]}, "tasks"),
+    ({"analyze_writes_stored": True}, "analyze_writes_stored"),
+    ({"pending_write_task_count": 1}, "pending_write_task_count"),
+    ({"final": {"kind": "finalized", "trace_id": "t", "epoch": 2}}, "final"),
+])
+def test_ownership_or_workflow_changes_between_the_snapshots_fail(change, field):
+    check = driver._snapshot_unchanged(*_pair(**change))
+    assert check["ok"] is False
+    assert field in check["detail"]["changed_fields"]
+
+
+def test_lease_expiry_moving_backwards_fails():
+    before, after = _pair()
+    after["lease"]["expires_at_ms"] = before["lease"]["expires_at_ms"] - 1
+    check = driver._snapshot_unchanged(before, after)
+    assert check["ok"] is False and check["detail"]["lease_expiry_change_ms"] == -1
+
+
+def test_lease_not_held_in_either_snapshot_fails_even_if_identical():
+    before, after = _pair(**{"lease.state": "RELEASED"})
+    before["lease"]["state"] = "RELEASED"
+    check = driver._snapshot_unchanged(before, after)
+    assert check["ok"] is False and check["detail"]["lease_held_throughout"] is False
+
+
+@pytest.mark.parametrize("which", ["before", "after", "both"])
+def test_missing_snapshots_remain_not_evaluated(which):
+    before, after = _pair()
+    check = driver._snapshot_unchanged(None if which in ("before", "both") else before,
+                                       None if which in ("after", "both") else after)
+    assert (check["ok"], check["status"]) == (None, "not_evaluated")
+
+
+@pytest.mark.parametrize("drop", ["final", "lease", "checkpoint_id", "pending_write_task_count"])
+def test_snapshots_missing_a_required_field_fail_rather_than_match(drop):
+    before, after = _pair()
+    del before[drop], after[drop]
+    check = driver._snapshot_unchanged(before, after)
+    assert check["ok"] is False and "lack required fields" in check["detail"]["reason"]
