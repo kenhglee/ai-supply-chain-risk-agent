@@ -1323,7 +1323,8 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] Verification on the deployed Lambda, P2–P4 ([deployment review §11](OWNERSHIP_DEPLOYMENT_REVIEW.md#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949)): START paused at epoch 1; RESUME finalized `suppressed` at epoch 2 under the Lambda role; a repeat RESUME returned `already_completed`, with only the lease advancing to epoch 3
   - [x] P6: a local owner held epoch 2, and one synchronous Lambda RESUME returned `contended` (409) with that holder, wrote nothing and made no model call; the owner then finalized at epoch 2 (`OWN-lambda-P6-20261101T165151Z`)
   - [x] P7: an eligible `new_alert` (Murata, flood) fails closed on the unconfigured Lambda. The trace records `authority_status: UNCONFIGURED`. The thread is parked at `act` with its assessment saved; the lease is released at epoch 2; there is no final marker, ledger item or business row (`OWN-lambda-P7-20261101T170122Z`)
-  - [ ] P5 and P8 on the deployed Lambda (parallel contention, logs and conflict counts)
+  - [ ] P5, parallel RESUMEs: run once (`OWN-lambda-P5-20261101T170812Z`), **inconclusive**. B cold-started and acquired after A finalized, returning `already_completed`. There was one finalization, one analysis and no fork, but simultaneous acquisition is not verified
+  - [ ] P8 on the deployed Lambda (logs and conflict counts, preflight re-run)
   - Open observations: a cold-start init timeout in P2 (cause undetermined; P6's cold start took 4,111.74 ms without timing out), and `state_written` null in the completion trace
   - [ ] Simultaneous-contender and transaction-conflict evidence on real DynamoDB
 - [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); AWS: suppressed route verified manually (`thread-68cb0fe1…`), action-eligible route pending

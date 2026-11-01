@@ -1,7 +1,7 @@
 # Same-Thread Ownership: Deployment Review
 
-**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4, P6 and P7 have passed; see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
-- P5 and P8 are not run yet.
+**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4, P6 and P7 have passed, and P5 was inconclusive (sequential); see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
+- P8 is not run yet. Overlapping acquisition on the Lambda remains unverified.
 - Phase 2 (ticketing) is not implemented, and governance stays unconfigured on the Lambda.
 - The review itself was prepared from branch `assess-before-act` at `a3a710d`.
 
@@ -446,7 +446,51 @@ Every apply below used a saved plan, after its SHA-256 and the caller's identity
 - **No pre-RESUME state was saved.** The planned read-only inspection between START and RESUME (lease at epoch 1, checkpoint at step 3, candidates, no Murata row) wasn't saved. The START response and trace show the pause at epoch 1. No Murata row before RESUME rests on the 16:58:59Z scan before START, plus the absence of any Murata row now.
 - **The pending-write count wasn't in the expected outcome.** The one `__error__` write on the parked checkpoint is LangGraph's failure record.
 
+### P5: two parallel RESUMEs — sequential, inconclusive for acquisition contention
+
+**Run `OWN-lambda-P5-20261101T170812Z`** ([evidence](evidence/OWN-lambda-P5-20261101T170812Z/)), thread `thread-…` from START trace `d6224d1d…`.
+- **Setup:** one Lambda START, then two synchronous `checkpoint_resume` calls (A and B) launched in parallel from the client, each with `AWS_MAX_ATTEMPTS=1` and its own files.
+- **No pre-warm.**
+- **Snapshots:** taken before and after the RESUMEs with the read-only helper `thread_snapshot.py`, preserved with the evidence. Its SHA-256 is `0d03cb30bb0f43cf9db977249b5d01c35c186b71c0aa2ea5344279d067cb2d9b`, recorded in `thread_snapshot.py.sha256`.
+  - The helper uses the preflight's read-only guard. Its recorded operations are `dynamodb:GetItem/Query/Scan`, `lambda:GetFunction/GetFunctionConcurrency` and `sso:GetRoleCredentials`.
+
+**Timeline** (client = CLI timestamps; server = Lambda log and lease items; UTC):
+
+| Request | Client sent → returned | Environment | Init | Server handler | Outcome |
+|---|---|---|---|---|---|
+| START `4aeaf5c8-…` | 17:08:12.263 → 17:08:14.154 | `…dc414c3c` (warm, from P7) | none | 17:08:12.812 → 17:08:14.052 (1,239 ms) | `paused`, epoch 1. Lease acquired 17:08:12.915, released 17:08:14.039 |
+| RESUME A `acd1c939-…` | 17:08:58.123 → 17:09:00.869 | `…dc414c3c` (warm) | none | **17:08:58.546 → 17:09:00.751** (2,204 ms) | **`completed`**, `suppressed`, **epoch 2**, trace `f5d8d7cd…`. Final marker `finalized_at` **17:09:00.670** |
+| RESUME B `5a3f9aca-…` | 17:08:58.122 → 17:09:02.289 | `…c5f9bce2…` (new) | **`Init Duration: 2603.75 ms`** | **17:09:01.315 → 17:09:02.112** (796 ms) | **`already_completed`**, reporting the finalizer `f5d8d7cd…` at epoch 2. Lease **epoch 3** acquired **17:09:01.947**, released 17:09:02.100 |
+
+**Ordering:**
+- The two client requests were sent 1 ms apart.
+- B landed on a new environment and spent 2.6 s initializing, so **its handler started (17:09:01.315) after A's handler ended (17:09:00.751)**.
+- **B's lease acquisition (17:09:01.947) came after A's finalization (17:09:00.670).**
+- So the executions did **not** overlap while ownership was held.
+- A's own lease acquisition and release times were overwritten when B took epoch 3. A's window is bounded by its handler start and end and by the marker's time.
+
+**Required checks** (all satisfied):
+- **Both requests reached Lambda and ran once:** `StatusCode 200`, no `FunctionError`, CLI exit 0, empty stderr.
+- **One analysis:** CloudTrail 17:07–17:13 shows `Converse` ×2 by `RiskAgentLambdaRole`. One at 17:08:13 is START's triage; one at 17:09:00 is A's `analyze`.
+  - **Titan `InvokeModel` ×1**, at 17:08:13 during START. That was only the query embedding, because the warm environment already held the index.
+  - **No embedding calls during either RESUME.** B made no model calls.
+- **One finalization:** a single final marker (`finalized`, epoch 2, trace `f5d8d7cd…`, final checkpoint `1f1d616e-e9fb-…`, `suppressed`). The thread has exactly two traces: START's `paused` (epoch 1) and A's `resumed_completed` (epoch 2). B wrote no trace.
+- **No fork:**
+  - The after-snapshot's chain is linear: steps -1 to 6, no shared parent, `fork: false`.
+  - Steps -1 to 3 carry `lease_epoch: 1`, and steps 4 to 6 carry `lease_epoch: 2`.
+  - The latest checkpoint is the marker's `final_checkpoint_id`, with 0 pending writes.
+- **Business state:** `TSMC#earthquake` `last_seen_at` changed from 16:54:58Z to **17:09:00Z** (A's finalization). No ledger item.
+- **Lease at the end:** `RELEASED` (epoch 3, B).
+- **Final marker after B:** the after-snapshot (17:09:04.596, after B finished) shows A's marker unchanged in kind, epoch, trace, checkpoint and finalization time. B's response reports that same marker.
+  - No snapshot was taken *between* A and B, so "unchanged" rests on the marker's content and `finalized_at` predating B's acquisition. There's no direct A-only comparison.
+- **Errors:** none in the log (no AccessDenied, exception, transaction or throttling lines).
+
+**Classification: B, sequential, inconclusive for acquisition contention.** Not a failure. **This run doesn't verify simultaneous lease acquisition**, so rollout plan §4 gap 1 remains open. P6 still stands as evidence that the Lambda respects a lease held by another executor.
+
+**Cold starts:** B's environment initialized in 2,603.75 ms, within the limit. P2's 9,999.71 ms init timeout is still unresolved.
+
 **Not yet done:**
-- P5 (parallel synchronous contention) and P8 (logs and conflict counts, preflight re-run).
+- P8 (logs and conflict counts, preflight re-run).
+- Overlapping acquisition on the Lambda: P5 was inconclusive.
 - Phase 2 (ticketing).
 - The items in §10.
