@@ -1,6 +1,6 @@
 # Same-Thread Ownership: AWS Rollout Plan (for review)
 
-**Status:** step 1 (read-only preflight and plan), experiment A and experiment B are done; see [Results](#9-results). Still not done:
+**Status:** step 1 (read-only preflight and plan) and step 3 are done: experiments A, B and C (owned DR1) are accepted against AWS. They ran as local workers with developer credentials (`ken-ai-dev`); see [Results](#9-results). Still not done:
 - No Terraform has been applied.
 - Nothing has been deployed or adopted.
 - The Lambda has not been invoked, and no historical thread has been resumed.
@@ -102,7 +102,9 @@ Local rehearsals on the owned lifecycle (separate processes, SQLite stand-ins) i
 - kill, then contended until expiry, then takeover passes the c1 verdict with the ownership checks;
 - `--direct-invoke` is refused.
 
-## 6. Manual owned experiments (proposed commands; not run)
+## 6. Manual owned experiments (run; results in §9)
+
+A, B and C have been run and accepted ([§9](#9-results)). The accepted runs used the active virtualenv (`$VIRTUAL_ENV/bin/python`, i.e. `venv/`) in place of `.venv/bin/python`. B's accepted run included `record-exit`, and C ran with `--expect-action skipped`.
 
 **Common setup, in both terminals:**
 ```bash
@@ -199,7 +201,7 @@ AWS_PROFILE=ken-ai-dev AWS_DEFAULT_REGION=us-west-2 AUTHORITY_TABLE=risk_agent_a
    - the thread inventory, especially `action_in_flight` and `completion_unverified`;
    - any plan drift.
 2. **Decide what can write dev tables during the experiments.** If an EventBridge schedule runs the Phase 2 RSS pipeline, it writes `supplier_risk_state` without ownership. That doesn't conflict with thread ownership, but it can change what an experiment assesses. Pausing it would be a write and needs your approval.
-3. **Run experiments A, B and C locally** with `ken-ai-dev`. This needs no IAM change or deploy.
+3. **Run experiments A, B and C locally** with `ken-ai-dev`. This needs no IAM change or deploy. **Done:** all three are accepted (§9).
 4. **Collect real-DynamoDB evidence for the gaps in §4:**
    - repeat A several times;
    - record `TransactionConflict` retries;
@@ -316,3 +318,30 @@ Evidence: [`docs/evidence/OWN-preflight-20261031T224222Z.json`](evidence/OWN-pre
   - the other 10 acceptance checks pass.
 
 **The remaining claim** was then verified by repeating B with `record-exit` between the kill and the contender (§6), in the accepted run above. This run's thread is finalized and can't be reused.
+
+### Experiment C: DR1 on the owned lifecycle
+
+**Accepted run `DR1-owned-20261101T155104Z`** ([evidence](evidence/DR1-owned-20261101T155104Z.json)). The evidence file is the harness's own output, byte-identical to the original. The harness redacts before writing (host name, STS session name), so no unredacted original exists.
+- **Command:** `scripts/durable_resume_proof.py run --expect-action skipped`, TSMC earthquake headline, fresh thread `thread-587bc251…`. Credentials: `ken-ai-dev` SSO (`AWSReservedSSO_AdministratorAccess_*`), us-west-2. Bedrock Claude Haiku 4.5 and Titan v2 embeddings (FAISS). Every table was DynamoDB.
+- **Code:** the evidence records `git_commit: 68af710`, clean tree (`git_dirty: false`). This is the code that ran.
+  - `code_revision` is **stale**: it says `974c21e`, because `CODE_REVISION` was still exported from an earlier shell.
+  - `974c21e..68af710` changes only documentation and evidence, so no executed code differs between the two.
+- **The run** (times UTC on 2026-11-01):
+  - **Process A** (pid 98348, 15:51:06.162–15:51:12.892, exit 0, trace `3302dd93…`) ran infer, decide, retrieve and analyze. It paused before `validate` at **epoch 1**. Checkpoint `1f1d60c1-00d9-…` is at step 4 with the analysis saved: TSMC, earthquake, High.
+  - **Process B** (pid 98393, 15:51:13.810–15:51:16.765, exit 0, trace `c819702e…`) started after A exited, in a new interpreter with tripwires installed. It resumed at **epoch 2**, ran `validate` and `assess`, and completed `suppressed` (`eligibility_basis: assessed`, not action-eligible). There was no action and no ledger item. Its trace event is `resumed_completed`, and the final checkpoint `1f1d60c1-24f6-…` is at step 6.
+  - **B made no retrieval, embedding or model call.** There were no tripwire hits, and its only AWS services were `dynamodb` (18 calls) and `sso` (one `GetRoleCredentials`).
+  - **Finalization:** the final marker is by B's trace at epoch 2. The lease is `RELEASED` at epoch 2.
+- **Verdict:** `passed: true`, **20 of 20 checks**:
+  - resume: 13 of 13;
+  - ownership: 4 of 4 (`a_started_at_epoch_1`, `b_resumed_at_the_next_epoch`, `b_trace_and_final_marker_at_b_epoch`, `lease_released_at_b_epoch`);
+  - action: 3 of 3 (`eligibility_assessed_by_b`, `action_matches_eligibility`, `expected_action_mode`).
+
+**What this run doesn't show:** the action-eligible route (`new_alert` / `escalated` through `act`) under ownership. The scenario assessed `suppressed`, as expected.
+
+### What the accepted experiments cover, and what remains open
+
+A, B and C ran the owned lifecycle **as local worker processes against the dev AWS tables, with developer (admin) credentials**. Still open:
+- **IAM apply** of the reviewed plan (§3);
+- **deployment** of an ownership image (§7, step 7);
+- **verification on a deployed executor**: the Lambda, or a worker under its own role (§7, step 8);
+- the real-DynamoDB gaps in §4: simultaneous contenders and transaction-conflict counts.

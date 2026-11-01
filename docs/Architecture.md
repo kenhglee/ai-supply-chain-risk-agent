@@ -1316,7 +1316,12 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] AWS experiment B, kill, expiry and takeover, accepted (`OWN-takeover-20261101T153802Z`, commit `974c21e`): verdict complete and passed, 11 of 11 checks
   - [x] Post-kill, pre-expiry contention: a contender after the recorded owner exit met the dead owner's valid epoch-2 lease; takeover at epoch 3 after expiry
   - Earlier run `OWN-takeover-20261031T233348Z` showed recovery at epoch 3 but is incomplete: it recorded no owner exit, so post-kill contention is unverified there
-  - [ ] Simultaneous-contender and transaction-conflict evidence on real DynamoDB; IAM apply; deployment
+  - [x] AWS experiment C, DR1 on the owned lifecycle, accepted (`DR1-owned-20261101T155104Z`, git commit `68af710`, clean tree; its `CODE_REVISION` was stale at `974c21e`): 20 of 20 checks. START paused before `validate` at epoch 1; RESUME in a new process at epoch 2 with no retrieval, embedding or model call; finalized `suppressed`, lease released at epoch 2
+  - A, B and C ran as local workers against dev AWS with developer credentials (`ken-ai-dev`), not on a deployed executor
+  - [ ] IAM apply (reviewed plan, 1 policy)
+  - [ ] Deployment of an ownership image
+  - [ ] Verification on a deployed executor (Lambda or a worker under its own role)
+  - [ ] Simultaneous-contender and transaction-conflict evidence on real DynamoDB
 - [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); AWS: suppressed route verified manually (`thread-68cb0fe1…`), action-eligible route pending
 
 ## Data Models and Storage

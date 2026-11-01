@@ -1,0 +1,476 @@
+{
+  "headline": "TSMC halts production after earthquake in Taiwan",
+  "code": {
+    "code_revision": "974c21ea6facfdec9ec481bbfd1fc9969ff4b078",
+    "image_digest": null,
+    "git_commit": "68af710edcec45854e6b392193a2df7e19d514d0",
+    "git_dirty": false
+  },
+  "caller_arn": "arn:aws:sts::714781437949:assumed-role/AWSReservedSSO_AdministratorAccess_05923c424fbe9171/<session>",
+  "region": "us-west-2",
+  "config": {
+    "LLM_PROVIDER": "bedrock",
+    "BEDROCK_MODEL_ID": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "EMBEDDING_PROVIDER": "bedrock",
+    "RETRIEVER_PROVIDER": null,
+    "RISK_STATE_BACKEND": "dynamodb",
+    "TRACE_STORE_BACKEND": "dynamodb",
+    "CHECKPOINT_TABLE": "risk_agent_checkpoints",
+    "AUTHORITY_TABLE": "risk_agent_authority",
+    "ACTIONS_TABLE": "risk_agent_actions",
+    "RISK_STATE_TABLE": "supplier_risk_state",
+    "RISK_TRACES_TABLE": "risk_traces"
+  },
+  "thread_id": "thread-587bc251a67540e3bde2724ce920bb49",
+  "action_id": "action#thread-587bc251a67540e3bde2724ce920bb49#open_review_ticket",
+  "process_a": {
+    "pid": 98348,
+    "returncode": 0,
+    "started_at": "2026-11-01T15:51:06.162+00:00",
+    "ended_at": "2026-11-01T15:51:12.892+00:00",
+    "alive_after_exit": false,
+    "outcome": {
+      "action": "start",
+      "status": "paused",
+      "thread_id": "thread-587bc251a67540e3bde2724ce920bb49",
+      "trace_id": "3302dd93bd8d43eeabe2a3e06a6f7eee",
+      "next": [
+        "validate"
+      ],
+      "change_type": null,
+      "state_written": false,
+      "final_status": "ok",
+      "supplier": "TSMC",
+      "action_id": null,
+      "action_status": null,
+      "authority_version": null,
+      "eligibility_change_type": null,
+      "action_eligible": null,
+      "eligibility_basis": null,
+      "lease_epoch": 1,
+      "lineage_checkpoint_id": "1f1d60c1-00d9-6428-8004-da0f2b344364",
+      "finalized_by_trace_id": null,
+      "recovered_finalization": null,
+      "trace_recovered": null,
+      "legacy_recognized": null,
+      "unverified_reasons": null,
+      "holder": null,
+      "error_type": null,
+      "executor_id": "<host>:98348"
+    },
+    "tripwire_report": null,
+    "stderr_tail": []
+  },
+  "process_b": {
+    "pid": 98393,
+    "returncode": 0,
+    "started_at": "2026-11-01T15:51:13.810+00:00",
+    "ended_at": "2026-11-01T15:51:16.765+00:00",
+    "alive_after_exit": false,
+    "outcome": {
+      "action": "resume",
+      "status": "completed",
+      "thread_id": "thread-587bc251a67540e3bde2724ce920bb49",
+      "trace_id": "c819702e14c441029cdf8072aa97d7de",
+      "next": [],
+      "change_type": "suppressed",
+      "state_written": true,
+      "final_status": "ok",
+      "supplier": "TSMC",
+      "action_id": null,
+      "action_status": null,
+      "authority_version": null,
+      "eligibility_change_type": "suppressed",
+      "action_eligible": false,
+      "eligibility_basis": "assessed",
+      "lease_epoch": 2,
+      "lineage_checkpoint_id": "1f1d60c1-24f6-63f6-8006-5688db6aa1dd",
+      "finalized_by_trace_id": "c819702e14c441029cdf8072aa97d7de",
+      "recovered_finalization": false,
+      "trace_recovered": null,
+      "legacy_recognized": null,
+      "unverified_reasons": null,
+      "holder": null,
+      "error_type": null,
+      "executor_id": "<host>:98393"
+    },
+    "tripwire_report": {
+      "pid": 98393,
+      "process_started_at": "2026-11-01T15:51:13.850+00:00",
+      "worker_exit_code": 0,
+      "error": null,
+      "hits": [],
+      "aws_calls": [
+        "dynamodb:Query",
+        "sso:GetRoleCredentials",
+        "dynamodb:Query",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:Query",
+        "dynamodb:Query",
+        "dynamodb:Query",
+        "dynamodb:TransactWriteItems",
+        "dynamodb:TransactWriteItems",
+        "dynamodb:GetItem",
+        "dynamodb:TransactWriteItems",
+        "dynamodb:TransactWriteItems",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:GetItem",
+        "dynamodb:TransactWriteItems",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem"
+      ],
+      "aws_services": [
+        "dynamodb",
+        "sso"
+      ]
+    },
+    "stderr_tail": []
+  },
+  "between_processes": {
+    "checkpoint": {
+      "exists": true,
+      "checkpoint_id": "1f1d60c1-00d9-6428-8004-da0f2b344364",
+      "checkpoint_count": 6,
+      "metadata_step": 4,
+      "pending_branches": [
+        "branch:to:validate"
+      ],
+      "nodes": [
+        "infer",
+        "decide",
+        "retrieve",
+        "analyze"
+      ],
+      "tool_decision": "retrieve",
+      "context_chars": 240,
+      "retriever_metadata": {
+        "retriever_id": "faiss_supplier_profiles",
+        "retriever_version": "v1",
+        "embedding_provider": "bedrock",
+        "top_k": 4
+      },
+      "alert": {
+        "status": "ok",
+        "supplier": "TSMC",
+        "risk_type": "earthquake",
+        "risk_level": "High",
+        "impact": "TSMC production halt disrupts global semiconductor supply chain. TSMC is a critical foundry for advanced chips used in computing, mobile, automotive, and IoT devices. Production stoppage will create immediate shortages and extended lead times for dependent manufacturers."
+      },
+      "is_valid": null,
+      "action_result": null
+    },
+    "action_item": null,
+    "trace_a_workflow_event": "paused"
+  },
+  "after_b": {
+    "checkpoint": {
+      "exists": true,
+      "checkpoint_id": "1f1d60c1-24f6-63f6-8006-5688db6aa1dd",
+      "checkpoint_count": 8,
+      "metadata_step": 6,
+      "pending_branches": [],
+      "nodes": [
+        "infer",
+        "decide",
+        "retrieve",
+        "analyze",
+        "validate",
+        "assess"
+      ],
+      "tool_decision": "retrieve",
+      "context_chars": 240,
+      "retriever_metadata": {
+        "retriever_id": "faiss_supplier_profiles",
+        "retriever_version": "v1",
+        "embedding_provider": "bedrock",
+        "top_k": 4
+      },
+      "alert": {
+        "status": "ok",
+        "supplier": "TSMC",
+        "risk_type": "earthquake",
+        "risk_level": "High",
+        "impact": "TSMC production halt disrupts global semiconductor supply chain. TSMC is a critical foundry for advanced chips used in computing, mobile, automotive, and IoT devices. Production stoppage will create immediate shortages and extended lead times for dependent manufacturers."
+      },
+      "is_valid": true,
+      "action_result": null
+    },
+    "action_item": null,
+    "trace_b_workflow_event": "resumed_completed",
+    "trace_b_steps": [
+      {
+        "node_name": "infer",
+        "started_at": "2026-11-01T15:51:08.176+00:00",
+        "ended_at": "2026-11-01T15:51:08.176+00:00",
+        "duration_ms": 0.0
+      },
+      {
+        "node_name": "decide",
+        "started_at": "2026-11-01T15:51:08.235+00:00",
+        "ended_at": "2026-11-01T15:51:08.864+00:00",
+        "duration_ms": 628.8,
+        "decision": "retrieve"
+      },
+      {
+        "node_name": "retrieve",
+        "started_at": "2026-11-01T15:51:08.928+00:00",
+        "ended_at": "2026-11-01T15:51:09.898+00:00",
+        "duration_ms": 970.7
+      },
+      {
+        "node_name": "analyze",
+        "started_at": "2026-11-01T15:51:10.099+00:00",
+        "ended_at": "2026-11-01T15:51:12.246+00:00",
+        "duration_ms": 2147.4
+      },
+      {
+        "node_name": "validate",
+        "started_at": "2026-11-01T15:51:15.672+00:00",
+        "ended_at": "2026-11-01T15:51:15.672+00:00",
+        "duration_ms": 0.0,
+        "decision": "valid"
+      },
+      {
+        "node_name": "assess",
+        "started_at": "2026-11-01T15:51:15.873+00:00",
+        "ended_at": "2026-11-01T15:51:16.033+00:00",
+        "duration_ms": 159.8,
+        "decision": "no_action"
+      }
+    ]
+  },
+  "expect_action": "skipped",
+  "assessment": {
+    "eligibility_change_type": "suppressed",
+    "action_eligible": false,
+    "eligibility_basis": "assessed",
+    "change_type": "suppressed"
+  },
+  "checks": {
+    "resume": {
+      "same_thread_id": {
+        "ok": true,
+        "detail": [
+          "thread-587bc251a67540e3bde2724ce920bb49",
+          "thread-587bc251a67540e3bde2724ce920bb49"
+        ]
+      },
+      "different_trace_id": {
+        "ok": true,
+        "detail": [
+          "3302dd93bd8d43eeabe2a3e06a6f7eee",
+          "c819702e14c441029cdf8072aa97d7de"
+        ]
+      },
+      "different_executor_and_pid": {
+        "ok": true,
+        "detail": {
+          "a": [
+            "<host>:98348",
+            98348
+          ],
+          "b": [
+            "<host>:98393",
+            98393
+          ]
+        }
+      },
+      "process_a_exited_before_b_started": {
+        "ok": true,
+        "detail": {
+          "a_exit": 0,
+          "a_ended_at": "2026-11-01T15:51:12.892+00:00",
+          "b_started_at": "2026-11-01T15:51:13.810+00:00"
+        }
+      },
+      "a_paused_after_analysis": {
+        "ok": true,
+        "detail": {
+          "status": "paused",
+          "next": [
+            "validate"
+          ]
+        }
+      },
+      "analysis_saved_before_b": {
+        "ok": true,
+        "detail": {
+          "nodes": [
+            "infer",
+            "decide",
+            "retrieve",
+            "analyze"
+          ],
+          "alert": {
+            "status": "ok",
+            "supplier": "TSMC",
+            "risk_type": "earthquake",
+            "risk_level": "High",
+            "impact": "TSMC production halt disrupts global semiconductor supply chain. TSMC is a critical foundry for advanced chips used in computing, mobile, automotive, and IoT devices. Production stoppage will create immediate shortages and extended lead times for dependent manufacturers."
+          },
+          "context_chars": 240,
+          "pending_branches": [
+            "branch:to:validate"
+          ]
+        }
+      },
+      "no_business_or_action_write_by_a": {
+        "ok": true,
+        "detail": {
+          "row_before_a": {
+            "current_risk_level": "High",
+            "risk_type": "earthquake",
+            "supplier": "TSMC",
+            "last_headline": "TSMC halts production after earthquake in Taiwan",
+            "pk": "TSMC#earthquake",
+            "last_seen_at": "2026-11-01T15:43:52+00:00"
+          },
+          "row_after_a": {
+            "current_risk_level": "High",
+            "last_seen_at": "2026-11-01T15:43:52+00:00",
+            "risk_type": "earthquake",
+            "last_headline": "TSMC halts production after earthquake in Taiwan",
+            "supplier": "TSMC",
+            "pk": "TSMC#earthquake"
+          },
+          "action_item_after_a": null
+        }
+      },
+      "no_retrieval_embedding_or_model_call_in_b": {
+        "ok": true,
+        "detail": {
+          "hits": [],
+          "aws_services": [
+            "dynamodb",
+            "sso"
+          ],
+          "non_dynamodb_calls": [
+            "sso:GetRoleCredentials"
+          ],
+          "aws_call_count": 19
+        }
+      },
+      "b_reused_checkpointed_steps": {
+        "ok": true,
+        "detail": {
+          "b_trace_nodes": [
+            "infer",
+            "decide",
+            "retrieve",
+            "analyze",
+            "validate",
+            "assess"
+          ],
+          "analyze_started_at": "2026-11-01T15:51:10.099+00:00",
+          "validate_started_at": "2026-11-01T15:51:15.672+00:00",
+          "b_process_started_at": "2026-11-01T15:51:13.810+00:00"
+        }
+      },
+      "workflow_completed": {
+        "ok": true,
+        "detail": {
+          "status": "completed",
+          "exit": 0,
+          "next": [],
+          "final_status": "ok"
+        }
+      },
+      "business_result_persisted": {
+        "ok": true,
+        "detail": {
+          "change_type": "suppressed",
+          "row": {
+            "risk_type": "earthquake",
+            "pk": "TSMC#earthquake",
+            "supplier": "TSMC",
+            "last_seen_at": "2026-11-01T15:51:16+00:00",
+            "last_headline": "TSMC halts production after earthquake in Taiwan",
+            "current_risk_level": "High"
+          }
+        }
+      },
+      "paused_trace_not_displayed_as_completed": {
+        "ok": true,
+        "detail": {
+          "final_status": "ok",
+          "displayed_status": "paused (workflow not completed)"
+        }
+      },
+      "traces_recorded": {
+        "ok": true,
+        "detail": {
+          "a": "paused",
+          "b": "resumed_completed"
+        }
+      }
+    },
+    "ownership": {
+      "a_started_at_epoch_1": {
+        "ok": true,
+        "detail": {
+          "a_epoch": 1
+        }
+      },
+      "b_resumed_at_the_next_epoch": {
+        "ok": true,
+        "detail": {
+          "a_epoch": 1,
+          "b_epoch": 2
+        }
+      },
+      "b_trace_and_final_marker_at_b_epoch": {
+        "ok": true,
+        "detail": {
+          "trace_epoch": 2,
+          "final_trace_id": "c819702e14c441029cdf8072aa97d7de",
+          "final_epoch": "2",
+          "b_trace_id": "c819702e14c441029cdf8072aa97d7de"
+        }
+      },
+      "lease_released_at_b_epoch": {
+        "ok": true,
+        "detail": {
+          "state": "RELEASED",
+          "epoch": "2"
+        }
+      }
+    },
+    "action": {
+      "eligibility_assessed_by_b": {
+        "ok": true,
+        "detail": {
+          "expected_change": "suppressed",
+          "expected_eligible": false,
+          "assessed_change": "suppressed",
+          "assessed_eligible": false,
+          "basis": "assessed",
+          "prior_risk_level": "High"
+        }
+      },
+      "action_matches_eligibility": {
+        "ok": true,
+        "detail": {
+          "expected": "no action",
+          "ledger_status": null,
+          "claimed_by_trace_id": null,
+          "authority_version": null,
+          "policy_version": null,
+          "ticket_id": null,
+          "b_nodes_after_validate": [
+            "assess"
+          ]
+        }
+      },
+      "expected_action_mode": {
+        "ok": true,
+        "detail": {
+          "expect": "skipped",
+          "eligible": false
+        }
+      }
+    }
+  },
+  "passed": true
+}
