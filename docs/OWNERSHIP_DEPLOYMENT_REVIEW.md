@@ -448,7 +448,7 @@ Every apply below used a saved plan, after its SHA-256 and the caller's identity
 
 ### P5: two parallel RESUMEs — sequential, inconclusive for acquisition contention
 
-**Run `OWN-lambda-P5-20261101T170812Z`** ([evidence](evidence/OWN-lambda-P5-20261101T170812Z/)), thread `thread-…` from START trace `d6224d1d…`.
+**Run `OWN-lambda-P5-20261101T170812Z`** ([evidence](evidence/OWN-lambda-P5-20261101T170812Z/)), thread `thread-4c7fcd82e31c4ea4b14cc639627b1f10`, START trace `d6224d1d…`.
 - **Setup:** one Lambda START, then two synchronous `checkpoint_resume` calls (A and B) launched in parallel from the client, each with `AWS_MAX_ATTEMPTS=1` and its own files.
 - **No pre-warm.**
 - **Snapshots:** taken before and after the RESUMEs with the read-only helper `thread_snapshot.py`, preserved with the evidence. Its SHA-256 is `0d03cb30bb0f43cf9db977249b5d01c35c186b71c0aa2ea5344279d067cb2d9b`, recorded in `thread_snapshot.py.sha256`.
