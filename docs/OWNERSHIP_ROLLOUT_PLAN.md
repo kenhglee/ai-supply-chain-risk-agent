@@ -5,7 +5,7 @@
 - Nothing has been deployed or adopted.
 - The Lambda has not been invoked, and no historical thread has been resumed.
 
-Design: `docs/SAME_THREAD_OWNERSHIP_DESIGN.md` (§16 lists the requirements). Code: branch `assess-before-act`.
+Deployment review (not applied): [`OWNERSHIP_DEPLOYMENT_REVIEW.md`](OWNERSHIP_DEPLOYMENT_REVIEW.md). Design: `docs/SAME_THREAD_OWNERSHIP_DESIGN.md` (§16 lists the requirements). Code: branch `assess-before-act`.
 
 ## 1. Executors and what could not be inspected
 
