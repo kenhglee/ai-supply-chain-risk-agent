@@ -1,0 +1,208 @@
+{
+ "window": [
+  "2026-11-01T16:38:00+00:00",
+  "2026-11-01T17:15:51+00:00"
+ ],
+ "events": 90,
+ "streams": [
+  "2026/11/01/[$LATEST]6ff4abe01c774a5a8f3cd2a2dc414c3c",
+  "2026/11/01/[$LATEST]91deacc3eb494d7e8a49be6b984d1de8",
+  "2026/11/01/[$LATEST]c5f9bce24d664a22a380502422ec3a85",
+  "2026/11/01/[$LATEST]d77de61253e2492cb95b268d4fad4fa6"
+ ],
+ "request_ids": [
+  "069651b0-636f-4164-b809-d7d184e782d8",
+  "4aeaf5c8-5976-4fc7-bc35-db8ac72f3ebd",
+  "564c6c1d-a21a-4221-bd11-c2a26e33ab3f",
+  "5a3f9aca-9bd9-45f0-96fa-9f5400efb18a",
+  "6b330d5a-aeb5-4647-b901-4aec854f5726",
+  "7f421313-fb30-4998-bf09-ebd290ee35ef",
+  "acd1c939-11b1-4d4b-9fc4-33fd3141ccab",
+  "c13c26ff-e1b2-45da-94ed-ae61041ec93e",
+  "fa79b7ff-ba09-4490-a7c9-f10941ae3119"
+ ],
+ "handler_outcomes": {
+  "checkpoint_start:paused": 3,
+  "checkpoint_resume:completed": 2,
+  "checkpoint_resume:already_completed": 2,
+  "checkpoint_resume:contended": 1,
+  "checkpoint_resume:authority_denied": 1
+ },
+ "reports": [
+  "REPORT RequestId: 564c6c1d-a21a-4221-bd11-c2a26e33ab3f Duration: 18976.81 ms Billed Duration: 18977 ms Memory Size: 1028 MB Max Memory Used: 259 MB ",
+  "REPORT RequestId: fa79b7ff-ba09-4490-a7c9-f10941ae3119 Duration: 2508.82 ms Billed Duration: 2509 ms Memory Size: 1028 MB Max Memory Used: 264 MB ",
+  "REPORT RequestId: 7f421313-fb30-4998-bf09-ebd290ee35ef Duration: 249.04 ms Billed Duration: 250 ms Memory Size: 1028 MB Max Memory Used: 264 MB ",
+  "REPORT RequestId: 069651b0-636f-4164-b809-d7d184e782d8 Duration: 711.31 ms Billed Duration: 4824 ms Memory Size: 1028 MB Max Memory Used: 212 MB Init Duration: 4111.74 ms ",
+  "REPORT RequestId: 6b330d5a-aeb5-4647-b901-4aec854f5726 Duration: 2533.00 ms Billed Duration: 6643 ms Memory Size: 1028 MB Max Memory Used: 259 MB Init Duration: 4109.40 ms ",
+  "REPORT RequestId: c13c26ff-e1b2-45da-94ed-ae61041ec93e Duration: 2213.91 ms Billed Duration: 2214 ms Memory Size: 1028 MB Max Memory Used: 262 MB ",
+  "REPORT RequestId: 4aeaf5c8-5976-4fc7-bc35-db8ac72f3ebd Duration: 1238.91 ms Billed Duration: 1239 ms Memory Size: 1028 MB Max Memory Used: 266 MB ",
+  "REPORT RequestId: acd1c939-11b1-4d4b-9fc4-33fd3141ccab Duration: 2204.23 ms Billed Duration: 2205 ms Memory Size: 1028 MB Max Memory Used: 266 MB ",
+  "REPORT RequestId: 5a3f9aca-9bd9-45f0-96fa-9f5400efb18a Duration: 795.85 ms Billed Duration: 3400 ms Memory Size: 1028 MB Max Memory Used: 212 MB Init Duration: 2603.75 ms "
+ ],
+ "matches": {
+  "AccessDenied": [],
+  "transaction conflict/cancellation": [],
+  "conditional check failures (logged)": [],
+  "throttling": [],
+  "init failure/timeout": [
+   "INIT_REPORT Init Duration: 9999.71 ms\tPhase: init\tStatus: timeout"
+  ],
+  "exceptions/tracebacks": [],
+  "warnings": []
+ },
+ "metrics_since_release": {
+  "Invocations": [
+   [
+    "08:42",
+    1.0
+   ],
+   [
+    "08:45",
+    1.0
+   ],
+   [
+    "08:47",
+    1.0
+   ],
+   [
+    "08:53",
+    1.0
+   ],
+   [
+    "09:01",
+    1.0
+   ],
+   [
+    "09:02",
+    1.0
+   ],
+   [
+    "09:08",
+    3.0
+   ]
+  ],
+  "Errors": [
+   [
+    "08:42",
+    0.0
+   ],
+   [
+    "08:45",
+    0.0
+   ],
+   [
+    "08:47",
+    0.0
+   ],
+   [
+    "08:53",
+    0.0
+   ],
+   [
+    "09:01",
+    0.0
+   ],
+   [
+    "09:02",
+    0.0
+   ],
+   [
+    "09:08",
+    0.0
+   ]
+  ],
+  "Throttles": [
+   [
+    "08:42",
+    0.0
+   ],
+   [
+    "08:45",
+    0.0
+   ],
+   [
+    "08:47",
+    0.0
+   ],
+   [
+    "08:53",
+    0.0
+   ],
+   [
+    "09:01",
+    0.0
+   ],
+   [
+    "09:02",
+    0.0
+   ],
+   [
+    "09:08",
+    0.0
+   ]
+  ],
+  "ConcurrentExecutions": [
+   [
+    "08:42",
+    1.0
+   ],
+   [
+    "08:45",
+    1.0
+   ],
+   [
+    "08:47",
+    1.0
+   ],
+   [
+    "08:53",
+    1.0
+   ],
+   [
+    "09:01",
+    1.0
+   ],
+   [
+    "09:02",
+    1.0
+   ],
+   [
+    "09:08",
+    2.0
+   ]
+  ],
+  "Duration": [
+   [
+    "08:42",
+    18976.81
+   ],
+   [
+    "08:45",
+    2508.82
+   ],
+   [
+    "08:47",
+    249.04
+   ],
+   [
+    "08:53",
+    4823.05
+   ],
+   [
+    "09:01",
+    6642.4
+   ],
+   [
+    "09:02",
+    2213.91
+   ],
+   [
+    "09:08",
+    3399.6
+   ]
+  ],
+  "AsyncEventsReceived": [],
+  "AsyncEventAge": [],
+  "AsyncEventsDropped": []
+ }
+}

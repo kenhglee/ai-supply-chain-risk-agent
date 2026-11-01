@@ -4,11 +4,12 @@
 
 **Phase 1 is deployed to the dev Lambda (2026-11-01).**
 - What's live: `RiskCheckpointOwnership`, and the ownership image `sha256:7701dd33…` built from `a117c8c`. The rollout hold has been applied and released.
-- **Deployed checks P2–P4, P6 and P7 passed** under `RiskAgentLambdaRole`. P5 (parallel RESUMEs) was inconclusive: the calls ran sequentially.
+- **Deployed checks P2–P4, P6 and P7 passed** under `RiskAgentLambdaRole`. P5 (parallel RESUMEs) was inconclusive: the calls ran sequentially. The final read-only review (P8) found no unexpected activity, and **Phase 1 is complete**.
 - For the record, see the [deployment review §11](OWNERSHIP_DEPLOYMENT_REVIEW.md#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
 
 **Still not done:**
-- P8, and overlapping acquisition on the Lambda.
+- Overlapping acquisition on the Lambda (P5 inconclusive).
+- The open findings in the [Phase 1 conclusion](OWNERSHIP_DEPLOYMENT_REVIEW.md#phase-1-conclusion).
 - Lambda ticketing: governance remains unconfigured.
 - No historical (legacy) thread has been resumed.
 

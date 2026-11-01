@@ -1,7 +1,7 @@
 # Same-Thread Ownership: Deployment Review
 
-**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4, P6 and P7 have passed, and P5 was inconclusive (sequential); see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
-- P8 is not run yet. Overlapping acquisition on the Lambda remains unverified.
+**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4, P6 and P7 have passed, P5 was inconclusive (sequential), and the final review (P8) found no unexpected activity; see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
+- Overlapping acquisition on the Lambda remains unverified. For open findings, see the [Phase 1 conclusion](#phase-1-conclusion).
 - Phase 2 (ticketing) is not implemented, and governance stays unconfigured on the Lambda.
 - The review itself was prepared from branch `assess-before-act` at `a3a710d`.
 
@@ -489,8 +489,48 @@ Every apply below used a saved plan, after its SHA-256 and the caller's identity
 
 **Cold starts:** B's environment initialized in 2,603.75 ms, within the limit. P2's 9,999.71 ms init timeout is still unresolved.
 
-**Not yet done:**
-- P8 (logs and conflict counts, preflight re-run).
-- Overlapping acquisition on the Lambda: P5 was inconclusive.
+### P8: final Phase 1 review (read-only, 2026-11-01T17:15Z)
+
+[Evidence](evidence/OWN-phase1-review-20261101T171507Z/): the preflight, a thread-inventory comparison, a log and metrics summary, the full function log since the deploy (host name redacted), and the Terraform plan. No workflow was invoked and no historical thread was adopted.
+
+**Observed:**
+
+| Area | Result |
+|---|---|
+| Executor | Image `sha256:7701dd33…` (from `a117c8c`), role `RiskAgentLambdaRole`, timeout 123 s, 1028 MB. The environment has the same 11 variables as before the rollout. **No reserved concurrency** (unreserved) |
+| Governance | `AUTHORITY_TABLE` / `ACTIONS_TABLE` absent: **unconfigured** |
+| Role policies | `BedrockInvoke`, `RiskCheckpointAccess`, **`RiskCheckpointOwnership`**, `RiskStateAccess`, `RiskTraceAccess`, plus `AWSLambdaBasicExecutionRole` |
+| Invocation sources | None: no URL, resource policy, async configuration, event source mapping, EventBridge rule or schedule |
+| Requests since the deploy | **9**, exactly the planned P2–P7 calls, on 4 environments. Handler outcomes: `paused` ×3, `completed` ×2, `already_completed` ×2, `contended` ×1, `authority_denied` ×1 |
+| Log patterns since 16:38Z (90 events) | **AccessDenied 0; transaction conflict or cancellation 0; logged conditional-check failures 0; throttling 0; tracebacks, exceptions or `[ERROR]` 0; warnings 0.** Init: **1 timeout** (P2, 9,999.71 ms). Other cold starts completed in 4,111.74, 4,109.40 and 2,603.75 ms. The FAISS AVX2 fallback appears twice (informational) |
+| Metrics since the hold release (1-minute) | `Invocations` sum 9; **`Errors` sum 0; `Throttles` sum 0** (real datapoints, so observed zeros); `ConcurrentExecutions` max 2 (P5, where B's initialization overlapped A); `Duration` max 18,976.81 ms (P2) |
+| Threads | **22: 13 `legacy_recognized`, 9 `owned`.** The 9 owned are A (2), B (2), C, P2, P5, P6 and P7. Eight are finalized with the lease `RELEASED`. The **P7 Murata thread** (`thread-ec26e56c…`) is **parked at `act`**, with no final marker, no ledger action, and its lease `RELEASED` at epoch 2. **No `IN_FLIGHT` action anywhere** |
+| Legacy threads | All **13 original legacy threads are unadopted**: still `legacy_recognized`, no lease, no final marker. Checkpoint count, `next`, pending tasks, source trace and evidence reasons are identical to `OWN-preflight-20261031T224222Z` |
+| Terraform | `terraform plan -lock=false` as `TerraformDeploymentRole`: **`No changes`** (only the existing `hash_key` deprecation warning) |
+
+**Missing telemetry, not observed zeros:**
+- `AsyncEventsReceived`, `AsyncEventAge` and `AsyncEventsDropped` have no datapoints since the hold release. They're emitted only when async events exist; with no async source configured, this is consistent with none.
+- DynamoDB data-plane calls aren't in CloudTrail and the Lambda path isn't instrumented, so per-request DynamoDB calls (for example a refused lease `UpdateItem`) are inferred from the code, not observed.
+- `TransactionConflict` *retries* that succeeded aren't logged by the application. "0 conflicts in the logs" therefore doesn't count retries. This is the rollout plan's §4 gap 3, which stays open.
+
+**Open findings (not fixed):**
+1. **P2 cold-start init timeout:** `INIT_REPORT … Status: timeout` at 9,999.71 ms, after which initialization re-ran inside the invocation. The cause is undetermined. Later cold starts took 2.6–4.1 s, but that doesn't explain or resolve it.
+2. **P5 was inconclusive:** the two parallel RESUMEs executed sequentially (B cold-started and acquired after A finalized). Simultaneous lease acquisition on the deployed executor (§4 gap 1) is **not verified**.
+3. **Trace and outcome fields that are inconsistent or easy to misread:**
+   - The `resumed_completed` trace records `state_written: null` while the outcome says `true` (P3). The P7 denial trace also has `state_written: null`.
+   - A denial for unconfigured governance records `denied_layer: emergency` (the constructor default). Only `authority_status: UNCONFIGURED` identifies it (P7).
+   - `action_status: DENIED` appears in the P7 outcome and trace although **no ledger item** exists.
+   - `already_completed` reports `lease_epoch` = the finalizer's epoch (2), not the attempt's own epoch (3) (P4, P5-B).
+   - A parked denial leaves a LangGraph `__error__` pending write on the `act` task (P7). That's expected framework behavior, but it wasn't in the stated expectation.
+4. **Tooling:** the preflight's read-only guard refuses `logs:FilterLogEvents`, a read whose name it doesn't recognize. Some evidence in P2 and P6 was not recorded (P2's `%3N` timestamp; P6's client timing and CLI exit code; P7's pre-RESUME inspection).
+
+### Phase 1 conclusion
+
+**Phase 1 (ownership deployed, Lambda ticketing off) is complete on the dev Lambda**, with one test inconclusive.
+- **Live:** the ownership image `sha256:7701dd33…` built from `a117c8c` on Python 3.13 with the hashed lock, and the scoped `RiskCheckpointOwnership` policy. Lambda governance is still unconfigured.
+- **Owned START and RESUME work under the Lambda's own role,** including finalization (P2–P3). A repeat RESUME is a no-op apart from the lease (P4). The Lambda respects a lease held by another executor (P6). An eligible alert fails closed and parks at `act` (P7).
+- **Nothing unexpected:** no invocation, error, throttle, AccessDenied or transaction failure, and no unexpected thread change. The legacy threads are untouched.
+- **Simultaneous acquisition on the Lambda is unverified (P5).** The init timeout, and the trace and outcome field issues above, remain open.
+- **Next, needing separate approval:** Phase 2 (ticketing, §9), whose starting thread is the parked P7 Murata thread; a repeat of the overlap test; and the §10 items.
 - Phase 2 (ticketing).
 - The items in §10.

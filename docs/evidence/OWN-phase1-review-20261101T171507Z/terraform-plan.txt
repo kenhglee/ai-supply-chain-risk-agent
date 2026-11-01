@@ -1,0 +1,39 @@
+data.aws_caller_identity.current: Reading...
+aws_ecr_repository.risk_agent: Refreshing state... [id=ai-supply-chain-risk-agent]
+aws_dynamodb_table.risk_agent_authority: Refreshing state... [id=risk_agent_authority]
+aws_dynamodb_table.supplier_risk_state: Refreshing state... [id=supplier_risk_state]
+aws_dynamodb_table.risk_agent_checkpoints: Refreshing state... [id=risk_agent_checkpoints]
+aws_dynamodb_table.risk_agent_actions: Refreshing state... [id=risk_agent_actions]
+aws_dynamodb_table.risk_traces: Refreshing state... [id=risk_traces]
+aws_iam_role.risk_agent_lambda: Refreshing state... [id=RiskAgentLambdaRole]
+data.aws_caller_identity.current: Read complete after 0s [id=714781437949]
+aws_iam_policy.risk_agent_policy_claude_deny: Refreshing state... [id=arn:aws:iam::714781437949:policy/RiskAgentPolicyClaudeDeny]
+aws_iam_role.risk_agent_bedrock_worker: Refreshing state... [id=RiskAgentBedrockWorkerRole]
+aws_iam_role.terraform_deployment: Refreshing state... [id=TerraformDeploymentRole]
+aws_iam_policy.risk_agent_bedrock_claude_deny: Refreshing state... [id=arn:aws:iam::714781437949:policy/RiskAgentBedrockClaudeDeny]
+aws_iam_role.risk_agent_policy_materializer: Refreshing state... [id=RiskAgentPolicyMaterializerRole]
+aws_iam_role.risk_agent_governed_worker: Refreshing state... [id=RiskAgentGovernedWorkerRole]
+aws_iam_role_policy.risk_agent_bedrock_worker_claude: Refreshing state... [id=RiskAgentBedrockWorkerRole:BedrockClaudeInvoke]
+aws_iam_role_policy.risk_agent_governed_worker: Refreshing state... [id=RiskAgentGovernedWorkerRole:GovernedWorkerAccess]
+aws_iam_role_policy.risk_agent_policy_materializer: Refreshing state... [id=RiskAgentPolicyMaterializerRole:PolicyMaterializerAccess]
+aws_iam_role_policy.risk_trace_access: Refreshing state... [id=RiskAgentLambdaRole:RiskTraceAccess]
+aws_iam_role_policy_attachment.lambda_basic_execution: Refreshing state... [id=RiskAgentLambdaRole/arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+aws_iam_role_policy.risk_checkpoint_access: Refreshing state... [id=RiskAgentLambdaRole:RiskCheckpointAccess]
+aws_iam_role_policy.risk_state_access: Refreshing state... [id=RiskAgentLambdaRole:RiskStateAccess]
+aws_iam_role_policy.bedrock_invoke: Refreshing state... [id=RiskAgentLambdaRole:BedrockInvoke]
+aws_iam_role_policy.terraform_deployment: Refreshing state... [id=TerraformDeploymentRole:TerraformDeploymentPolicy]
+aws_iam_role_policy.risk_checkpoint_ownership: Refreshing state... [id=RiskAgentLambdaRole:RiskCheckpointOwnership]
+aws_lambda_function.risk_agent: Refreshing state... [id=ai-supply-chain-risk-agent]
+
+No changes. Your infrastructure matches the configuration.
+
+Terraform has compared your real infrastructure against your configuration
+and found no differences, so no changes are needed.
+
+Warning: Argument is deprecated
+
+  with aws_dynamodb_table.risk_traces,
+  on traces.tf line 1, in resource "aws_dynamodb_table" "risk_traces":
+   1: resource "aws_dynamodb_table" "risk_traces" {
+
+hash_key is deprecated. Use key_schema instead.
