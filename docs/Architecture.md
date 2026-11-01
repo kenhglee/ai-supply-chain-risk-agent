@@ -1313,8 +1313,9 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
 - [x] Same-thread ownership: lease with monotonic epochs, fenced checkpoints, pending writes, actions and finalization, once-only `final` marker, recovery and legacy rules, lineage-bound outcomes; R1–R4 protected across processes (local only; **not deployed**; X1 and `IN_FLIGHT` reconciliation open)
   - [x] AWS read-only preflight and `terraform plan` (1 policy to add, not applied); 13 legacy threads, all recognizable ([rollout plan §9](OWNERSHIP_ROLLOUT_PLAN.md#9-results))
   - [x] AWS experiment A, owned contention, accepted (`OWN-contention-20261031T231350Z`, local owned code against dev DynamoDB)
-  - [x] Experiment B, kill and takeover: recovery at epoch 3 with repeated inference, reused retrieval and finalization demonstrated (`OWN-takeover-20261031T233348Z`)
-  - [ ] Post-kill, pre-expiry contention: unverified (that run recorded no owner exit); repeat B with `record-exit`
+  - [x] AWS experiment B, kill, expiry and takeover, accepted (`OWN-takeover-20261101T153802Z`, commit `974c21e`): verdict complete and passed, 11 of 11 checks
+  - [x] Post-kill, pre-expiry contention: a contender after the recorded owner exit met the dead owner's valid epoch-2 lease; takeover at epoch 3 after expiry
+  - Earlier run `OWN-takeover-20261031T233348Z` showed recovery at epoch 3 but is incomplete: it recorded no owner exit, so post-kill contention is unverified there
   - [ ] Simultaneous-contender and transaction-conflict evidence on real DynamoDB; IAM apply; deployment
 - [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); AWS: suppressed route verified manually (`thread-68cb0fe1…`), action-eligible route pending
 

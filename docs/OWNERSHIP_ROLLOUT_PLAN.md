@@ -1,6 +1,6 @@
 # Same-Thread Ownership: AWS Rollout Plan (for review)
 
-**Status:** step 1 (read-only preflight and plan) and experiment A are done; see [Results](#9-results). Still not done:
+**Status:** step 1 (read-only preflight and plan), experiment A and experiment B are done; see [Results](#9-results). Still not done:
 - No Terraform has been applied.
 - Nothing has been deployed or adopted.
 - The Lambda has not been invoked, and no historical thread has been resumed.
@@ -271,7 +271,27 @@ Evidence: [`docs/evidence/OWN-preflight-20261031T224222Z.json`](evidence/OWN-pre
 
 ### Experiment B: kill, expiry and takeover
 
-**Run `OWN-takeover-20261031T233348Z`** ([evidence](evidence/OWN-takeover-20261031T233348Z/)). Code: commit `4b3ee87`, clean tree.
+**Accepted run `OWN-takeover-20261101T153802Z`** ([evidence](evidence/OWN-takeover-20261101T153802Z/)).
+- **Code:** execution commit `974c21e`, clean tree, recorded in every attempt's events (`git_dirty: false`).
+- **The run** (thread `thread-cb6b4b31…`, all times UTC on 2026-11-01):
+  - START (trace `e8b4427a…`) paused before `analyze` at epoch 1, checkpoint `1f1d60ab-…` at step 3.
+  - The owner (pid 93738, trace `c79de035…`, epoch 2) inferred once (Bedrock request `ed2b31ed-…`) and held at `after-inference` from 15:42:14.607.
+  - The operator killed it. `record-exit` confirmed pid 93738 was no longer running and recorded that at **15:42:46.438**. The time of the kill itself was not recorded, so this is an upper bound on the death.
+  - A contender started at **15:42:47.160**, after the recorded exit. It returned `contended`, holder epoch 2, owner executor pid 93738, lease expiry **15:43:12.789** (25.6 s after the contender started). It executed nothing: its only AWS calls were `dynamodb:Query` ×3 and `dynamodb:UpdateItem` ×1 (the refused lease acquisition).
+  - The `after-kill` snapshot (15:42:50.464, before recovery) shows checkpoint `1f1d60ab-…` unchanged at step 3, `analyze` next, no analyze writes stored, and the epoch-2 lease still `HELD` with that expiry.
+  - The takeover (trace `1ebe1ca3…`) started at 15:43:48.455, after expiry. It acquired **epoch 3**, re-ran `analyze` with a second Bedrock call (`d3a908f0-…`), and completed `suppressed`. No ticket was opened.
+  - **Finalization:** the final marker is `finalized` at epoch 3 by the takeover. The lease is `RELEASED` at epoch 3 by the same attempt. The graph is at step 6 with no pending tasks.
+  - Retrieval was START's own (started 15:41:26.243). There were no tripwire hits.
+- **Verdict** (`verdict.json`, `--expect c1`, produced at the run by the driver at `974c21e`): **complete and passed (`complete: true`, `passed: true`), 11 of 11 acceptance checks.** These include `ownership_contended_until_expiry` (1 contender after the recorded exit and 0 before it, lease valid at its start, nothing executed), `ownership_takeover_epoch_increased` (2 → 3) and `ownership_final_marker_and_lease`.
+- **Notes:**
+  - `record-exit` was run without `--exit-status`, so the record's `exit_status` is `null`. The check relies on the confirmed-not-running record, not on the status.
+  - The evidence is redacted with `durable_resume_proof.redact_evidence_text`; only the host name was replaced. The raw originals are kept unchanged outside the repository.
+
+**What this run doesn't show:**
+- The exact kill time. It is bounded only by the recorded exit.
+- Anything about simultaneous contenders, transaction conflicts or the deployed Lambda (see experiment A).
+
+**Earlier incomplete run `OWN-takeover-20261031T233348Z`** ([evidence](evidence/OWN-takeover-20261031T233348Z/)). Code: commit `4b3ee87`, clean tree. It is superseded by the accepted run above and kept as the record of why `record-exit` is required.
 
 **Demonstrated:**
 - **Recovery at epoch 3.**
@@ -295,4 +315,4 @@ Evidence: [`docs/evidence/OWN-preflight-20261031T224222Z.json`](evidence/OWN-pre
   - the verdict is **incomplete** (`complete: false`, `passed: false`);
   - the other 10 acceptance checks pass.
 
-**To verify the remaining claim,** repeat B with `record-exit` between the kill and the contender (§6). The thread here is finalized and can't be reused.
+**The remaining claim** was then verified by repeating B with `record-exit` between the kill and the contender (§6), in the accepted run above. This run's thread is finalized and can't be reused.
