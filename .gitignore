@@ -8,6 +8,8 @@ venv/
 venv-langgraph/
 seen_headlines.json
 *.lock.txt
+# The Lambda image's hashed runtime lock (exported from uv.lock) is tracked.
+!requirements.lock.txt
 app/storage/risk_decisions.jsonl
 
 .DS_Store

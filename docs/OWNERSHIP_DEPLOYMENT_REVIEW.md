@@ -106,6 +106,41 @@ Building from the current `Dockerfile` would produce a different interpreter and
 
 **Residual difference:** Anaconda's CPython 3.13.9 on arm64 versus the Lambda base's CPython 3.13 on x86_64. The deployed-executor checks (§7) are what prove the image.
 
+### Implemented (build preparation; nothing pushed or deployed)
+
+**Changes:**
+- `requirements.lock.txt` is exported from `uv.lock` as in step 1. Its body is identical to the reviewed export, and `.gitignore` now makes an exception so this one file is tracked.
+- The `Dockerfile` follows step 2.
+
+**Base image:** `public.ecr.aws/lambda/python:3.13`, pinned to its **linux/amd64** manifest `sha256:2f2661d61213e6690f7613bee9d041592c0e92d977168fe6322077e378ade073`.
+- Looked up in the public registry on 2026-11-01. The index also lists an arm64 manifest, `sha256:241d405a…`, which isn't used.
+- The manifest's content hash matches its digest. Its config says `linux`/`amd64`, created 2026-10-31.
+
+**Validation, run without AWS credentials:**
+- **Offline:**
+  - `uv lock --check --offline` passes.
+  - A hash-checked `uv pip install --target` for `x86_64-manylinux_2_28`, CPython 3.13, installed 87 packages from wheels, plus `sgmllib3k` built from its source archive.
+  - All 61 native libraries are x86-64 ELF, and none is a macOS wheel.
+  - A dependency check equivalent to `pip check`, using linux markers: no problems.
+  - `pip install --dry-run` accepts the `Dockerfile`'s exact options with this lock.
+- **Local image build:** `docker buildx --platform linux/amd64`, built from `git archive` plus the changed files, with no credentials and a local-only tag. All of the following ran with `--network none`:
+  - **Interpreter:** CPython **3.13.18**, x86_64, glibc 2.34.
+  - **Packages:** 87 in `/var/task`, identical to the offline target install.
+  - **`pip check`:** "No broken requirements found".
+  - **Precedence over the base image:** the base image's own `boto3 1.42.97`, `botocore`, `urllib3 2.8.0`, `s3transfer`, `jmespath`, `dateutil` and `six` are shadowed. With `/var/task` on `PYTHONPATH`, the locked versions import from `/var/task`.
+  - **Compiled packages:** all 27 import. FAISS search and an `ormsgpack` round trip work.
+  - **LangGraph:** `langgraph 1.2.2` and `langgraph-checkpoint 4.1.1` import, and a `JsonPlusSerializer` msgpack round trip works.
+  - **Application modules:** the handler, `risk_worker`, `risk_workflow`, the checkpoint, lease and finalization stores, and the action ledger all import offline, in 0.8 s.
+  - **Lambda bootstrap:** a request the handler rejects, sent through the base image's runtime interface emulator, initialized successfully and returned `400` before any AWS client was built.
+- **Compared with the tested venv:** `+greenlet 3.5.1`; `-langchain 1.2.12`, `-pytest`, `-pluggy`, `-iniconfig`, `-pygments`; 0 version differences.
+
+**Not verified here:**
+- The `sys.path` order inside the real Lambda runtime process. Lambda places `LAMBDA_TASK_ROOT` first, but the shadowing check above used `PYTHONPATH`.
+- Any AWS call from the image: Bedrock, DynamoDB, the lease and finalization transactions under the Lambda role. Those are §7.
+- Performance under amd64 emulation is not representative.
+
+**Not changed:** `Dockerfile.rss` and `Dockerfile.github` still use Python 3.12 and `requirements.txt`. The Lambda doesn't use them.
+
 ## 4. Target commit, build and rollback
 
 **Target commit:** the commit that adds the lock and the `Dockerfile` change (§3).
