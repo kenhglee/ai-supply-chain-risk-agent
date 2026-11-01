@@ -1318,9 +1318,11 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - Earlier run `OWN-takeover-20261031T233348Z` showed recovery at epoch 3 but is incomplete: it recorded no owner exit, so post-kill contention is unverified there
   - [x] AWS experiment C, DR1 on the owned lifecycle, accepted (`DR1-owned-20261101T155104Z`, git commit `68af710`, clean tree; its `CODE_REVISION` was stale at `974c21e`): 20 of 20 checks. START paused before `validate` at epoch 1; RESUME in a new process at epoch 2 with no retrieval, embedding or model call; finalized `suppressed`, lease released at epoch 2
   - A, B and C ran as local workers against dev AWS with developer credentials (`ken-ai-dev`), not on a deployed executor
-  - [ ] IAM apply (reviewed plan, 1 policy)
-  - [ ] Deployment of an ownership image
-  - [ ] Verification on a deployed executor (Lambda or a worker under its own role)
+  - [x] IAM apply: `RiskCheckpointOwnership` on `RiskAgentLambdaRole` (2026-11-01, via the deployment role after a one-statement concurrency bootstrap)
+  - [x] Deployment of an ownership image: `sha256:7701dd33…` from `a117c8c` (Python 3.13, hashed lock), under a reserved-concurrency hold that has since been released
+  - [x] Verification on the deployed Lambda, P2–P4 ([deployment review §11](OWNERSHIP_DEPLOYMENT_REVIEW.md#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949)): START paused at epoch 1; RESUME finalized `suppressed` at epoch 2 under the Lambda role; a repeat RESUME returned `already_completed`, with only the lease advancing to epoch 3
+  - [ ] P5–P8 on the deployed Lambda (contention, an owner on another executor, an eligible alert failing closed, logs and conflict counts)
+  - Open observations: a cold-start init timeout (cause undetermined), and `state_written` null in the completion trace
   - [ ] Simultaneous-contender and transaction-conflict evidence on real DynamoDB
 - [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); AWS: suppressed route verified manually (`thread-68cb0fe1…`), action-eligible route pending
 

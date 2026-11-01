@@ -1,8 +1,9 @@
-# Same-Thread Ownership: Deployment Review (for review; nothing applied)
+# Same-Thread Ownership: Deployment Review
 
-**Status:** review only.
-- Nothing has been applied, built, pushed, deployed or invoked.
-- Prepared from branch `assess-before-act` at `a3a710d`.
+**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4 have passed; see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
+- P5–P8 are not run yet.
+- Phase 2 (ticketing) is not implemented, and governance stays unconfigured on the Lambda.
+- The review itself was prepared from branch `assess-before-act` at `a3a710d`.
 
 **Inputs, all read-only:**
 - The ownership preflight ([evidence](evidence/OWN-preflight-20261101T155611Z.json)). It refuses every non-read AWS call inside the process.
@@ -306,3 +307,49 @@ Throttle first, then roll back.
 - **Reconciling `IN_FLIGHT` actions** and X1 cross-thread deduplication (out of scope).
 - **Unfenced workers on other machines:** attestation only.
 - **The scheduled RSS path:** it isn't checkpointed, and has no trigger.
+
+## 11. Phase 1 rollout record (2026-11-01, dev account 714781437949)
+
+Every apply below used a saved plan, after its SHA-256 and the caller's identity were checked.
+
+**Deployed:** image `714781437949.dkr.ecr.us-west-2.amazonaws.com/ai-supply-chain-risk-agent@sha256:7701dd3365cae6e753d2864d051d105bcee31fe3bfa41bb16fe5ea3a250662bd`.
+- Built from source `a117c8cf2d300296e33de04dfd5c707ef26df78d` (`git archive`, linux/amd64, pinned Python 3.13 base, hashed lock). ECR tag `a117c8c`.
+- Its OCI label `org.opencontainers.image.revision` carries the same commit.
+- Image identity, manifest and package list: [evidence](evidence/OWN-image-a117c8c/).
+- **Rollback target:** `sha256:a0500bbe…` (§4).
+
+**Rollout steps:**
+
+| Step | Change | Identity | Result |
+|---|---|---|---|
+| Deploy-role bootstrap (`a117c8c`) | `TerraformDeploymentPolicy`: `RiskAgentLambdaConcurrency` (`lambda:Get/Put/DeleteFunctionConcurrency` on this function only); targeted apply | `ken-ai-dev` (admin) | 1 changed. IAM simulation: all three actions `allowed` on the function, `implicitDeny` on any other function |
+| Hold + ownership IAM (`2be27e3`, plan made at `a117c8c`) | `RiskCheckpointOwnership` created; reserved concurrency `-1 → 0` | `TerraformDeploymentRole` | 1 added, 1 changed. Concurrency 0 confirmed at 16:29:27Z. The policy matches the reviewed document |
+| Drain | Waited until 16:31:57Z (150 s after the hold) | read-only | Function logs: 0 events since 2026-10-11 (an observed zero). Invocation, concurrency, throttle and async metrics: **no datapoints** (missing telemetry, not an observed zero). The function was `Inactive` (`Idle`). No invocation sources |
+| Image (`5ec2e48`) | `image_uri` → `7701dd33…`, hold kept at 0 | `TerraformDeploymentRole` | 1 changed (16:38Z). `LastUpdateStatus: Successful`, `State: Active`. Role, environment and ownership IAM unchanged; `AUTHORITY_TABLE` / `ACTIONS_TABLE` absent. A fresh plan showed no changes |
+| Hold release (`8b9a64c`) | Reserved concurrency `0 → -1` | `TerraformDeploymentRole` | 1 changed (16:42:37Z). Re-checked first: still no async or throttle datapoints, no log events, no invocation sources |
+
+**Deployed checks** (`RiskAgentLambdaRole`; synchronous `aws lambda invoke` with `AWS_MAX_ATTEMPTS=1`, each run once, none retried):
+
+| Check | Evidence | Result |
+|---|---|---|
+| **P2** `checkpoint_start`, TSMC earthquake | [OWN-lambda-P2-20261101T164251Z](evidence/OWN-lambda-P2-20261101T164251Z/) | Lambda 200, no `FunctionError`; handler 200 **`paused`**, `next: ["analyze"]`, **`lease_epoch: 1`**, `thread-556d48cfd1a44c488e39f4b685330d88`. The lease is `RELEASED` at epoch 1 with no final marker. Checkpoint at step 3 with `lease_epoch: 1` in its metadata and no pending writes. Trace `paused` (`infer`, `decide`, `retrieve`). One Claude call (Converse) and 4 Titan embedding calls. No ledger item and no business write. No AccessDenied or import errors; the FAISS AVX2 message is an informational fallback |
+| **P3** `checkpoint_resume` | [OWN-lambda-P3-20261101T164525Z](evidence/OWN-lambda-P3-20261101T164525Z/) | Lambda 200, no `FunctionError`; handler 200 **`completed`**, **`suppressed`** (`eligibility_basis: assessed`, `action_eligible: false`), **`lease_epoch: 2`**. START's retrieval steps are reused byte for byte, `analyze` ran (one Converse call, no embeddings), then `validate` and `assess`. **Finalization under `RiskAgentLambdaRole`:** final marker `finalized` at epoch 2 by RESUME trace `8cbf0626…`, and the `TSMC#earthquake` row is written (`last_seen_at` 16:45:28Z). The lease is then `RELEASED` at epoch 2. Step 6, 0 pending writes. No ledger item. No AccessDenied or transaction errors. Warm, 2.5 s |
+| **P4** repeat `checkpoint_resume` | [OWN-lambda-P4-20261101T164718Z](evidence/OWN-lambda-P4-20261101T164718Z/) (`before.json` / `after.json`) | Lambda 200; handler 200 **`already_completed`**, reporting the finalizer's trace `8cbf0626…` and epoch 2, `state_written: false`. No model or embedding calls. Business row, final marker, ledger, checkpoints and the thread's traces are **unchanged**. **Only the lease changed: epoch 2 → 3**, owned by this attempt's own trace id, which appears nowhere else, and `RELEASED`. Warm, 249 ms |
+
+**What P2–P4 show:**
+- Owned START, RESUME and the repeat RESUME work on the deployed executor under its own scoped role. That includes `LeadingKeys`-conditioned lease updates, fenced checkpoint transactions and the finalization transaction (rollout plan §4 gap 5).
+- A finalized thread produced no repeated effect or business write in this case. This is not an exactly-once guarantee (§7).
+
+**Open observations; not addressed, and no code was changed for them:**
+1. **Cold-start initialization timeout.**
+   - P2's first cold start logged `INIT_REPORT Init Duration: 9999.71 ms Phase: init Status: timeout`. Lambda then re-ran initialization inside the invocation, and the request succeeded (`Duration` 18,977 ms).
+   - Locally, under the base image's runtime interface emulator, initialization took 0.8 s.
+   - **The cause is not determined.** Nothing collected here establishes it, so it isn't attributed to image fetching or anything else. It needs init-phase evidence from further cold starts.
+2. **`state_written` is null in the completion trace.** P3's completion trace (`resumed_completed`) records `state_written: null`. The handler outcome reported `state_written: true`, and the final marker and state row confirm the write.
+
+**Recording quirk:** P2's `invoke-times.txt` start line reads `16:42:51.3NZ`, because BSD `date` doesn't support `%3N`. The time is accurate to the second, and the Lambda log gives the precise times.
+
+**Not yet done:**
+- P5 (parallel synchronous contention), P6 (local owner holding the thread, Lambda contender), P7 (eligible alert failing closed) and P8 (logs and conflict counts, preflight re-run).
+- Phase 2 (ticketing).
+- The items in §10.

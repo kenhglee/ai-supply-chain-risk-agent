@@ -1,11 +1,18 @@
 # Same-Thread Ownership: AWS Rollout Plan (for review)
 
-**Status:** step 1 (read-only preflight and plan) and step 3 are done: experiments A, B and C (owned DR1) are accepted against AWS. They ran as local workers with developer credentials (`ken-ai-dev`); see [Results](#9-results). Still not done:
-- No Terraform has been applied.
-- Nothing has been deployed or adopted.
-- The Lambda has not been invoked, and no historical thread has been resumed.
+**Status:** step 1 (read-only preflight and plan) and step 3 are done: experiments A, B and C (owned DR1) are accepted against AWS. They ran as local workers with developer credentials (`ken-ai-dev`); see [Results](#9-results).
 
-Deployment review (not applied): [`OWNERSHIP_DEPLOYMENT_REVIEW.md`](OWNERSHIP_DEPLOYMENT_REVIEW.md). Design: `docs/SAME_THREAD_OWNERSHIP_DESIGN.md` (§16 lists the requirements). Code: branch `assess-before-act`.
+**Phase 1 is deployed to the dev Lambda (2026-11-01).**
+- What's live: `RiskCheckpointOwnership`, and the ownership image `sha256:7701dd33…` built from `a117c8c`. The rollout hold has been applied and released.
+- **Deployed checks P2–P4 passed** under `RiskAgentLambdaRole`.
+- For the record, see the [deployment review §11](OWNERSHIP_DEPLOYMENT_REVIEW.md#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
+
+**Still not done:**
+- P5–P8.
+- Lambda ticketing: governance remains unconfigured.
+- No historical (legacy) thread has been resumed.
+
+Deployment review: [`OWNERSHIP_DEPLOYMENT_REVIEW.md`](OWNERSHIP_DEPLOYMENT_REVIEW.md). Design: `docs/SAME_THREAD_OWNERSHIP_DESIGN.md` (§16 lists the requirements). Code: branch `assess-before-act`.
 
 ## 1. Executors and what could not be inspected
 

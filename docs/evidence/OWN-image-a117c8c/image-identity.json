@@ -1,0 +1,13 @@
+{
+  "repository": "714781437949.dkr.ecr.us-west-2.amazonaws.com/ai-supply-chain-risk-agent",
+  "tag": "a117c8c",
+  "registry_digest": "sha256:7701dd3365cae6e753d2864d051d105bcee31fe3bfa41bb16fe5ea3a250662bd",
+  "manifest_media_type": "application/vnd.oci.image.manifest.v1+json",
+  "config_digest": "sha256:cf7a8f597a4b4796d3637a85fcc5660d6c7c6bff5c0d0c589cfc7ba32bd8611f",
+  "platform": "linux/amd64",
+  "source_revision": "a117c8cf2d300296e33de04dfd5c707ef26df78d",
+  "base_image": "public.ecr.aws/lambda/python:3.13@sha256:2f2661d61213e6690f7613bee9d041592c0e92d977168fe6322077e378ade073",
+  "python": "3.13.18",
+  "packages_file": "packages.txt",
+  "package_count": 87
+}

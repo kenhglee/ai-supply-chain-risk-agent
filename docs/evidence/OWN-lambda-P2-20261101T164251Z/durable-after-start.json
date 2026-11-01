@@ -1,0 +1,42 @@
+{
+ "lease": {
+  "epoch": "1",
+  "owner": "2619d1c9d7c0468897bb1451ad15ec16",
+  "acquired_at_ms": "1793551389432",
+  "released_at_ms": "1793551401449",
+  "state": "RELEASED",
+  "expires_at_ms": "1793551509432",
+  "thread_id": "thread-556d48cfd1a44c488e39f4b685330d88",
+  "sk": "lease",
+  "owner_executor": "2026/11/01/[$LATEST]91deacc3eb494d7e8a49be6b984d1de8"
+ },
+ "final": null,
+ "checkpoint_items": 62,
+ "trace": {
+  "model_metadata": "[{\"model_id\": \"triage_primary\", \"model_version\": \"v1\", \"model_status\": \"approved\", \"model_provider\": \"openai\", \"model_name\": \"gpt-4o-mini\", \"model_description\": \"Primary model for triage decisions. Decides whether supplier-context retrieval is needed before risk analysis; returns 'retrieve' or 'skip'.\", \"runtime_provider\": \"bedrock\", \"runtime_model_name\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"runtime_overridden\": true}, {\"model_id\": \"risk_analysis_primary\", \"model_version\": \"v1\", \"model_status\": \"approved\", \"model_provider\": \"openai\", \"model_name\": \"gpt-4o-mini\", \"model_description\": \"Primary model for supply chain risk classification. Receives a headline, candidate suppliers, and retrieved context; returns a structured JSON risk alert.\", \"runtime_provider\": \"bedrock\", \"runtime_model_name\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"runtime_overridden\": true}]",
+  "run_duration_ms": "11912.4",
+  "created_at": "2026-11-01T16:43:09.486+00:00",
+  "thread_id": "thread-556d48cfd1a44c488e39f4b685330d88",
+  "tool_decision": "retrieve",
+  "lineage_checkpoint_id": "1f1d6135-914f-6b31-8003-1d10332f4d59",
+  "store_backend": "dynamodb",
+  "prompt_metadata": "[{\"prompt_id\": \"triage_agent\", \"prompt_version\": \"v1\", \"prompt_status\": \"approved\", \"prompt_description\": \"Decides whether supplier-context retrieval is needed before LLM risk analysis. Returns exactly one word: 'retrieve' or 'skip'.\"}, {\"prompt_id\": \"risk_classifier\", \"prompt_version\": \"v1\", \"prompt_status\": \"approved\", \"prompt_description\": \"Analyzes a supply chain headline and returns a structured JSON risk alert with supplier, risk type, risk level, impact, and recommended action.\"}]",
+  "trace_steps": "[{\"node_name\": \"infer\", \"started_at\": \"2026-11-01T16:43:09.607+00:00\", \"ended_at\": \"2026-11-01T16:43:09.607+00:00\", \"duration_ms\": 0.0}, {\"node_name\": \"decide\", \"started_at\": \"2026-11-01T16:43:09.628+00:00\", \"ended_at\": \"2026-11-01T16:43:10.102+00:00\", \"duration_ms\": 473.7, \"decision\": \"retrieve\"}, {\"node_name\": \"retrieve\", \"started_at\": \"2026-11-01T16:43:10.129+00:00\", \"ended_at\": \"2026-11-01T16:43:21.245+00:00\", \"duration_ms\": 11116.7}]",
+  "executor_id": "2026/11/01/[$LATEST]91deacc3eb494d7e8a49be6b984d1de8",
+  "trace_id": "2619d1c9d7c0468897bb1451ad15ec16",
+  "lease_epoch": "1",
+  "alert_id": "f6c88d76ebfc435ea3ae40696f30ef05",
+  "workflow_event": "paused",
+  "headline": "TSMC halts production after earthquake in Taiwan",
+  "retriever_metadata": "{\"retriever_id\": \"faiss_supplier_profiles\", \"retriever_version\": \"v1\", \"embedding_provider\": \"bedrock\", \"top_k\": 4, \"latency_ms\": 11116.7}",
+  "change_type": null
+ },
+ "tsmc_row": {
+  "risk_type": "earthquake",
+  "pk": "TSMC#earthquake",
+  "supplier": "TSMC",
+  "last_seen_at": "2026-11-01T15:51:16+00:00",
+  "last_headline": "TSMC halts production after earthquake in Taiwan",
+  "current_risk_level": "High"
+ }
+}
