@@ -168,11 +168,34 @@ docker buildx build --platform linux/amd64 --provenance=false \
 
 ## 5. Stopping unfenced executors
 
-**Throttle mechanism.** `reserved_concurrent_executions` isn't set in `lambda.tf`.
-- If you throttle by hand with `put-function-concurrency`, the next Terraform apply would likely remove it (`0 → -1`). Removing the throttle at the same moment as the image update is exactly what must not happen.
-- **Proposal:** manage the throttle in Terraform with a variable, `reserved_concurrent_executions = var.risk_agent_reserved_concurrency`, defaulting to `-1`.
-- Set it to `0` in `terraform.tfvars` for every apply in steps 1–5, and remove the throttle only as its own apply in step 7.
-- This is a separate infrastructure change and isn't written yet.
+**Throttle mechanism (implemented in Terraform; not applied).**
+- `lambda.tf` sets `reserved_concurrent_executions = var.risk_agent_reserved_concurrency`.
+- In `variables.tf`, the variable is a `number` with default **`-1`** (unreserved), the value the state already records. A validation rejects anything that isn't a whole number ≥ -1: `-2` and `1.5` are both refused at plan time.
+- A throttle set by hand with `put-function-concurrency` would be reverted by the next Terraform apply. That's why the throttle lives in Terraform.
+
+**Plans** (`terraform plan -lock=false` with read-only credentials, 2026-11-01; neither applied):
+
+| Plan | Variable | Result | Changed attributes |
+|---|---|---|---|
+| Default | `-1` (from the default) | `1 to add, 0 to change, 0 to destroy` | Only `aws_iam_role_policy.risk_checkpoint_ownership` is created. The new variable changes nothing on the live function |
+| Rollout hold | `0` | `1 to add, 1 to change, 0 to destroy` | The same IAM policy, plus `aws_lambda_function.risk_agent`: `reserved_concurrent_executions -1 → 0`, the only attribute that changes |
+
+- Both plans report three refresh-time `resource_drift` entries with no planned action. They are `tags` read back as `{}` instead of null, on `RiskAgentPolicyClaudeDeny`, `RiskAgentGovernedWorkerRole` and `RiskAgentPolicyMaterializerRole`, and the two roles' computed `inline_policy`, read back from their separately managed policy resources.
+- These are normalizations, not configuration drift, and the text plans show no "changed outside of Terraform" section.
+
+**Keeping the hold at 0 through the IAM and image updates:**
+1. Add this line to `terraform/terraform.tfvars`, next to the digest:
+   ```hcl
+   risk_agent_reserved_concurrency = 0
+   ```
+2. Terraform loads `terraform.tfvars` automatically on every plan and apply in `terraform/`, so the IAM apply and the image apply both carry `0`.
+   - Once the state records `0`, those plans show **no** change to `reserved_concurrent_executions`. The image plan's only change should be `image_uri`.
+   - The hold applies to every run from `terraform/`, so it doesn't depend on a flag that has to be repeated.
+3. **Precedence:** only `-var` / `-var-file` on the command line, or a `*.auto.tfvars` file, can override `terraform.tfvars`. A `TF_VAR_risk_agent_reserved_concurrency` environment variable can't.
+   - During the rollout, pass neither `-var` nor `-var-file` for this variable, and add no `*.auto.tfvars`. None exists today.
+4. **Apply only saved plans** (`terraform plan -out=<file>`, review it, then `terraform apply <file>`). Before every apply, confirm the plan doesn't contain `reserved_concurrent_executions = 0 -> -1`.
+   - An apply that dropped the line, or ran from a checkout without it, would show exactly that change. It isn't silent in a reviewed plan, but `apply -auto-approve` would skip the review.
+5. **Lift the hold only after readiness is verified (§6 step 5).** Remove the line (or set `-1`) as its own change. That plan must show only `reserved_concurrent_executions 0 → -1`.
 
 **Invocations already running:**
 - A throttle of 0 refuses new invocations, but doesn't stop ones already running. A code update doesn't stop them either.
@@ -192,19 +215,22 @@ docker buildx build --platform linux/amd64 --provenance=false \
 ## 6. Phase 1 sequence
 
 Each step's apply goes through a saved, reviewed plan.
-1. Re-run the preflight and `terraform plan -lock=false`; the expected results are §1 and §2.
-2. Apply the throttle: `risk_agent_reserved_concurrency = 0`.
-3. Drain (§5): wait past the timeout and confirm no execution.
-4. Apply the IAM change (§2) alone.
-5. Build, verify and push (§3–§4). Set the digest in `terraform.tfvars` with the throttle still at `0`. The plan should show only `image_uri` changing. Apply.
-6. **Verify image readiness while throttled; this needs no invocation:**
+1. Re-run the preflight and `terraform plan -lock=false`. The expected results are in §1, §2 and §5 (the default plan).
+2. **Hold and IAM:** add `risk_agent_reserved_concurrency = 0` to `terraform.tfvars` (§5), then plan and apply.
+   - Expect the rollout-hold plan: the policy is created, and `reserved_concurrent_executions` goes `-1 → 0`.
+   - Applying the two together is safe: the IAM policy only adds permissions and changes nothing for the old code.
+   - To throttle first and then apply IAM separately, use two plans, with `-target=aws_lambda_function.risk_agent` on the first.
+3. Drain (§5): wait past the timeout and confirm nothing executes.
+4. Build, verify and push (§3–§4). Set the digest in `terraform.tfvars`, keeping the hold line. The plan should change only `image_uri`, with no `reserved_concurrent_executions` change. Apply.
+5. **Verify image readiness while throttled; this needs no invocation:**
    - `GetFunction` shows `State: Active` and `LastUpdateStatus: Successful`.
    - `ResolvedImageUri` equals the pushed digest.
    - The environment is unchanged (no governance tables).
    - The role has `RiskCheckpointOwnership`.
-   - Limit: Lambda initializes the image only on the first invocation, so a failure at import time can only show up in step 8.
-7. Remove the throttle (`-1`) as its own apply.
-8. Run the checks in §7.
+   - `GetFunctionConcurrency` reports `0`.
+   - Limit: Lambda initializes the image only on its first invocation, so a failure at import time can only show up in step 7.
+6. **Lift the hold** in its own change: remove the line, or set `-1`. The plan must change only `reserved_concurrent_executions 0 → -1`.
+7. Run the checks in §7.
 
 ## 7. Phase 1 checks (executed as the Lambda execution role)
 

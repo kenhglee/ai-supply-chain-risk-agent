@@ -10,6 +10,10 @@ resource "aws_lambda_function" "risk_agent" {
   memory_size   = 1028
   timeout       = 123
 
+  # -1 (default) leaves concurrency unreserved; 0 holds the function stopped
+  # during a rollout (docs/OWNERSHIP_DEPLOYMENT_REVIEW.md §5).
+  reserved_concurrent_executions = var.risk_agent_reserved_concurrency
+
   ephemeral_storage {
     size = 512
   }
