@@ -1,0 +1,97 @@
+{
+ "traces": [
+  {
+   "model_metadata": "[{\"model_id\": \"triage_primary\", \"model_version\": \"v1\", \"model_status\": \"approved\", \"model_provider\": \"openai\", \"model_name\": \"gpt-4o-mini\", \"model_description\": \"Primary model for triage decisions. Decides whether supplier-context retrieval is needed before risk analysis; returns 'retrieve' or 'skip'.\", \"runtime_provider\": \"bedrock\", \"runtime_model_name\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"runtime_overridden\": true}, {\"model_id\": \"risk_analysis_primary\", \"model_version\": \"v1\", \"model_status\": \"approved\", \"model_provider\": \"openai\", \"model_name\": \"gpt-4o-mini\", \"model_description\": \"Primary model for supply chain risk classification. Receives a headline, candidate suppliers, and retrieved context; returns a structured JSON risk alert.\", \"runtime_provider\": \"bedrock\", \"runtime_model_name\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"runtime_overridden\": true}]",
+   "run_duration_ms": "1783.7",
+   "created_at": "2026-11-01T17:01:28.637+00:00",
+   "lineage_checkpoint_id": "1f1d615e-232e-6aff-8003-d878c4b10d8a",
+   "tool_decision": "retrieve",
+   "thread_id": "thread-ec26e56cb6604e999a044547c8ac0631",
+   "prompt_metadata": "[{\"prompt_id\": \"triage_agent\", \"prompt_version\": \"v1\", \"prompt_status\": \"approved\", \"prompt_description\": \"Decides whether supplier-context retrieval is needed before LLM risk analysis. Returns exactly one word: 'retrieve' or 'skip'.\"}, {\"prompt_id\": \"risk_classifier\", \"prompt_version\": \"v1\", \"prompt_status\": \"approved\", \"prompt_description\": \"Analyzes a supply chain headline and returns a structured JSON risk alert with supplier, risk type, risk level, impact, and recommended action.\"}]",
+   "store_backend": "dynamodb",
+   "trace_steps": "[{\"node_name\": \"infer\", \"started_at\": \"2026-11-01T17:01:28.761+00:00\", \"ended_at\": \"2026-11-01T17:01:28.761+00:00\", \"duration_ms\": 0.0}, {\"node_name\": \"decide\", \"started_at\": \"2026-11-01T17:01:28.784+00:00\", \"ended_at\": \"2026-11-01T17:01:29.243+00:00\", \"duration_ms\": 458.5, \"decision\": \"retrieve\"}, {\"node_name\": \"retrieve\", \"started_at\": \"2026-11-01T17:01:29.269+00:00\", \"ended_at\": \"2026-11-01T17:01:30.283+00:00\", \"duration_ms\": 1013.6}]",
+   "executor_id": "2026/11/01/[$LATEST]6ff4abe01c774a5a8f3cd2a2dc414c3c",
+   "trace_id": "8c499932a73c4efd8c70b5ff5502d000",
+   "alert_id": "0f357efb04d14e859e8ed9dae0d16f4b",
+   "lease_epoch": "1",
+   "workflow_event": "paused",
+   "headline": "Murata halts capacitor production after flooding in Malaysia",
+   "retriever_metadata": "{\"retriever_id\": \"faiss_supplier_profiles\", \"retriever_version\": \"v1\", \"embedding_provider\": \"bedrock\", \"top_k\": 4, \"latency_ms\": 1013.6}",
+   "change_type": null
+  },
+  {
+   "model_metadata": "[{\"model_id\": \"triage_primary\", \"model_version\": \"v1\", \"model_status\": \"approved\", \"model_provider\": \"openai\", \"model_name\": \"gpt-4o-mini\", \"model_description\": \"Primary model for triage decisions. Decides whether supplier-context retrieval is needed before risk analysis; returns 'retrieve' or 'skip'.\", \"runtime_provider\": \"bedrock\", \"runtime_model_name\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"runtime_overridden\": true}, {\"model_id\": \"risk_analysis_primary\", \"model_version\": \"v1\", \"model_status\": \"approved\", \"model_provider\": \"openai\", \"model_name\": \"gpt-4o-mini\", \"model_description\": \"Primary model for supply chain risk classification. Receives a headline, candidate suppliers, and retrieved context; returns a structured JSON risk alert.\", \"runtime_provider\": \"bedrock\", \"runtime_model_name\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"runtime_overridden\": true}]",
+   "run_duration_ms": "2013.4",
+   "tool_decision": "retrieve",
+   "trace_steps": "[{\"node_name\": \"infer\", \"started_at\": \"2026-11-01T17:01:28.761+00:00\", \"ended_at\": \"2026-11-01T17:01:28.761+00:00\", \"duration_ms\": 0.0}, {\"node_name\": \"decide\", \"started_at\": \"2026-11-01T17:01:28.784+00:00\", \"ended_at\": \"2026-11-01T17:01:29.243+00:00\", \"duration_ms\": 458.5, \"decision\": \"retrieve\"}, {\"node_name\": \"retrieve\", \"started_at\": \"2026-11-01T17:01:29.269+00:00\", \"ended_at\": \"2026-11-01T17:01:30.283+00:00\", \"duration_ms\": 1013.6}, {\"node_name\": \"analyze\", \"started_at\": \"2026-11-01T17:02:58.537+00:00\", \"ended_at\": \"2026-11-01T17:03:00.237+00:00\", \"duration_ms\": 1700.5}, {\"node_name\": \"validate\", \"started_at\": \"2026-11-01T17:03:00.303+00:00\", \"ended_at\": \"2026-11-01T17:03:00.303+00:00\", \"duration_ms\": 0.0, \"decision\": \"valid\"}, {\"node_name\": \"assess\", \"started_at\": \"2026-11-01T17:03:00.329+00:00\", \"ended_at\": \"2026-11-01T17:03:00.367+00:00\", \"duration_ms\": 38.6, \"decision\": \"act\"}]",
+   "action_eligible": true,
+   "executor_id": "2026/11/01/[$LATEST]6ff4abe01c774a5a8f3cd2a2dc414c3c",
+   "final_status": "ok",
+   "alert_id": "0f357efb04d14e859e8ed9dae0d16f4b",
+   "eligibility_change_type": "new_alert",
+   "eligibility_basis": "assessed",
+   "headline": "Murata halts capacitor production after flooding in Malaysia",
+   "retriever_metadata": "{\"retriever_id\": \"faiss_supplier_profiles\", \"retriever_version\": \"v1\", \"embedding_provider\": \"bedrock\", \"top_k\": 4, \"latency_ms\": 1013.6}",
+   "action_status": "DENIED",
+   "risk_type": "flood",
+   "change_type": null,
+   "risk_level": "High",
+   "created_at": "2026-11-01T17:02:58.514+00:00",
+   "lineage_checkpoint_id": "1f1d6161-7e4b-6942-8006-fe3254056f19",
+   "thread_id": "thread-ec26e56cb6604e999a044547c8ac0631",
+   "store_backend": "dynamodb",
+   "prompt_metadata": "[{\"prompt_id\": \"triage_agent\", \"prompt_version\": \"v1\", \"prompt_status\": \"approved\", \"prompt_description\": \"Decides whether supplier-context retrieval is needed before LLM risk analysis. Returns exactly one word: 'retrieve' or 'skip'.\"}, {\"prompt_id\": \"risk_classifier\", \"prompt_version\": \"v1\", \"prompt_status\": \"approved\", \"prompt_description\": \"Analyzes a supply chain headline and returns a structured JSON risk alert with supplier, risk type, risk level, impact, and recommended action.\"}]",
+   "denied_layer": "emergency",
+   "supplier": "Murata",
+   "trace_id": "f4cd2b3469ec41a58ca66d00b47e4a85",
+   "lease_epoch": "2",
+   "authority_status": "UNCONFIGURED",
+   "workflow_event": "authority_denied",
+   "action_id": "action#thread-ec26e56cb6604e999a044547c8ac0631#open_review_ticket"
+  }
+ ],
+ "lease": {
+  "sk": "lease",
+  "released_at_ms": "1793552580535",
+  "acquired_at_ms": "1793552578460",
+  "epoch": "2",
+  "thread_id": "thread-ec26e56cb6604e999a044547c8ac0631",
+  "expires_at_ms": "1793552698460",
+  "owner": "f4cd2b3469ec41a58ca66d00b47e4a85",
+  "owner_executor": "2026/11/01/[$LATEST]6ff4abe01c774a5a8f3cd2a2dc414c3c",
+  "state": "RELEASED"
+ },
+ "final": null,
+ "checkpoint_id": "1f1d6161-7e4b-6942-8006-fe3254056f19",
+ "step": 6,
+ "checkpoint_lease_epoch": 2,
+ "branches": [
+  "branch:to:act"
+ ],
+ "pending_writes": 1,
+ "alert": {
+  "status": "ok",
+  "supplier": "Murata",
+  "risk_type": "flood",
+  "risk_level": "High",
+  "impact": "Murata's capacitor production halt in Malaysia will disrupt supply of critical passive electronic components to downstream manufacturers. This affects electronics supply chains globally, particularly for devices requiring high-reliability capacitors. Production delays may extend lead times and create component shortages.",
+  "recommended_action": "Immediately contact Murata for production timeline and recovery estimates. Identify alternative capacitor suppliers and assess inventory levels. Consider expediting orders from other suppliers and implementing supply chain diversification strategies to mitigate future single-source dependencies.",
+  "relevant_supplier_context": "Murata is a major supplier of passive electronic components including capacitors and sensors. The company faces documented risks from natural disasters and factory disruptions that can significantly impact electronics supply chains."
+ },
+ "assessment": {
+  "basis": "assessed",
+  "eligibility_change_type": "new_alert",
+  "action_eligible": true,
+  "prior_risk_level": null,
+  "prior_last_seen_at": null
+ },
+ "action_result": null,
+ "candidate_suppliers": [
+  "Murata"
+ ],
+ "ledger_item": null,
+ "state_rows": [
+  "TSMC#earthquake",
+  "TSMC#outage"
+ ]
+}

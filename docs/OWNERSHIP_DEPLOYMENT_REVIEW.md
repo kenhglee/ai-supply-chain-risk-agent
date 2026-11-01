@@ -1,7 +1,7 @@
 # Same-Thread Ownership: Deployment Review
 
-**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4 and P6 have passed; see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
-- P5, P7 and P8 are not run yet.
+**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4, P6 and P7 have passed; see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
+- P5 and P8 are not run yet.
 - Phase 2 (ticketing) is not implemented, and governance stays unconfigured on the Lambda.
 - The review itself was prepared from branch `assess-before-act` at `a3a710d`.
 
@@ -393,7 +393,60 @@ Every apply below used a saved plan, after its SHA-256 and the caller's identity
 
 **Cold start:** this environment's initialization took **4,111.74 ms** and completed within the limit (there's no `INIT_REPORT` timeout line). That doesn't resolve P2's 9,999.71 ms init timeout, whose cause is still undetermined.
 
+### P7: an eligible alert fails closed on the unconfigured Lambda
+
+**Run `OWN-lambda-P7-20261101T170122Z`** ([evidence](evidence/OWN-lambda-P7-20261101T170122Z/)), thread `thread-ec26e56cb6604e999a044547c8ac0631`.
+- **Headline:** *"Murata halts capacitor production after flooding in Malaysia"*.
+- **Why this pair:** a read-only scan at 16:58:59Z showed no `Murata#…` row. The real `infer_candidate_suppliers_from_graph`, run offline, gave `['Murata']` as the only candidate.
+- **Invocations:** two synchronous ones, START then RESUME, each with `AWS_MAX_ATTEMPTS=1`. The CLI exit code (0 for both) and client-side times were recorded.
+
+**START** (17:01:22.722–17:01:30.591Z, request `6b330d5a-…`):
+- Transport `StatusCode 200`, no `FunctionError`. Handler `200`, `paused`, `next: ["analyze"]`, **`lease_epoch: 1`**, trace `8c499932…`.
+- Cold start on a new environment (`…6ff4abe0…`): `Init Duration: 4109.40 ms`, no timeout line.
+- One Converse call and 4 Titan `InvokeModel` calls, all by `RiskAgentLambdaRole` (log and CloudTrail).
+
+**RESUME** (17:02:57.904–17:03:00.638Z, request `c13c26ff-…`, warm, 2,214 ms):
+- Transport `StatusCode 200`, no `FunctionError`.
+- Handler **`200`** with:
+  - `status: authority_denied`, `next: ["act"]`, **`lease_epoch: 2`**;
+  - `supplier: Murata`, **`eligibility_change_type: new_alert`**, `action_eligible: true`, `eligibility_basis: assessed`;
+  - `action_id: action#thread-ec26e56c…#open_review_ticket`, `action_status: DENIED`, `authority_version: null`;
+  - `change_type: null`, `state_written: false`, `final_status: ok`, `finalized_by_trace_id: null`.
+- **Model calls:** one Converse call (`analyze`) and **no Titan calls**, so retrieval wasn't repeated (log and CloudTrail).
+
+**The denial trace as recorded** (`f4cd2b34…`, `workflow_event: authority_denied`):
+
+| Field | Value |
+|---|---|
+| `authority_status` | **`UNCONFIGURED`** |
+| `denied_layer` | `emergency`, the `AuthorityDenied` default. The unconfigured case is identified by `authority_status`, not by the layer |
+| `policy_version` / `policy_sha256` / `authority_version` | `null` / `null` / `null` |
+| `action_id` / `action_status` | `action#thread-ec26e56c…#open_review_ticket` / `DENIED`. This is the outcome only; **no ledger item exists** |
+| `eligibility_change_type` / `action_eligible` / `eligibility_basis` | `new_alert` / `true` / `assessed` |
+| `lease_epoch` | `2` |
+| `change_type` / `state_written` | `null` / `null` |
+| Steps | `infer`, `decide`, `retrieve`, `analyze`, `validate`, `assess` |
+
+**Durable state** (read-only, after RESUME):
+- **Checkpoint parked at `act`:** `1f1d6161-…`, step 6, `lease_epoch: 2` in the metadata, routing only to `act`.
+  - The alert is saved (`Murata`, `flood`, `High`, `ok`; `is_valid: true`).
+  - So is the **assessment** (`basis: assessed`, `eligibility_change_type: new_alert`, `action_eligible: true`, `prior_risk_level: null`).
+  - `action_result` is null.
+- **One pending write:** LangGraph's `__error__` entry for the failed `act` task, holding the `AuthorityDenied` message. It isn't a business or state write. By design a later RESUME re-runs only `act`; that wasn't exercised here.
+- **Lease:** **`RELEASED` at epoch 2**, owned by the RESUME trace `f4cd2b34…` on the Lambda environment `…6ff4abe0…`.
+- **Not written:** no **final marker**, no **action-ledger item** for the thread, and **no `Murata#…` row**. `supplier_risk_state` still holds only `TSMC#earthquake` (unchanged since 16:54:58Z) and `TSMC#outage`.
+- **Logs:** 26 events, no AccessDenied, exception, transaction or throttling lines. The only error-like line is the known FAISS AVX2 fallback.
+
+**What P7 demonstrates:**
+- On the deployed executor, under ownership, an action-eligible alert (`new_alert`) **fails closed** when governance is unconfigured.
+- The `act` node is denied before reaching the ledger. Nothing is finalized, no business state is written, and the lease is released.
+- The thread stays parked at `act` with its assessment saved, ready for Phase 2.
+
+**Missing evidence:**
+- **No pre-RESUME state was saved.** The planned read-only inspection between START and RESUME (lease at epoch 1, checkpoint at step 3, candidates, no Murata row) wasn't saved. The START response and trace show the pause at epoch 1. No Murata row before RESUME rests on the 16:58:59Z scan before START, plus the absence of any Murata row now.
+- **The pending-write count wasn't in the expected outcome.** The one `__error__` write on the parked checkpoint is LangGraph's failure record.
+
 **Not yet done:**
-- P5 (parallel synchronous contention), P7 (an eligible alert failing closed) and P8 (logs and conflict counts, preflight re-run).
+- P5 (parallel synchronous contention) and P8 (logs and conflict counts, preflight re-run).
 - Phase 2 (ticketing).
 - The items in §10.
