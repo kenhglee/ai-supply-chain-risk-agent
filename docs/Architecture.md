@@ -1321,8 +1321,9 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] IAM apply: `RiskCheckpointOwnership` on `RiskAgentLambdaRole` (2026-11-01, via the deployment role after a one-statement concurrency bootstrap)
   - [x] Deployment of an ownership image: `sha256:7701dd33…` from `a117c8c` (Python 3.13, hashed lock), under a reserved-concurrency hold that has since been released
   - [x] Verification on the deployed Lambda, P2–P4 ([deployment review §11](OWNERSHIP_DEPLOYMENT_REVIEW.md#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949)): START paused at epoch 1; RESUME finalized `suppressed` at epoch 2 under the Lambda role; a repeat RESUME returned `already_completed`, with only the lease advancing to epoch 3
-  - [ ] P5–P8 on the deployed Lambda (contention, an owner on another executor, an eligible alert failing closed, logs and conflict counts)
-  - Open observations: a cold-start init timeout (cause undetermined), and `state_written` null in the completion trace
+  - [x] P6: a local owner held epoch 2, and one synchronous Lambda RESUME returned `contended` (409) with that holder, wrote nothing and made no model call; the owner then finalized at epoch 2 (`OWN-lambda-P6-20261101T165151Z`)
+  - [ ] P5, P7 and P8 on the deployed Lambda (parallel contention, an eligible alert failing closed, logs and conflict counts)
+  - Open observations: a cold-start init timeout in P2 (cause undetermined; P6's cold start took 4,111.74 ms without timing out), and `state_written` null in the completion trace
   - [ ] Simultaneous-contender and transaction-conflict evidence on real DynamoDB
 - [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); AWS: suppressed route verified manually (`thread-68cb0fe1…`), action-eligible route pending
 

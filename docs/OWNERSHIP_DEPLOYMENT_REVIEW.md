@@ -1,7 +1,7 @@
 # Same-Thread Ownership: Deployment Review
 
-**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4 have passed; see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
-- P5–P8 are not run yet.
+**Status:** Phase 1 is deployed to the dev Lambda (2026-11-01), and checks P2–P4 and P6 have passed; see [§11](#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949).
+- P5, P7 and P8 are not run yet.
 - Phase 2 (ticketing) is not implemented, and governance stays unconfigured on the Lambda.
 - The review itself was prepared from branch `assess-before-act` at `a3a710d`.
 
@@ -349,7 +349,51 @@ Every apply below used a saved plan, after its SHA-256 and the caller's identity
 
 **Recording quirk:** P2's `invoke-times.txt` start line reads `16:42:51.3NZ`, because BSD `date` doesn't support `%3N`. The time is accurate to the second, and the Lambda log gives the precise times.
 
+### P6: a local owner holds the thread while the Lambda contends
+
+**Run `OWN-lambda-P6-20261101T165151Z`** ([evidence](evidence/OWN-lambda-P6-20261101T165151Z/)).
+- **Local side:** commit `b67efe4` (clean tree), whose runtime code matches the deployed image's. It ran with developer credentials.
+- **Contender:** one synchronous Lambda `checkpoint_resume` under `RiskAgentLambdaRole`.
+- **Thread:** `thread-c4693a44854641d3b308463ee15f6870`.
+
+**Timeline (UTC):**
+
+| Time | Event |
+|---|---|
+| 16:51:52–16:51:56 | Local START (trace `8084c240…`) pauses before `analyze` at epoch 1 |
+| 16:52:31 | The local owner (pid 23703, trace `4809782e…`) starts. It acquires **epoch 2**, enters `analyze`, makes one Bedrock Converse call (request `a9f70cc9-…`, CloudTrail 16:52:35), and **holds** at `after-inference` from 16:52:35.560 |
+| 16:52:58.848 | Snapshot `before-contender` |
+| about 16:53:11–16:53:15 | Lambda cold start on a new environment (`…d77de612…`): `Init Duration: 4111.74 ms` |
+| 16:53:15.579–16:53:16.298 | Lambda request `069651b0-…`. Transport `StatusCode 200`, **no `FunctionError`**. Handler **`statusCode 409`, `status: contended`**, holder `{owner: 4809782e…, epoch: 2, expires 16:55:13.139}` (the local owner). Duration 711 ms, billed 4,824 ms |
+| 16:53:31.919 | Snapshot `after-contender` |
+| 16:54:57.785 | The owner is released, then completes. Final marker `finalized` at **epoch 2** by `4809782e…`, `suppressed`; lease **`RELEASED` at epoch 2** at 16:54:58.901 |
+
+**The two snapshots.** Both are in `events.jsonl` as `event: "durable_snapshot"` with `label` `before-contender` and `after-contender`, so neither is missing.
+- **Unchanged between them:** checkpoint `1f1d6148-…` (step 3, `next: ["analyze"]`), no analyze writes stored, no pending tasks, no final marker, and the lease's owner, epoch 2 and state `HELD`.
+- **Only difference:** the lease's `expires_at_ms`, 16:54:32.954 → 16:55:13.139. That's the owner's heartbeat; a renewal around 16:53:13 is implied by the 120 s TTL.
+- The contender's reported holder expiry equals the after-snapshot's, so the contender read the lease **after** that renewal.
+
+**Other evidence:**
+- **No Lambda completion trace:** the contender's trace `a91b4003…` doesn't exist in `risk_traces`. The thread's only traces are START's `paused` and the owner's `resumed_completed`.
+- **No model call by the Lambda:**
+  - The contender's log has no Converse, Titan or other model lines.
+  - CloudTrail's Bedrock events for 16:52–16:56 show exactly one `Converse`, at 16:52:35 by the developer SSO role: the owner's call. None came from `RiskAgentLambdaRole`.
+- **Owner:** exactly one inference, `completed` at epoch 2, no ledger item. The `TSMC#earthquake` row was written at the owner's finalization (16:54:58Z).
+- **Errors:** none in the Lambda log (no AccessDenied, transaction or throttling lines).
+
+**What P6 demonstrates:** the deployed executor respects a lease held by another executor. The Lambda attempt met the local owner's valid epoch-2 lease, returned `contended`, and changed no checkpoint, lease ownership, epoch or state. Afterwards the owner completed and finalized at its own epoch.
+
+**Claims without direct evidence:**
+- **The contender's own AWS calls.** The Lambda path isn't instrumented, and DynamoDB data events aren't in CloudTrail. The expected `Query` calls plus one refused `UpdateItem` are inferred from the code. What *is* observed is that the lease didn't change apart from the owner's expiry.
+- **The business row around the contender.** The snapshots don't include `supplier_risk_state`. The row's current value is the owner's later write, so it can't directly show that the contender didn't write. There's indirect evidence: the status was `contended`, there's no Lambda trace, and no graph node ran.
+- **The action ledger** wasn't snapshotted around the contender either. It has no item for the thread now.
+- **No CLI exit code or client-side timing** was recorded for the Lambda invocation. The Lambda log provides the server-side times.
+
+**Redaction:** the host name in `owner_executor` is redacted in every file. In `lambda-invoke-meta.json`, the base64 `LogResult` was decoded, redacted and re-encoded, and the file re-serialized as JSON. The empty `release-owner` trigger file isn't kept.
+
+**Cold start:** this environment's initialization took **4,111.74 ms** and completed within the limit (there's no `INIT_REPORT` timeout line). That doesn't resolve P2's 9,999.71 ms init timeout, whose cause is still undetermined.
+
 **Not yet done:**
-- P5 (parallel synchronous contention), P6 (local owner holding the thread, Lambda contender), P7 (eligible alert failing closed) and P8 (logs and conflict counts, preflight re-run).
+- P5 (parallel synchronous contention), P7 (an eligible alert failing closed) and P8 (logs and conflict counts, preflight re-run).
 - Phase 2 (ticketing).
 - The items in §10.

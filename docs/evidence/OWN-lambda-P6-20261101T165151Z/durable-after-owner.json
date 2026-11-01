@@ -1,0 +1,51 @@
+{
+ "traces": [
+  {
+   "change_type": "suppressed",
+   "executor_id": "<host>:23703",
+   "lease_epoch": "2",
+   "trace_id": "4809782ed5924b6097f4b95a8ecacb5f",
+   "workflow_event": "resumed_completed"
+  },
+  {
+   "change_type": null,
+   "executor_id": "<host>:22613",
+   "lease_epoch": "1",
+   "trace_id": "8084c240d1614823b1493c884b10d1a9",
+   "workflow_event": "paused"
+  }
+ ],
+ "lease": {
+  "renewed_at_ms": "1793552073251",
+  "epoch": "2",
+  "state": "RELEASED",
+  "expires_at_ms": "1793552193251",
+  "owner": "4809782ed5924b6097f4b95a8ecacb5f",
+  "thread_id": "thread-c4693a44854641d3b308463ee15f6870",
+  "released_at_ms": "1793552098901",
+  "acquired_at_ms": "1793551952954",
+  "owner_executor": "<host>:23703",
+  "sk": "lease"
+ },
+ "final": {
+  "kind": "finalized",
+  "trace_id": "4809782ed5924b6097f4b95a8ecacb5f",
+  "sk": "final",
+  "epoch": "2",
+  "eligibility_change_type": "suppressed",
+  "recovered": false,
+  "thread_id": "thread-c4693a44854641d3b308463ee15f6870",
+  "finalized_at": "2026-11-01T16:54:58.556+00:00",
+  "change_type": "suppressed",
+  "risk_level": "High",
+  "final_checkpoint_id": "1f1d614f-8827-6752-8006-8e2c507670ba",
+  "workflow_event": "resumed_completed"
+ },
+ "cloudtrail_bedrock": [
+  [
+   "16:52:35",
+   "Converse",
+   "AWSReservedSSO_AdministratorAccess_05923c424fbe9171"
+  ]
+ ]
+}
