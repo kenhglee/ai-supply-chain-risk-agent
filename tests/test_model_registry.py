@@ -9,7 +9,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from app.model_registry import get_model, resolve_model_runtime
+from app.model_registry import ModelConfigError, get_model, resolve_model_runtime
 
 
 # ---- helpers ----
@@ -212,7 +212,7 @@ def test_resolve_no_override(monkeypatch):
 
 def test_resolve_llm_provider_override(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "bedrock")
-    monkeypatch.delenv("BEDROCK_MODEL_ID", raising=False)
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
     record = get_model("risk_analysis_primary")   # registered as openai
     rt = resolve_model_runtime(record)
     assert rt.runtime_provider == "bedrock"
@@ -220,10 +220,48 @@ def test_resolve_llm_provider_override(monkeypatch):
     assert rt.model_provider == "openai"          # registry value unchanged
 
 
+@pytest.mark.parametrize("value", [None, "", "   "])
+@pytest.mark.parametrize("model_id", ["risk_analysis_primary", "triage_primary"])
+def test_resolve_bedrock_without_model_id_raises(monkeypatch, value, model_id):
+    monkeypatch.setenv("LLM_PROVIDER", "bedrock")
+    if value is None:
+        monkeypatch.delenv("BEDROCK_MODEL_ID", raising=False)
+    else:
+        monkeypatch.setenv("BEDROCK_MODEL_ID", value)
+    with pytest.raises(ModelConfigError, match="LLM_PROVIDER=bedrock requires BEDROCK_MODEL_ID"):
+        resolve_model_runtime(get_model(model_id))
+
+
+def test_model_config_error_is_a_value_error():
+    assert issubclass(ModelConfigError, ValueError)
+
+
+@pytest.mark.parametrize("model_id", ["risk_analysis_primary", "triage_primary"])
+def test_registry_pins_dated_openai_snapshot(monkeypatch, model_id):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    record = get_model(model_id)
+    assert record.provider == "openai"
+    assert record.model_name == "gpt-4o-mini-2024-07-18"
+    assert resolve_model_runtime(record).runtime_model_name == "gpt-4o-mini-2024-07-18"
+
+
+@pytest.mark.parametrize("value", ["", None])
+def test_resolve_blank_openai_model_uses_registry_snapshot(monkeypatch, value):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    if value is None:
+        monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_MODEL", value)
+    rt = resolve_model_runtime(get_model("risk_analysis_primary"))
+    assert rt.runtime_model_name == "gpt-4o-mini-2024-07-18"
+    assert rt.runtime_overridden is False
+
+
 def test_resolve_openai_model_override(monkeypatch):
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("OPENAI_MODEL", "gpt-4o")
-    record = get_model("risk_analysis_primary")   # registered as gpt-4o-mini
+    record = get_model("risk_analysis_primary")   # registered as gpt-4o-mini-2024-07-18
     rt = resolve_model_runtime(record)
     assert rt.runtime_model_name == "gpt-4o"
     assert rt.runtime_overridden is True

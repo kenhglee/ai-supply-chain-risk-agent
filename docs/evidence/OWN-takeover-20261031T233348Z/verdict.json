@@ -1,0 +1,210 @@
+{
+  "experiment": "C2b c1",
+  "thread_id": "thread-b0e7d18753c54a2cb998670614b6bdf8",
+  "durable_state_read": true,
+  "final_durable_state": {
+    "exists": true,
+    "checkpoint_id": "1f1d5842-65ad-619c-8006-398eee0b04a0",
+    "step": 6,
+    "next": [],
+    "tasks": [],
+    "nodes": [
+      "infer",
+      "decide",
+      "retrieve",
+      "analyze",
+      "validate",
+      "assess"
+    ],
+    "analyze_writes_stored": false,
+    "pending_analyze_step": null,
+    "pending_analyze_alert_status": null,
+    "pending_write_task_count": 0,
+    "lease": {
+      "epoch": 3,
+      "state": "RELEASED",
+      "owner": "d73d3d0bce624642bbe9f608cfa4cf78",
+      "expires_at_ms": 1793489924716
+    },
+    "final": {
+      "kind": "finalized",
+      "trace_id": "d73d3d0bce624642bbe9f608cfa4cf78",
+      "epoch": 3,
+      "change_type": "suppressed",
+      "recovered": false
+    }
+  },
+  "final_outcome": {
+    "status": "completed",
+    "trace_id": "d73d3d0bce624642bbe9f608cfa4cf78",
+    "change_type": "suppressed",
+    "eligibility_change_type": "suppressed",
+    "action_eligible": false,
+    "action_status": null
+  },
+  "checks": {
+    "acceptance": {
+      "killed_attempt_reached_hold": {
+        "ok": true,
+        "detail": {
+          "hold": "after-inference",
+          "events": [
+            "attempt_start",
+            "precondition",
+            "hooks_installed",
+            "analyze_enter",
+            "model_invoke_start",
+            "aws_call",
+            "model_return",
+            "holding"
+          ]
+        }
+      },
+      "killed_attempt_entered_analyze_and_got_response": {
+        "ok": true,
+        "detail": {
+          "request_ids": [
+            "20a65392-b544-4294-a19f-7c2c0bbf2574"
+          ]
+        }
+      },
+      "nothing_downstream_before_kill": {
+        "ok": true,
+        "detail": {
+          "after_hold": []
+        }
+      },
+      "no_tripwire_hits": {
+        "ok": true,
+        "detail": []
+      },
+      "retrieval_reused_from_start": {
+        "ok": true,
+        "detail": {
+          "retrieve_started_at": "2026-10-31T23:33:51.409+00:00",
+          "start_retrieve_started_at": "2026-10-31T23:33:51.409+00:00"
+        }
+      },
+      "durable_state_unchanged_by_killed_attempt": {
+        "ok": true,
+        "detail": {
+          "before": {
+            "checkpoint_id": "1f1d5838-7f0e-6aaa-8003-3135d6d412d8",
+            "step": 3,
+            "next": [
+              "analyze"
+            ]
+          },
+          "after_kill": {
+            "checkpoint_id": "1f1d5838-7f0e-6aaa-8003-3135d6d412d8",
+            "step": 3,
+            "next": [
+              "analyze"
+            ],
+            "analyze_writes_stored": false
+          }
+        }
+      },
+      "resume_completed": {
+        "ok": true,
+        "detail": {
+          "ts": "2026-10-31T23:38:18.675+00:00",
+          "pid": 26480,
+          "attempt": "resume-none-26480",
+          "seq": 16,
+          "event": "attempt_exit",
+          "aws_calls": {
+            "dynamodb:Query": 7,
+            "dynamodb:UpdateItem": 2,
+            "bedrock-runtime:Converse": 1,
+            "dynamodb:TransactWriteItems": 9,
+            "dynamodb:GetItem": 3,
+            "dynamodb:PutItem": 1
+          },
+          "status": "completed",
+          "thread_id": "thread-b0e7d18753c54a2cb998670614b6bdf8",
+          "trace_id": "d73d3d0bce624642bbe9f608cfa4cf78",
+          "next": [],
+          "change_type": "suppressed",
+          "state_written": true,
+          "final_status": "ok",
+          "eligibility_change_type": "suppressed",
+          "action_eligible": false,
+          "eligibility_basis": "assessed",
+          "action_id": null,
+          "action_status": null,
+          "lease_epoch": 3,
+          "lineage_checkpoint_id": "1f1d5842-65ad-619c-8006-398eee0b04a0",
+          "finalized_by_trace_id": "d73d3d0bce624642bbe9f608cfa4cf78",
+          "recovered_finalization": false,
+          "trace_recovered": null,
+          "holder": null,
+          "error_type": null
+        }
+      },
+      "resume_reran_analyze_and_inference": {
+        "ok": true,
+        "detail": {
+          "model_returns": [
+            {
+              "attempt": "resume-after-inference-24594",
+              "request_id": "20a65392-b544-4294-a19f-7c2c0bbf2574",
+              "output_tokens": 249
+            },
+            {
+              "attempt": "resume-none-26480",
+              "request_id": "e068a476-63ef-4215-b178-2a630c129c55",
+              "output_tokens": 239
+            }
+          ]
+        }
+      },
+      "ownership_contended_until_expiry": {
+        "ok": true,
+        "detail": {
+          "contended_attempts": 1,
+          "holder_epochs": [
+            2
+          ],
+          "killed_epoch": 2
+        }
+      },
+      "ownership_takeover_epoch_increased": {
+        "ok": true,
+        "detail": {
+          "killed_epoch": 2,
+          "resumed_epoch": 3
+        }
+      },
+      "ownership_final_marker_and_lease": {
+        "ok": true,
+        "detail": {
+          "final": {
+            "kind": "finalized",
+            "trace_id": "d73d3d0bce624642bbe9f608cfa4cf78",
+            "epoch": 3,
+            "change_type": "suppressed",
+            "recovered": false
+          },
+          "lease": {
+            "epoch": 3,
+            "state": "RELEASED",
+            "owner": "d73d3d0bce624642bbe9f608cfa4cf78",
+            "expires_at_ms": 1793489924716
+          },
+          "resume_trace_id": "d73d3d0bce624642bbe9f608cfa4cf78"
+        }
+      }
+    },
+    "diagnostics": {}
+  },
+  "code": {
+    "code_revision": "4b3ee87694e9db41aa9feeb86ffb901aa5f9d583",
+    "image_digest": null,
+    "git_commit": "4b3ee87694e9db41aa9feeb86ffb901aa5f9d583",
+    "git_dirty": false
+  },
+  "complete": true,
+  "passed": true,
+  "diagnostics_ok": null
+}

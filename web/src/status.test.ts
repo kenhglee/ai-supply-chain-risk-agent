@@ -9,7 +9,7 @@ describe('traceBadge', () => {
   });
 
   it('never shows a paused or denied attempt as a completed ok alert', () => {
-    for (const event of ['paused', 'authority_denied']) {
+    for (const event of ['paused', 'authority_denied', 'lease_lost', 'action_in_flight', 'attempt_failed', 'completion_unverified']) {
       const badge = traceBadge('ok', event);
       expect(badge.label).toBe(event);
       expect(badge.className).not.toContain('badge-ok');

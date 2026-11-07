@@ -32,10 +32,10 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required for local RSS pipeline when `LLM_PROVIDER=openai` or `EMBEDDING_PROVIDER=openai` (FAISS default) |
 | `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
-| `OPENAI_MODEL` | `gpt-4o-mini` | |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | |
+| `OPENAI_MODEL` | registry (`gpt-4o-mini-2024-07-18`) | Overrides the registry `model_name` when set and non-blank. The snapshot is deprecated by OpenAI; shutdown 2027-01-14 |
+| `BEDROCK_MODEL_ID` | — (required when `LLM_PROVIDER=bedrock`) | Missing or blank raises `ModelConfigError` during model resolution (at import of `supplier_risk_agent.py`). Terraform and `docker/worker.env` set `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 | `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`); used when `LLM_PROVIDER=bifrost` |
-| `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
+| `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint. **Requirement (unverified):** the gateway must have MCP/tool injection and gateway-side tool execution disabled for this application; see "LLM tool-call boundary and Bifrost" in `docs/Architecture.md` |
 | `BIFROST_API_KEY` | `dummy-key` | Bifrost does not validate this; any placeholder value works |
 | `RISK_STATE_BACKEND` | `csv` | `csv` or `dynamodb` |
 | `RISK_STATE_FILE` | `risk_state.csv` | Used when backend is `csv` |
@@ -51,10 +51,11 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 | `RETRIEVER_PROVIDER` | `faiss` | `faiss` (default) or `bedrock_kb` |
 | `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
 | `BEDROCK_KB_TOP_K` | `4` | Number of KB results to request (bedrock_kb only) |
-| `EMBEDDING_PROVIDER` | `openai` | FAISS embeddings: `openai` (`OpenAIEmbeddings`) or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`, default AWS credential chain). Lambda sets `bedrock` |
+| `EMBEDDING_PROVIDER` | `openai` | FAISS embeddings: `openai` (`OpenAIEmbeddings`, pinned to `text-embedding-ada-002`) or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`, default AWS credential chain). Lambda sets `bedrock` |
 | `CHECKPOINT_TABLE` | — | DynamoDB table for LangGraph checkpoints (`risk_agent_checkpoints`). Required only for Lambda `checkpoint_start` / `checkpoint_resume` actions; the scheduled RSS path is not checkpointed |
 | `AUTHORITY_TABLE` | — | Runtime authority table (`risk_agent_authority`). If this or `ACTIONS_TABLE` is unset, the checkpointed lifecycle denies every governed action (fail closed) |
 | `ACTIONS_TABLE` | — | Action ledger table (`risk_agent_actions`) |
+| `LEASE_TTL_MS` | `120000` | Same-thread ownership lease TTL for checkpointed attempts (renewed by a heartbeat every TTL/3) |
 
 ## Architecture
 
@@ -66,16 +67,19 @@ A LangGraph state machine that processes news headlines into structured supplier
 
 ```
 infer → decide → [retrieve] → analyze → validate → [fallback] → END
+(checkpointed lifecycle: … → validate → assess → [act] → END)
 ```
 
 - **infer**: maps headlines to candidate suppliers via `app/storage/supplier_graph.json` (graph traversal) and alias matching
 - **decide**: LLM call — returns `retrieve` or `skip` to gate context retrieval
 - **retrieve**: FAISS similarity search over `app/storage/supplier_profiles.json`
 - **analyze**: LLM call — returns structured JSON alert with supplier, risk_type, risk_level, impact
-- **validate**: checks required fields; routes to fallback on failure
-- **act** (checkpointed lifecycle only, `build_app(checkpointer, action_gate=...)`): governed privileged action (mock review ticket) for a valid `ok` alert, admitted only if the durable emergency authority item `agent#supplier-risk-agent` is `ACTIVE` **and** the materialized policy item `policy#supplier-risk-agent#open_review_ticket` allows it (Phase 3F). Both checks and the action-ledger claim are one DynamoDB transaction. With no materialized policy, `act` is denied (`POLICY_MISSING`); the materializer CLI is `python -m app.governance.policy_cli`. On denial the thread stays at `next=["act"]` and a later RESUME re-runs only `act`. The Phase 2 graph has no `act` node. See "Runtime authority and governed actions (Phase 3D)" in `docs/Architecture.md`; operator CLI: `python -m app.governance.authority_cli show|revoke|restore`
+- **validate**: checks required fields and, for `status="ok"`, that `supplier` exactly matches a `candidate_suppliers` entry or one of its `SUPPLIER_ALIASES` (canonicalized to the candidate; no substring match; no candidates → reject); routes to fallback on failure with the reason in the trace step's `error`
+- **Tool-call rejection**: decide/analyze bind no tools. A response carrying any tool call (`unexpected_tool_call_signals`) takes the existing invalid path (decide → `skip`, analyze → `inconclusive`) with a trace `error`
+- **assess** (checkpointed lifecycle only, `build_app(checkpointer, action_gate=..., risk_reader=...)`): read-only, strongly consistent read of the prior supplier-state row; classifies the alert (`classify_risk_change`) and routes only `new_alert` / `escalated` to `act`. `suppressed` / `downgraded` end without an action, but supplier state is still written after END. The checkpointed assessment (`eligibility_change_type`) is reused on RESUME and reported separately from the write-time `change_type`. Threads parked at `act` by the pre-assess graph proceed as before (`eligibility_basis=legacy_unassessed`). RESUME never rewrites state: the attempt `trace_id` is passed in `configurable`
+- **act** (checkpointed lifecycle only): governed privileged action (mock review ticket) for an action-eligible alert, admitted only if the durable emergency authority item `agent#supplier-risk-agent` is `ACTIVE` **and** the materialized policy item `policy#supplier-risk-agent#open_review_ticket` allows it (Phase 3F). Both checks and the action-ledger claim are one DynamoDB transaction. With no materialized policy, `act` is denied (`POLICY_MISSING`); the materializer CLI is `python -m app.governance.policy_cli`. On denial the thread stays at `next=["act"]` and a later RESUME re-runs only `act`. The Phase 2 graph has no `act` node. See "Runtime authority and governed actions (Phase 3D)" in `docs/Architecture.md`; operator CLI: `python -m app.governance.authority_cli show|revoke|restore`
 
-**Important**: `supplier_risk_agent.py` has module-level initialization that runs at import time — it loads the graph JSON, builds the FAISS index (calling `OpenAIEmbeddings()`), and instantiates the LLM. `OPENAI_API_KEY` must be set even when using Bedrock as the LLM provider.
+**Important**: `supplier_risk_agent.py` has module-level initialization that runs at import time — it loads the graph JSON, builds the FAISS index (calling `OpenAIEmbeddings(model="text-embedding-ada-002")`), and instantiates the LLM. `OPENAI_API_KEY` must be set even when using Bedrock as the LLM provider.
 
 Supplier risk state is persisted across runs to detect escalations/suppressions. State change types: `new_alert`, `escalated`, `suppressed`, `downgraded`, `inconclusive`.
 
@@ -94,8 +98,8 @@ Wraps the GitHub pipeline as three MCP tools via FastMCP (`supply-chain-risk` se
     → stateless evaluation + persists decision
 - `get_recent_risk_decisions` 
     → read-only query over decision history
-- `create_mock_servicenow_ticket` 
-    → workflow action tied to a prior decision
+- `create_mock_servicenow_ticket(decision_id)` 
+    → governed action for a stored decision (`app/workflows/decision_ticket_action.py`). Fields come only from the stored record, which must be consistent with its stored event (re-evaluates to the same decision; this does not prove the record genuine) and be `review_recommended` / `manual_review_required`. Decision-store write access is the event trust boundary. Admitted through the production `ActionLedger` under the `open_review_ticket` capability (same emergency authority + policy item as the supplier `act` node; unset `AUTHORITY_TABLE`/`ACTIONS_TABLE` → denied). Action ID `action#decision#<id>#open_review_ticket`: at most one ticket per decision; repeats return `already_created`; a failure between claim and completion leaves it `IN_FLIGHT` (`action_in_flight` on retry, no reconciliation)
 
 GitHub risk decisions are stored in `app/storage/risk_decisions.jsonl` (appended, newest-first on read).
 
@@ -107,8 +111,9 @@ It is a separate interaction layer intended for AI assistants and manual workflo
 - `handlers/rss_handler/handler.py` — wraps the RSS pipeline; triggered by EventBridge on a schedule. Events with an `action` key are explicit checkpoint lifecycle requests instead (Phase 3A3 durability experiment):
   - `{"action": "checkpoint_start", "headline": "..."}` → `start_workflow(..., pause_before=["analyze"])`, returns `status=paused`, `thread_id`, `trace_id`
   - `{"action": "checkpoint_resume", "thread_id": "thread-<32 hex>"}` → `resume_workflow(thread_id)`; accepts no other input
-  - malformed/unknown → 400, unknown thread → 404; saver and stores are built per invocation (continuity is only DynamoDB + `thread_id`)
-- `app/workers/risk_worker.py` — runtime-neutral equivalent for containers or plain Python: `python -m app.workers.risk_worker start --headline "..." [--pause-before {analyze,validate}]` / `resume --thread-id thread-<32 hex>`. `--pause-before validate` checkpoints the completed analysis so RESUME runs no retrieval or inference; the two-process proof is `scripts/durable_resume_proof.py run` (evidence in `docs/evidence/`). It uses the same `risk_workflow` lifecycle and `docker/worker.env` (Lambda env mirror, no credentials). In the Lambda image, run it with `--entrypoint python`. Phase 3C1 proved Lambda START → local Docker RESUME on one image digest (see `docs/Architecture.md`). `session` runs one long-lived process that reads `{"start": ...}` / `{"resume": ...}` JSON lines from stdin; exit code 4 means `authority_denied`
+  - malformed/unknown → 400, unknown thread → 404, `contended` / `lease_lost` / `action_in_flight` / `completion_unverified` → 409, `attempt_failed` → 500; saver and stores are built per invocation (continuity is only DynamoDB + `thread_id`)
+  - **Same-thread ownership** (`docs/SAME_THREAD_OWNERSHIP_DESIGN.md`): every checkpointed attempt acquires a per-thread lease (`lease` item in the checkpoint table, monotonic epoch), fences checkpoint/pending writes, action admission/replay/denial and finalization, and finalizes business state with a once-only `final` marker in one transaction. `checkpoint_dependencies_from_env` always builds owned dependencies and requires `RISK_STATE_BACKEND=dynamodb` and `TRACE_STORE_BACKEND=dynamodb`; the unfenced lifecycle exists only behind `unfenced_baseline=True` for baseline tests. Implemented and tested locally; **not deployed** (needs the IAM changes in the design doc §16)
+- `app/workers/risk_worker.py` — runtime-neutral equivalent for containers or plain Python: `python -m app.workers.risk_worker start --headline "..." [--pause-before {analyze,validate}]` / `resume --thread-id thread-<32 hex>`. Exit codes: 3 not found, 4 authority denied, 5 contended, 6 lease lost / action in flight, 7 completion unverified, 8 attempt failed. `--pause-before validate` checkpoints the completed analysis so RESUME runs no retrieval or inference; the two-process proof is `scripts/durable_resume_proof.py run` (evidence in `docs/evidence/`). It uses the same `risk_workflow` lifecycle and `docker/worker.env` (Lambda env mirror, no credentials). In the Lambda image, run it with `--entrypoint python`. Phase 3C1 proved Lambda START → local Docker RESUME on one image digest (see `docs/Architecture.md`). `session` runs one long-lived process that reads `{"start": ...}` / `{"resume": ...}` JSON lines from stdin; exit code 4 means `authority_denied`
 - `handlers/github_webhook_handler/handler.py` — wraps the GitHub pipeline; exposed via Lambda Function URL; verifies HMAC signature before processing
 
 ### Data Flow

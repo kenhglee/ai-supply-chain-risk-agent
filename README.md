@@ -99,7 +99,7 @@ infer → decide → [retrieve] → analyze → validate → [fallback] → END
 | `decide` | LLM call — returns `retrieve` or `skip` to gate context retrieval |
 | `retrieve` | Calls the configured retriever backend (FAISS or Bedrock KB) |
 | `analyze` | LLM call — returns a structured JSON risk alert |
-| `validate` | Checks required fields; routes to `fallback` on missing or weak output |
+| `validate` | Checks required fields and that an `ok` alert's supplier is one of the inferred candidates; routes to `fallback` on missing, weak or unmatched output |
 | `fallback` | Replaces the alert with a safe `inconclusive` sentinel |
 
 **Prompt Registry** — prompts for `decide` and `analyze` are versioned JSON files under `prompts/`. Only `"status": "approved"` versions load automatically.
@@ -208,8 +208,8 @@ The MCP server exposes system capabilities as tools:
 → query recent decision history
 - `get_decisions_requiring_review`
 → filter decisions requiring human review
-- `create_mock_servicenow_ticket`
-→ create workflow tickets from decisions
+- `create_mock_servicenow_ticket(decision_id)`
+→ open one governed mock ticket for a stored, review-requiring decision (authority + policy gated; repeats return the original ticket)
 
 These tools enable higher-level workflows such as:
 
@@ -364,6 +364,8 @@ RETRIEVER_PROVIDER=faiss
 # BEDROCK_KB_ID=<your-kb-id>
 
 # Bifrost gateway (local proxy, e.g. to test Bedrock models via an OpenAI-shaped client)
+# Requirement: disable MCP/tool injection and gateway-side tool execution for this app.
+# The app rejects tool-call responses but cannot stop a gateway running tools internally.
 # LLM_PROVIDER=bifrost
 # BIFROST_MODEL_ID=bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
 # BIFROST_BASE_URL=http://localhost:8080/langchain
@@ -382,10 +384,10 @@ uv run python -m app.workflows.supplier_risk_agent
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required when `RETRIEVER_PROVIDER=faiss` or `LLM_PROVIDER=openai` |
 | `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID for Bedrock provider |
+| `OPENAI_MODEL` | registry (`gpt-4o-mini-2024-07-18`) | Overrides the registry `model_name` when set and non-blank. The snapshot is deprecated by OpenAI; shutdown 2027-01-14 |
+| `BEDROCK_MODEL_ID` | — (required when `LLM_PROVIDER=bedrock`) | Missing or blank raises `ModelConfigError` during model resolution (at import of `supplier_risk_agent.py`). Terraform and `docker/worker.env` set `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 | `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway when `LLM_PROVIDER=bifrost` (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`) |
-| `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
+| `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint. **Requirement (unverified):** the gateway must have MCP/tool injection and gateway-side tool execution disabled for this application; see "LLM tool-call boundary and Bifrost" in `docs/Architecture.md` |
 | `BIFROST_API_KEY` | `dummy-key` | Placeholder key; Bifrost does not validate it |
 | `RETRIEVER_PROVIDER` | `faiss` | `faiss` or `bedrock_kb` |
 | `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
@@ -765,7 +767,7 @@ Registry
   model_id:           risk_analysis_primary
   model_version:      v1
   runtime_provider:   openai
-  runtime_model_name: gpt-4o-mini
+  runtime_model_name: gpt-4o-mini-2024-07-18
 ```
 
 ### How this supports prompt / model promotion governance
@@ -804,7 +806,7 @@ Each file follows this schema:
   "created_at": "2026-06-18",
   "description": "Primary model for supply chain risk classification.",
   "provider": "openai",
-  "model_name": "gpt-4o-mini",
+  "model_name": "gpt-4o-mini-2024-07-18",
   "use_case": "risk_classification"
 }
 ```
@@ -849,7 +851,7 @@ Each risk trace in `app/storage/risk_traces.jsonl` includes a `model_metadata` f
     "model_version": "v1",
     "model_status": "approved",
     "model_provider": "openai",
-    "model_name": "gpt-4o-mini",
+    "model_name": "gpt-4o-mini-2024-07-18",
     "model_description": "Primary model for triage decisions..."
   },
   {
@@ -857,7 +859,7 @@ Each risk trace in `app/storage/risk_traces.jsonl` includes a `model_metadata` f
     "model_version": "v1",
     "model_status": "approved",
     "model_provider": "openai",
-    "model_name": "gpt-4o-mini",
+    "model_name": "gpt-4o-mini-2024-07-18",
     "model_description": "Primary model for supply chain risk classification..."
   }
 ]

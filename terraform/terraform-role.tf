@@ -82,6 +82,20 @@ resource "aws_iam_role_policy" "terraform_deployment" {
         ]
         Resource = "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:*"
       },
+      # Rollout hold (var.risk_agent_reserved_concurrency). The ARN is built from
+      # the function name, not aws_lambda_function.risk_agent.arn, so a targeted
+      # bootstrap apply of this policy doesn't pull in the function (and its
+      # pending concurrency change) as a dependency.
+      {
+        Sid    = "RiskAgentLambdaConcurrency"
+        Effect = "Allow"
+        Action = [
+          "lambda:GetFunctionConcurrency",
+          "lambda:PutFunctionConcurrency",
+          "lambda:DeleteFunctionConcurrency"
+        ]
+        Resource = "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:ai-supply-chain-risk-agent"
+      },
       {
         Sid    = "ManageRiskAgentRole"
         Effect = "Allow"

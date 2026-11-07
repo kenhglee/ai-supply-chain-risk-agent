@@ -37,7 +37,7 @@ Surface actionable risk, reduce noise, and provide prioritized next steps with r
 2. Group by: decision type, event pattern (repeated pushes, same PR)
 3. For each pattern summarize: repository, event type, branch/target, risk score range, reason, timestamps, persisted IDs (latest 1–2 only)
 4. Recommend **one clear action per pattern** — see Decision Guidance below
-5. Ask before creating tickets unless explicitly requested
+5. Ask before creating tickets unless explicitly requested. To create one, call `create_mock_servicenow_ticket` with the decision's `id` (the `record_id` from `evaluate_github_event_risk`); it takes no other fields. `already_created` means a ticket exists for that decision; `rejected` / `denied` carry a `reason` to report, not retry around
 
 ---
 

@@ -83,8 +83,11 @@ class DynamoRiskStateStore(RiskStateStore):
         return f"{supplier}#{risk_type}"
 
     def get(self, supplier: str, risk_type: str) -> dict | None:
+        # Strongly consistent: action eligibility (assess) and the write-time
+        # comparison must see the latest committed row.
         response = self.table.get_item(
-            Key={"pk": self._pk(supplier, risk_type)}
+            Key={"pk": self._pk(supplier, risk_type)},
+            ConsistentRead=True,
         )
         return response.get("Item")
 

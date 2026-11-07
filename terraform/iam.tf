@@ -97,3 +97,32 @@ resource "aws_iam_role_policy" "risk_checkpoint_access" {
     }]
   })
 }
+
+# Same-thread ownership (docs/SAME_THREAD_OWNERSHIP_DESIGN.md §16). The owned
+# lifecycle acquires, renews and releases the thread's lease (UpdateItem),
+# fences checkpoint, pending-write and finalization transactions with a
+# ConditionCheck on the lease (ConditionCheckItem; their Puts are covered by
+# RiskCheckpointAccess), and reads items back after an unknown outcome
+# (GetItem). Limited to thread keys. Not applied.
+resource "aws_iam_role_policy" "risk_checkpoint_ownership" {
+  name = "RiskCheckpointOwnership"
+  role = aws_iam_role.risk_agent_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "ThreadLeaseAndFencedWrites"
+      Effect = "Allow"
+      Action = [
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:ConditionCheckItem"
+      ]
+      Resource = aws_dynamodb_table.risk_agent_checkpoints.arn
+      Condition = {
+        "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["thread-*"] }
+        Null                      = { "dynamodb:LeadingKeys" = "false" }
+      }
+    }]
+  })
+}

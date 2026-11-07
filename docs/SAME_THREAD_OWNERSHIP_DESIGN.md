@@ -1,0 +1,417 @@
+# Same-Thread Ownership: Design (Draft)
+
+**Status:** **implemented and tested locally, not deployed.** Slices 1 and 2 (§14, §15) cover the lease, fenced checkpoint and pending writes, the fenced action ledger, once-only finalization, recovery, legacy compatibility, lineage-bound outcomes and lifecycle integration. **Nothing has run against AWS.** No IAM, schema, infrastructure or deployment change has been made. Same-thread ownership is complete locally; in AWS it is not in effect until the rollout in §16 is done.
+**Baseline:** `assess-before-act` at `2517e9a`. The races this design addresses are reproduced in `tests/test_concurrent_resume.py`; see "Concurrent resume reproduction (local)" in `docs/Architecture.md`.
+
+**Goal:** at most one owner executes and mutates a checkpointed thread at a time. A stale owner cannot change durable workflow state after another owner takes over.
+
+**Outside this milestone:**
+- **X1: cross-thread business deduplication.** Two threads for the same business change can each open a ticket, and the supplier-state row has no version check.
+- **External `IN_FLIGHT` reconciliation.** Determining whether an admitted effect happened when its executor died or lost ownership mid-effect.
+
+---
+
+## 1. Model
+
+**Ownership token.** Each execution attempt carries `(thread_id, owner, epoch)`, where `owner` is the attempt's `trace_id`.
+- The token travels in `configurable` as `lease_owner` and `lease_epoch`, alongside `trace_id`.
+- The saver and the action gate read it from the config of every write.
+- LangGraph copies string and integer `configurable` keys into each checkpoint's metadata, so every checkpoint records the owner and epoch that wrote it.
+
+**Two new item types in `risk_agent_checkpoints`.** The partition key is `thread_id`. Neither sort key matches the `chk#` or `wr#` prefixes the saver queries.
+
+| `sk` | Fields | Lifetime |
+|---|---|---|
+| `lease` | `epoch` (N), `state` (`HELD` / `RELEASED`), `owner`, `owner_executor`, `expires_at_ms` (N), `acquired_at`, `renewed_at`, `released_at`, `adopted_legacy` (bool) | Created on first acquisition. **Never deleted.** `delete_thread` must skip it, so an epoch is never reused |
+| `final` | `kind` (`finalized` / `legacy_recognized`), `trace_id`, `epoch`, `change_type`, `eligibility_change_type`, `final_checkpoint_id`, `action_id`, `action_status`, `risk_level`, `source_trace_id` (legacy only), `finalized_at` | Written once (`attribute_not_exists`) |
+
+**Ownership rules:**
+- **Acquisition requires** the lease to be absent, `RELEASED`, or expired (`expires_at_ms < :now`). Acquisition always increments `epoch`.
+- **Fenced writes require** `owner = :me AND epoch = :epoch AND state = HELD`. **Expiry is not part of the write condition.**
+  - DynamoDB conditions have no server clock. `:now` is the writer's clock, so testing expiry on writes would turn clock skew into self-rejection.
+  - Fencing is what revokes ownership: once another worker acquires, the epoch has changed and every write by the old owner fails.
+- **An expired owner** may keep writing, and may renew, only while the epoch is unchanged, i.e. while nobody has taken over. Such a renewal is recorded as `renewed_after_expiry`. After a takeover, renewal and writes fail.
+- **Clock skew** can cause an early takeover. That costs wasted work (inference is at least once), never a second durable mutation.
+
+## 2. Ownership lifecycle operations
+
+Notation:
+- `CC(lease)` is a ConditionCheck on the `lease` item with `#owner = :me AND epoch = :epoch AND #state = :held`.
+- **Txn** is `TransactWriteItems`. IAM has no TransactWriteItems action; each item in a transaction needs its own per-item permission.
+
+| Operation | Condition | Boundary | Failure → result |
+|---|---|---|---|
+| **Acquire on START** (new thread) | `attribute_not_exists(sk)`; `SET … epoch = 1, state = HELD` | `UpdateItem` | Condition fails → the existing thread-collision error |
+| **Acquire on RESUME** | `attribute_not_exists(sk) OR #state = :released OR expires_at_ms < :now`; `SET owner, owner_executor, state = HELD, expires_at_ms = :now + :ttl, acquired_at ADD epoch :one`; `ReturnValues = ALL_NEW` | `UpdateItem`, **before** any workflow state is read | Condition fails → read the lease → **`contended`**, reporting the holder, its trace and `expires_at`. Nothing is executed or written. A missing lease item on an existing thread creates it with `adopted_legacy = true` (§6) |
+| **Renew** (heartbeat every `ttl/3`) | `#owner = :me AND epoch = :epoch AND #state = :held`; `SET expires_at_ms, renewed_at` | `UpdateItem` | Fails → set the local `lost` flag (§8) |
+| **Release** | `#owner = :me AND epoch = :epoch`; `SET state = RELEASED, released_at`. **Epoch and item retained** | `UpdateItem`, last step of shutdown (§8) | Fails → `release_failed` on the outcome; the lease expires on its own |
+| **Takeover** | Acquire on RESUME succeeds against an expired lease | as Acquire | The new owner proceeds per §7. The old owner's next fenced write fails |
+
+## 3. Fenced workflow mutations
+
+| Mutation | Condition | Boundary | Failure → result |
+|---|---|---|---|
+| **Checkpoint `put`** | `CC(lease)` + `Put chk#{ns}#{id}` with `attribute_not_exists(sk)` | Txn, 2 items (checkpoint ≤ 350 KB) | Lease → **`LeaseLost`**; the main thread waits on this put, so the attempt stops at that step. Data condition → §5 |
+| **`put_writes`**: all writes of one task, regular **and** special (`__error__`, `__interrupt__`, `__scheduled__`, `__resume__`) | `CC(lease)` + one `Put wr#…` per write: regular writes `attribute_not_exists(sk)`, special writes unconditional | **One txn per task.** More than 99 writes → refuse; never split. A partial batch would be reapplied as the node's result | Lease → **`LeaseLost`**, nothing stored. Data condition → §5 |
+| **Action admission** | Authority and policy ConditionChecks (existing) + `CC(lease)` + `Update action` (absent or `DENIED` → `IN_FLIGHT`, `claimed_epoch`) | The existing cross-table txn, plus 1 item | Lease → **`LeaseLost`**. Authority or policy → `authority_denied`. `IN_FLIGHT` (any epoch) → **`action_in_flight`**, an outcome, not an exception |
+| **Action replay** (`COMPLETED`) | `CC(lease)` + `Update action SET last_replayed_by, replay_epoch` with `#status = :completed` | Txn, replacing today's unconditional read | Lease → **`LeaseLost`**. A non-owner can no longer complete by replaying |
+| **Denial record** | `CC(lease)` + `Update action → DENIED` (existing condition) | Txn | Lease → `LeaseLost`; nothing recorded |
+| **Action completion** | Unchanged: `#status = :in_flight AND claimed_by_trace_id = :me`. **No lease check** | `UpdateItem` | Records an effect that already ran (§4) |
+| **Finalization** | Consistent read of the prior row, classify, then `CC(lease)` + `Put supplier row` (unconditional; versioning is X1) + `Put final` with `attribute_not_exists(sk)` | Txn across 2 tables, 3 items | Lease → **`lease_lost`**, nothing written. `final` exists → **`already_finalized`**, reporting the marker's trace and epoch |
+| **Completion trace** | `Put trace` with `attribute_not_exists(trace_id)` | `PutItem`, after finalization | Exists → §5 (verify). A failure does not undo finalization; recovery repairs it (§7) |
+
+**Fail closed.** A `DynamoCheckpointSaver` write without an ownership token in `configurable` is refused. The C2b `--direct-invoke` diagnostic must acquire a lease or stay on local test savers. The test savers (InMemory, File, SQLite) stay unfenced unless they implement these conditions.
+
+## 4. External-effect guarantees (narrowed)
+
+- **Ownership fences admission and durable workflow mutations:** checkpoints, every pending write, action admission, replay and denial records, finalization, and the `final` marker.
+- **It does not stop an effect that was already admitted.** If an owner loses its lease while its effect runs, the effect may continue and complete after a takeover, and its completion is recorded by claim (`claimed_by_trace_id`) without a lease check. Revocation is prospective, as with authority (Phase 3D).
+- **A new owner that finds the action `IN_FLIGHT`** reports `action_in_flight` and stops. Whether that effect happened is unresolved; reconciliation is outside this milestone.
+- At most one admission per `action_id` remains the ledger's guarantee. Exactly-once external effects are not claimed.
+
+## 5. Retry and idempotency after an unknown outcome
+
+**Error classes.** These are evaluated in this order. A `TransactionCanceledException` carries per-item `CancellationReasons`; data items are sent with `ReturnValuesOnConditionCheckFailure = ALL_OLD`, so the existing item comes back without an extra read.
+
+| Class | Signals | Handling |
+|---|---|---|
+| **Lost ownership** | Cancellation reason `ConditionalCheckFailed` on the `lease` item | Raise `LeaseLost`. **No retry** |
+| **Data conflict** | `ConditionalCheckFailed` on a data item (`chk#`, `wr#`, `final`, trace) | **Verify, don't assume** (rules below): identical means already applied; different means a conflict error, no retry |
+| **Transaction conflict** | Reason `TransactionConflict`; `TransactionInProgressException` | Retry the **same request with the same `ClientRequestToken`**, bounded exponential backoff |
+| **Throttling** | `ProvisionedThroughputExceededException`, `ThrottlingException`, reason `ThrottlingError`, `RequestLimitExceeded` | As transaction conflict. When retries are exhausted: unknown outcome |
+| **Unknown outcome** | Timeouts, connection reset, `InternalServerError`, `ServiceUnavailable`, retries exhausted | Retry with the same token while inside DynamoDB's 10-minute idempotency window. Otherwise, or if still unknown: **read back and verify** |
+| **Request bug** | `IdempotentParameterMismatchException`, `ValidationException`, item size | Fail, no retry |
+
+**Tokens.** `ClientRequestToken` is deterministic per logical write: a hash of thread, operation, and checkpoint or task identity, ≤ 36 characters. A retry **reuses the exact serialized payload** from the first attempt (serialize once), so byte comparison on read-back is meaningful.
+
+**Rules for each write:**
+- **Checkpoint.** After an unknown outcome or a `chk#` condition failure, read the item. Stored checkpoint bytes, metadata bytes and parent ID equal to ours → **success**: our earlier attempt applied it. **An identical retry is not a bug.** Any difference → `CheckpointConflict`. Absent → re-check the lease (lost → `LeaseLost`), then retry.
+- **Pending writes.** Read **every** `wr#` item for `(checkpoint_id, task_id)` and compare with the **complete intended batch**: the same `idx` set, channels, value types and value bytes, special writes included.
+  - Exactly equal → **success**.
+  - None present → re-check the lease, then retry.
+  - A **partial** batch, or any differing item → `PendingWriteConflict`. A transaction can't leave a partial batch, so this means a protocol violation, not a retryable state.
+- **Finalization.** Read `final`.
+  - Present with our `trace_id` and epoch → **success**. The supplier row was in the same transaction, so it needn't be checked.
+  - Present with another trace → `already_finalized`.
+  - Absent and the lease is ours → retry with the same token and payload inside the window. Beyond the window → re-read the prior row, reclassify, and submit a new transaction.
+  - Absent and the lease is lost → `LeaseLost`.
+- **Completion trace.** On a condition failure or an unknown outcome, read the trace by `trace_id`. The same `thread_id`, `workflow_event`, `change_type` and `lease_epoch` → **success**. Different → record `trace_conflict` on the outcome. Finalization stands, and nothing is overwritten.
+- **Lease operations** have no token, so read back:
+  - **Acquire, unknown:** `owner = me` → held at the returned epoch; otherwise re-evaluate.
+  - **Renew, unknown:** `owner = me` and `epoch = mine` → held.
+  - **Release, unknown:** `RELEASED` by me, or another owner → done.
+- **Action operations, unknown:**
+  - **Admission:** read the action. `IN_FLIGHT` with `claimed_by_trace_id = me` → admitted. Otherwise evaluate as a fresh admission.
+  - **Completion:** read the action. `COMPLETED` by me → done.
+
+## 6. Compatibility: threads created before ownership
+
+**Protocol threads and legacy threads.** A checkpoint written under this protocol carries `lease_epoch` in its metadata (§1). That gives a crisp rule:
+- **Recovery finalization** (§7) applies only when the **final checkpoint was written by the protocol**, i.e. its metadata has `lease_epoch`.
+- A **completed thread whose final checkpoint lacks `lease_epoch`** is **legacy**. It is **never finalized again automatically**.
+
+**Legacy completed thread** (no pending tasks, no `final` marker, final checkpoint without `lease_epoch`). Acquisition adopts it (creates the lease with `adopted_legacy = true`) and then evaluates the historical evidence. **All** of the following are required:
+
+| # | Evidence | Source |
+|---|---|---|
+| E1 | The latest checkpoint has no pending tasks (`snapshot.tasks == ()`) | Checkpoint query |
+| E2 | Linear history: no two `chk#` items share a parent | Query of the thread's `chk#` items |
+| E3 | The completing attempt is identified: the final checkpoint's metadata `trace_id` (written since `25a7193`), else the final state's `trace_id` (older threads, stamped by `update_state`) | Final checkpoint |
+| E4 | A completion trace exists for that `trace_id`, with matching `thread_id`, `workflow_event` in {`started_completed`, `resumed_completed`}, and a non-null `change_type` | Trace `GetItem` by `trace_id` |
+
+- **All present → recognized.** Write `final` with `kind = legacy_recognized`, `source_trace_id`, the `change_type` from the trace, and the current epoch. Use the same fenced, conditional transaction as finalization, but **without a supplier-state write and without a new trace**. Outcome `already_completed` (`legacy_recognized = true`).
+- **Missing or ambiguous** (no trace for E3's ID; a fork under E2; no identifiable trace ID; or a mismatched thread, event, or null change type):
+  - **No** supplier-state write, **no** marker, **no** trace rewrite.
+  - Outcome **`completion_unverified`**, listing which evidence failed. Worker exit 7; Lambda 409.
+  - The lease is released. The thread is re-evaluated, and reported the same way, on every RESUME until an operator resolves it. An operator resolution command is a later milestone.
+- **Why not finalize when evidence is missing:** before this protocol, a crash between END and the state write lost the write, and a crash after it left no trace. The two cases can't be told apart from the trace store, and finalizing could apply a business change twice. The supplier row isn't used as evidence, because other threads overwrite it.
+- **Expected scope:** runs whose traces went only to local JSONL (the default before DynamoDB traces) report `completion_unverified`. That is the intended conservative result.
+
+**Precondition for any legacy adoption: stop every unfenced worker first.** A worker running code from before this protocol writes checkpoints and pending writes without the lease check. Adoption creates a lease, but that lease cannot fence a worker that never checks it. Until all such workers (the Lambda image, containers, sessions) are stopped or upgraded, two writers can still interleave on an adopted thread. Rollout order:
+1. Deploy fenced code everywhere.
+2. Drain or stop the old workers.
+3. Only then rely on adoption.
+
+**Legacy paused or parked threads** (pending tasks remain) are adopted and continue normally under the lease.
+- Their pending writes were stored without fencing. They're reused as today, and the attempt's trace carries `legacy_pending_writes = true`.
+- Threads parked at `act` with no assessment keep the existing `legacy_unassessed` behavior.
+
+## 7. Takeover and recovery after acquisition
+
+| Durable state | Action | Outcome |
+|---|---|---|
+| Pending tasks | `invoke(None)`. Pending writes from an earlier epoch were fenced when written and are reused (C3) | as today |
+| No pending tasks; no `final`; final checkpoint **has** `lease_epoch` | **Recovery finalization** under the new epoch from the final checkpoint: `act` is not re-run, and its stored `action_result` is used | `completed`, `recovered_finalization = true` |
+| No pending tasks; no `final`; final checkpoint **lacks** `lease_epoch` | Legacy rule (§6) | `already_completed` (recognized) or `completion_unverified` |
+| `final` present; completion trace for `final.trace_id` absent (`kind = finalized`) | Write that trace with **the original `trace_id` and epoch**, built from `final` and the final checkpoint, marked `recovered_by = <this trace>`; idempotent (§5) | `already_completed`, `trace_recovered = true` |
+| `final` present; trace present | Nothing | `already_completed`, reporting `final.trace_id`, `final.epoch`, `final.change_type` |
+| Action `IN_FLIGHT` from any epoch | Stop | `action_in_flight` (§4) |
+
+## 8. Shutdown ordering and cleanup
+
+**Normal completion or pause.** The steps run in this order:
+1. **Drain checkpoint writers, then check recorded loss.** `invoke()` has returned. LangGraph 1.2.2's `BackgroundExecutor.__exit__` waits for every submitted write (checkpoint puts and `put_writes`), then re-raises the first write error, **but only if no other exception is already propagating**.
+   - So a `LeaseLost` from a background writer can be swallowed when a node also raised. This was reproduced in `test_takeover_rejects_a_stale_special_error_write_even_when_its_exception_is_swallowed`.
+   - The fenced saver therefore records every lost `(thread, owner, epoch)` in `saver.lost`. After `invoke()` returns or raises, the lifecycle must check `saver.lost` and treat any entry as `lease_lost`, whatever exception it saw.
+2. **Settle.** If paused: write the paused trace. If completed: finalization (§3, §5), then the completion trace.
+3. **Stop the heartbeat**, then join it with a deadline. It stays alive through finalization and the trace, so the lease can't expire mid-finalization.
+4. **Release conditionally** (§2).
+5. **Emit the outcome.** Its lineage is described in §9.
+
+**On exceptions:**
+
+| Cause | Writers | Finalization | Trace | Heartbeat | Release | Outcome |
+|---|---|---|---|---|---|---|
+| `LeaseLost` (any fenced write, or found when draining) | The saver enters a local `lost` state and refuses further writes; drain outstanding writes, which fail fenced | Skipped | `lease_lost` trace: an unfenced audit record, conditional on `trace_id` | Stop and join | **Skipped:** no longer the owner | `lease_lost` |
+| `AuthorityDenied` | Drain | Skipped | Denial trace (existing) | Stop and join | Release | `authority_denied` |
+| `ActionInFlight` | Drain | Skipped | `action_in_flight` trace | Stop and join | Release | `action_in_flight` |
+| Data conflict, retries exhausted, unknown outcome not resolved, other errors | Drain | Skipped, or left unknown | Best-effort `attempt_failed` trace | Stop and join | Release: safe, because finalization is atomic and its marker conditional, so the next owner re-evaluates from durable state | `attempt_failed` |
+| SIGTERM or interrupt | Best-effort drain within a deadline | Skipped if not started | Best-effort | Stop | Best-effort release | — |
+| SIGKILL or crash | — | — | — | — | None; the lease expires | Recovered by the next owner (§7) |
+
+**Heartbeat failure** only sets `lost`. Nodes check it before starting a model call (an optional cost saving). Safety comes from the next fenced write failing.
+
+## 9. Keeping outcomes tied to the execution lineage
+
+- Each attempt records **its own** last checkpoint ID, as returned by its fenced puts. `_settle` reads `get_state` at that checkpoint ID, never the thread's latest. This removes the misattribution seen in the race harness, where a worker reported another worker's paused state as its own.
+- `already_completed`, recovery and legacy recognition report from the `final` marker: who finalized, at which epoch, with which `change_type`.
+- Trace records add `lease_epoch` and `lineage_checkpoint_id`. Checkpoint metadata carries the owner and epoch.
+- **New `workflow_event` values:** `lease_lost`, `action_in_flight`, `attempt_failed` and `completion_unverified`. They are added to `INCOMPLETE_WORKFLOW_EVENTS`. `contended` writes no trace.
+
+| Outcome | Worker exit | Lambda |
+|---|---|---|
+| `contended` | 5 | 409 |
+| `lease_lost`, `action_in_flight` | 6 | 409 |
+| `completion_unverified` | 7 | 409 |
+
+## 10. Complete operation and permission inventory
+
+These permissions are what each executor (Lambda, container worker) would need. **No IAM change has been made.**
+
+| # | Operation | API | Table / key | Lambda role today | Governed worker today |
+|---|---|---|---|---|---|
+| 1 | Acquire, renew, release | `UpdateItem` | checkpoints / `sk = lease` | missing | missing |
+| 2 | Inspect lease (contention report, unknown-outcome read-back) | `Query` (or `GetItem`) | checkpoints / `lease` | `Query` ✓ | missing |
+| 3 | Read checkpoints and pending writes | `Query` | checkpoints / `chk#`, `wr#` | ✓ | missing |
+| 4 | Checkpoint put (fenced) | `ConditionCheckItem` + `PutItem` | checkpoints / `lease`, `chk#` | `PutItem` ✓, CC missing | missing |
+| 5 | Pending writes (fenced) | `ConditionCheckItem` + `PutItem` | checkpoints / `lease`, `wr#` | `PutItem` ✓, CC missing | missing |
+| 6 | Verify checkpoint or pending writes after an unknown outcome | `Query` | checkpoints | ✓ | missing |
+| 7 | Read `final` marker; E1–E3 legacy evidence | `Query` (or `GetItem`) | checkpoints / `final`, `chk#` | ✓ | missing |
+| 8 | Write `final` (finalization, legacy recognition) | `PutItem` + `ConditionCheckItem` | checkpoints / `final`, `lease` | `PutItem` ✓, CC missing | missing |
+| 9 | Supplier comparison read | `GetItem` (consistent) | supplier state | ✓ | missing |
+| 10 | Supplier write (in the finalization txn) | `PutItem` | supplier state | ✓ | missing |
+| 11 | Authority and policy read before admission | `GetItem` | authority / `agent#…`, `policy#…` | missing | ✓ |
+| 12 | Admission, denial (fenced) | `ConditionCheckItem` (authority, checkpoints `lease`) + `UpdateItem` (actions) | authority, checkpoints, actions / `action#thread-*` | missing | authority ✓; checkpoints missing; actions only `action#probe-*` |
+| 13 | Replay read and fenced replay record | `GetItem` + `UpdateItem` + `ConditionCheckItem` | actions, checkpoints | missing | probe keys only; CC missing |
+| 14 | Completion | `UpdateItem` | actions | missing | probe keys only |
+| 15 | Action read-back after an unknown outcome | `GetItem` | actions | missing | probe keys only |
+| 16 | Completion, paused and denial traces (conditional put) | `PutItem` | traces | ✓ | missing |
+| 17 | Trace read: recovery (§7), legacy E4 (§6), verify after unknown (§5) | `GetItem` | traces / `trace_id` | ✓ | missing |
+| 18 | Model inference (unchanged) | `bedrock:InvokeModel` | — | Titan only | Claude ✓ |
+
+`ClientRequestToken` and `ReturnValuesOnConditionCheckFailure` need no extra permission. Every step and every task's writes become transactions, which doubles their write units (about 80 writes per run today).
+
+## 11. Mapping to the reproduced races
+
+| Race / requirement (strict xfail in `2517e9a`) | Protection | Expected after |
+|---|---|---|
+| R1: single execution | Acquire on RESUME | B is `contended`: 0 inferences, no writes |
+| R1: no checkpoint fork | Acquire, plus fenced `put` and `put_writes` | One writer per epoch. Stale writes are rejected |
+| R2: contention is an outcome | Acquire, plus the `action_in_flight` outcome | B is `contended`. A new owner meeting `IN_FLIGHT` gets exit 6, no exception |
+| R3: action and business state agree | Fenced admission, replay and finalization | Only the owner's analysis acts and finalizes |
+| R4: single finalization | `final` marker in the finalization txn | The second finalization is `already_finalized` |
+| X1: one ticket per business change | **Out of scope** | Remains a strict xfail |
+| Pending writes deciding recovery (C3, R1) | Fenced `put_writes`, whole batch | Only writes stored under a valid lease are reused |
+| Stale error and interrupt writes (R2) | Special writes inside the fenced txn | Rejected |
+
+## 12. Tests to add before or with the implementation
+
+The SQLite stand-ins get extended with `lease` and `final` and these conditions, with injected `now()` and TTL. There are also moto tests for the DynamoDB implementation, and subprocess SIGKILL tests for the crash cases.
+
+- **Converted:** the R1–R4 strict xfails become passing regressions, and their observed-behavior tests are replaced by protected outcomes. X1 is unchanged.
+- **Stale owner** (A loses the lease to a forced takeover, then is released):
+
+| Test | Stale owner A | Expect |
+|---|---|---|
+| S1 | is mid-task | `put_writes` rejected; nothing stored |
+| S2 | has stored its writes, before `put` | `put` rejected; no fork |
+| S3 | writes an `__error__` | rejected |
+| S4 | attempts admission | rejected; no `IN_FLIGHT` |
+| S5 | attempts replay and finalization after B finished | rejected; one marker |
+| S6 | — | heartbeat keeps B `contended`; after a takeover, renewal fails and sets `lost` |
+| S7 | is expired but not taken over | may renew and write (`renewed_after_expiry`) |
+| S8 | — | epochs 1, 2, 3 across START and two resumes; the lease survives `delete_thread` |
+
+- **Crash and takeover:**
+
+| Test | Kill point | Expect |
+|---|---|---|
+| K1 | mid-`analyze` | the analysis is re-run |
+| K2 | after analyze's writes are stored | reused, not re-run |
+| K3 | after END, before finalization | recovery finalization; `act` not re-run |
+| K4 | after finalization, before the trace | trace recovered with the original `trace_id`; no second state write |
+| K5 | `IN_FLIGHT` | `action_in_flight` |
+| K6 | — | contention reporting (exit 5 / 409) |
+
+- **Retry:** each write is put into the unknown-outcome state by a fault-injecting client, which applies the write, then raises a timeout.
+  - An identical checkpoint retry → success.
+  - A complete identical pending-write batch → success. Partial or different → `PendingWriteConflict`.
+  - Finalization verified by the marker.
+  - The trace verified, or `trace_conflict`.
+  - `TransactionConflict` and throttling are retried with the same token. A lease failure is not retried.
+- **Compatibility:** legacy completed threads:
+  - all evidence present → `legacy_recognized`, no state write;
+  - no trace → `completion_unverified`, no writes;
+  - a forked legacy history → `completion_unverified`;
+  - a legacy paused thread → adopted and completed;
+  - a legacy thread parked at `act` → `legacy_unassessed`.
+- **Shutdown:**
+  - Lease release happens after finalization and the trace, and after the heartbeat is joined.
+  - A drain error surfaces before settling.
+  - `LeaseLost` skips release.
+  - SIGTERM releases on a best-effort basis.
+
+## 13. Open questions and limits
+
+- ~~Whether LangGraph joins its background writers before `invoke()` returns.~~ Resolved: it does, but it may swallow their errors (§8, step 1).
+- The unexplained late-load behavior recorded in `2517e9a`. It should be re-run under the protocol, where the late worker would be `contended`.
+- TTL choice (proposed 120 s) against the longest step, and against Lambda's timeout.
+- **Approval required before implementation:** the schema (two new item types), IAM (§10), and the transaction cost.
+- **Out of scope here:** X1 and `IN_FLIGHT` reconciliation; operator resolution of `completion_unverified`; fencing of audit traces.
+
+## 14. Slice 1: implemented and tested locally
+
+**Implemented:**
+- **`app/storage/thread_lease.py`:**
+  - `LeaseStore`: acquire, renew and release, with the conditions in §2, monotonic epochs, an injectable clock, and read-back after unknown outcomes.
+  - `LeaseHeartbeat`.
+  - Errors: `LeaseContended`, `LeaseLost`, `OwnershipRequired`, `WriteConflict` and `WriteOutcomeUnknown`.
+- **`DynamoCheckpointSaver(fenced=True)`:**
+  - Each checkpoint put, and each task's full write batch (regular and special), is one transaction with the lease check.
+  - Retries follow §5: one serialized payload, a deterministic `ClientRequestToken`, classification of lost ownership, data conflicts, transaction conflicts, throttling and unknown outcomes, and read-back verification of the complete batch.
+  - `saver.lost` records ownership loss.
+  - `delete_thread` keeps the `lease` and `final` items.
+- **Unfenced mode stays the default.** The workflow lifecycle, Lambda handler and worker still use it, so their behavior is unchanged.
+
+**Verified against LangGraph 1.2.2:**
+- **One `put_writes` call per task per attempt**, holding all of that task's writes:
+  - success: regular writes, or `__no_writes__`;
+  - error: the writes so far plus `__error__` (and `__error_source_node__` when routed to an error handler);
+  - interrupt: `__interrupt__` plus `__resume__`.
+- **The same task can be written again in a later attempt** under the same checkpoint. A denied `act` stored `__error__`, and a later successful `act` stored 13 regular writes. So batch verification covers only that batch's own indexes. An earlier special write of the same task may coexist with it.
+- **The batch limit is 99 per task** (the lease check takes one transaction item); the largest observed is 14.
+- **LangGraph does not retry `put_writes` itself.**
+- **`put` and `put_writes` run concurrently** on different background threads. Fenced transactions use a dedicated low-level client (boto3 clients are thread-safe) with explicit serialization. The concurrent-transaction failure seen while testing was in moto's in-memory backend, not in the client.
+
+**Tests:**
+- **`tests/test_thread_lease.py`** (moto, in-process):
+  - lease lifecycle;
+  - epochs never reset across release;
+  - expired-owner renewal;
+  - heartbeat;
+  - takeover rejecting stale checkpoint, pending and special writes;
+  - writes stored before takeover remaining readable and reused by the compiled graph without re-inference;
+  - lost acknowledgments, with no duplicate and no corruption;
+  - partial or different batches as conflicts;
+  - retried transaction conflicts and throttling;
+  - unknown outcomes;
+  - non-retried request errors.
+- **`tests/test_ownership_processes.py`** (separate processes, persistent SQLite stand-ins with the same conditions):
+  - two simultaneous acquisitions yield one owner, and the contender does no inference;
+  - takeover rejects the stale owner's pending and checkpoint writes;
+  - a stale `__error__` write is rejected even when its exception is swallowed;
+  - writes stored before takeover are reused without re-inference;
+  - release and reacquisition give epochs 1, 2, 3.
+
+**Test-only accommodations:**
+- moto doesn't implement `ClientRequestToken` idempotency, so retries are verified by read-back. Real DynamoDB may acknowledge them directly.
+- moto's `transact_write_items` isn't safe against concurrent transactions, so the moto tests serialize them with a test-only lock. Production code has none.
+- Acquisition in the process tests happens in the harness, because the lifecycle doesn't acquire yet.
+- The unprotected race reproduction (`tests/test_concurrent_resume.py`) is unchanged and still demonstrates today's races.
+
+**Remaining before end-to-end ownership can be claimed:**
+1. **Lifecycle integration:**
+   - `start_workflow` and `resume_workflow` acquire the lease and pass the token in `configurable`;
+   - the fenced saver is enabled in `checkpoint_dependencies_from_env`;
+   - heartbeat;
+   - the §8 shutdown order, including the `saver.lost` check;
+   - the `contended` and `lease_lost` outcomes, exit codes and Lambda 409.
+2. **Action fencing:** lease checks in admission, replay and denial; `action_in_flight` as an outcome.
+3. **Finalization:** the once-only `final` marker in the finalization transaction; recovery after END; trace recovery.
+4. **Compatibility:** legacy recognition and `completion_unverified` (§6).
+5. **Lineage-bound outcomes (§9)** and the new `workflow_event` values for trace consumers.
+6. **Converting the R1–R4 strict xfails** to regressions through the integrated lifecycle.
+7. **Approvals, then rollout:** schema, IAM and transaction cost; deploying fenced code everywhere before adoption (§6).
+
+## 15. Slice 2: lifecycle integration (implemented and tested locally)
+
+- **`risk_workflow.start_workflow` / `resume_workflow`:**
+  - START creates the lease (epoch 1). RESUME acquires it or returns `contended`, running and writing nothing.
+  - The token (owner = attempt `trace_id`, epoch) travels in `configurable`.
+  - A heartbeat renews the lease for the whole attempt.
+  - Shutdown follows §8. `saver.lost` is checked on every exit path, including while another exception propagates. Lost ownership becomes `lease_lost`: no finalization, no successful outcome, no release.
+- **Production dependencies** (`checkpoint_dependencies_from_env`):
+  - Always owned: fenced saver, fenced ledger (`lease_table`), `LeaseStore` (`LEASE_TTL_MS`, default 120 s) and `FinalizationStore`.
+  - They refuse to run unless `RISK_STATE_BACKEND` and `TRACE_STORE_BACKEND` are `dynamodb`. There is no fallback to unfenced writes. Missing permissions surface as AWS errors at the first fenced operation.
+  - The unfenced lifecycle is reachable only with an explicit `unfenced_baseline=True`, which is used by baseline tests.
+- **Action ledger:**
+  - Admission, replay and denial are fenced.
+  - Completion is not fenced, so an admitted effect's completion is recorded even after ownership loss. The stale worker still can't advance the graph, because its next write is fenced out.
+  - `ActionInFlight` becomes the `action_in_flight` outcome.
+- **Finalization:**
+  - The marker and the supplier row are one transaction; the completion trace is write-once.
+  - RESUME with no pending tasks follows §7 exactly: report from the marker; recover the trace with the original `trace_id`; recover finalization when the final checkpoint carries `lease_epoch`; otherwise apply the legacy rule in §6.
+  - Evidence and recovery look traces up **by exact `trace_id`** (`get_by_trace_id`), never through the alert-ID index.
+- **Lineage:** outcomes come from the attempt's own last checkpoint, or from the marker for `already_completed`. Traces carry `lease_epoch` and `lineage_checkpoint_id`.
+- **Surfaces:**
+  - Worker exit codes: 5 `contended`, 6 `lease_lost` or `action_in_flight`, 7 `completion_unverified`, 8 `attempt_failed`.
+  - Lambda: 409 for `contended`, `lease_lost`, `action_in_flight` and `completion_unverified`; 500 for `attempt_failed`.
+  - Trace consumers (Python and web) treat `lease_lost`, `action_in_flight`, `attempt_failed` and `completion_unverified` as incomplete.
+- **Tests:**
+  - `tests/test_owned_lifecycle.py` (moto, in-process).
+  - `tests/test_ownership_storage.py` (ledger, finalization and traces).
+  - `tests/test_ownership_processes.py` and `tests/test_protected_races.py`: separate processes on persistent SQLite stand-ins. These cover R1–R4 protected, the stale owner, and kills K3 and K4.
+  - The unfenced R1–R4 reproductions remain explicit baselines in `tests/test_concurrent_resume.py`.
+  - X1 remains a strict xfail in both baseline and owned runs.
+
+**Remaining limits (not addressed by this milestone):**
+- X1, cross-thread business deduplication.
+- `IN_FLIGHT` reconciliation.
+- Clock skew in lease expiry: wasted work, never a second durable mutation.
+- Audit traces for `lease_lost` and `attempt_failed` are not fenced.
+- JSONL `append_once` is not atomic across processes. Production requires DynamoDB traces.
+- The late-load behavior recorded in `2517e9a` is no longer reachable under ownership (the late worker is `contended`), but it remains unexplained for the unfenced baseline.
+- C2b's local tests characterize the **unfenced** baseline's crash recovery. Owned crash recovery is covered by K3, K4 and the process tests.
+
+## 16. AWS preflight and rollout (not done)
+
+**Every executor needs these permissions.** The table rows are what the owned lifecycle calls today:
+
+| Table | Operations | Lambda role today | `RiskAgentGovernedWorkerRole` today |
+|---|---|---|---|
+| `risk_agent_checkpoints` | `Query`, `GetItem`, `PutItem`, `UpdateItem`, `ConditionCheckItem` (the lease, `final`, `chk#`, `wr#`); `DeleteItem` only for operator `delete_thread` | `Query`, `PutItem` only: **add** `GetItem`, `UpdateItem`, `ConditionCheckItem` | none: **add all** |
+| `supplier_risk_state` | `GetItem` (consistent read), `PutItem` (inside the finalization transaction) | ✓ | none: **add** |
+| `risk_traces` | `PutItem` (conditional), `GetItem` (by `trace_id`) | ✓ | none: **add** |
+| `risk_agent_actions` | `GetItem`, `UpdateItem` (claim, replay, deny and complete, partly inside transactions), keys `action#thread-*` | none: **add** (also needs `AUTHORITY_TABLE` and `ACTIONS_TABLE` in its environment) | `action#probe-*` only: **extend the keys** |
+| `risk_agent_authority` | `GetItem`, `ConditionCheckItem` (`agent#…`, `policy#…`) | none: **add** | ✓ |
+
+**Preflight, read-only, before any run:**
+1. Confirm the deployed image digest and environment. Lambda already sets both backends to `dynamodb`. Workers use `docker/worker.env`.
+2. List checkpointed threads that have no `lease` item.
+3. Classify each:
+   - **Paused** (pending tasks): it will be adopted.
+   - **Completed:** it will be recognized from evidence, or reported `completion_unverified`.
+4. Spot-check E1–E4 (§6) for the completed ones, using `get_by_trace_id` on `risk_traces`.
+5. Confirm the Lambda timeout (123 s) against `LEASE_TTL_MS` (120 s). A Lambda killed at its timeout releases nothing, so its lease expires about 2 minutes later, and a retry inside that window is `contended`.
+
+**Rollout order:**
+1. Approve the schema (the `lease` and `final` items), the IAM changes above, and the transaction cost (about twice the write units for each step and each task's writes).
+2. Apply IAM through Terraform. **Don't change live IAM by hand.**
+3. Build one image from this branch, and deploy it to **every** executor before running any owned attempt: the Lambda, containers and Kubernetes. Stop or drain anything still running pre-ownership code (§6 precondition).
+4. Run the DR1 harness and the C2b driver against dev:
+   - DR1 now exercises owned START and RESUME.
+   - C2b's c1/c3 holds run on the owned lifecycle.
+   - Record the evidence, as before.
+5. Run an owned R1 contention check on AWS: two workers, one thread. Expect one `contended`, one inference and one final marker.
+6. Only then treat legacy adoption and `completion_unverified` reports as authoritative.
+

@@ -1,0 +1,32 @@
+[
+ [
+  "17:01:29",
+  "Converse",
+  "RiskAgentLambdaRole"
+ ],
+ [
+  "17:01:29",
+  "InvokeModel",
+  "RiskAgentLambdaRole"
+ ],
+ [
+  "17:01:29",
+  "InvokeModel",
+  "RiskAgentLambdaRole"
+ ],
+ [
+  "17:01:30",
+  "InvokeModel",
+  "RiskAgentLambdaRole"
+ ],
+ [
+  "17:01:30",
+  "InvokeModel",
+  "RiskAgentLambdaRole"
+ ],
+ [
+  "17:03:00",
+  "Converse",
+  "RiskAgentLambdaRole"
+ ]
+]

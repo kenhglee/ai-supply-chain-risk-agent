@@ -1,0 +1,3 @@
+--------------------------------------------------
+THREAD_ID=thread-69cc83390c314386a9e6a058c77109fe
+{"status": "paused", "thread_id": "thread-69cc83390c314386a9e6a058c77109fe", "trace_id": "40d75ea77e6241df9e58d52bd5c5cc59", "next": ["analyze"], "change_type": null, "state_written": false, "final_status": null, "eligibility_change_type": null, "action_eligible": null, "eligibility_basis": null, "action_id": null, "action_status": null, "lease_epoch": 1, "lineage_checkpoint_id": "1f1d57f3-3ca4-67fe-8003-8fd94477ef70", "finalized_by_trace_id": null, "recovered_finalization": null, "trace_recovered": null, "holder": null, "error_type": null}

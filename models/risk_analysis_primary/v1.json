@@ -6,6 +6,6 @@
   "created_at": "2026-06-18",
   "description": "Primary model for supply chain risk classification. Receives a headline, candidate suppliers, and retrieved context; returns a structured JSON risk alert.",
   "provider": "openai",
-  "model_name": "gpt-4o-mini",
+  "model_name": "gpt-4o-mini-2024-07-18",
   "use_case": "risk_classification"
 }

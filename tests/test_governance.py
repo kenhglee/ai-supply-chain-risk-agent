@@ -240,7 +240,14 @@ def test_inconclusive_alert_completes_without_action(env):
 
 def test_phase2_graph_has_no_act_node():
     assert "act" not in agent.app.get_graph().nodes
-    assert "act" in agent.build_app(action_gate=UnconfiguredActionGate()).get_graph().nodes
+    governed = agent.build_app(action_gate=UnconfiguredActionGate(), risk_reader=object()).get_graph().nodes
+    assert "assess" in governed and "act" in governed
+    assert "assess" not in agent.app.get_graph().nodes
+
+
+def test_governed_graph_requires_a_risk_reader():
+    with pytest.raises(ValueError, match="risk_reader"):
+        agent.build_app(action_gate=UnconfiguredActionGate())
 
 
 def test_phase2_process_alert_row_takes_no_action(env):

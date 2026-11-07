@@ -1,0 +1,151 @@
+{
+  "experiment": "owned contention",
+  "thread_id": "thread-69cc83390c314386a9e6a058c77109fe",
+  "durable_state_read": true,
+  "final_durable_state": {
+    "exists": true,
+    "checkpoint_id": "1f1d57f9-6941-6e5a-8006-deb7a933b047",
+    "step": 6,
+    "next": [],
+    "tasks": [],
+    "nodes": [
+      "infer",
+      "decide",
+      "retrieve",
+      "analyze",
+      "validate",
+      "assess"
+    ],
+    "analyze_writes_stored": false,
+    "pending_analyze_step": null,
+    "pending_analyze_alert_status": null,
+    "pending_write_task_count": 0,
+    "lease": {
+      "epoch": 2,
+      "state": "RELEASED",
+      "owner": "b88b60963be94de48be067883169db46",
+      "expires_at_ms": 1793488029063
+    },
+    "final": {
+      "kind": "finalized",
+      "trace_id": "b88b60963be94de48be067883169db46",
+      "epoch": 2,
+      "change_type": "suppressed",
+      "recovered": false
+    }
+  },
+  "checks": {
+    "acceptance": {
+      "owner_held_then_released": {
+        "ok": true,
+        "detail": {
+          "owner_events": [
+            "attempt_start",
+            "precondition",
+            "hooks_installed",
+            "analyze_enter",
+            "model_invoke_start",
+            "aws_call",
+            "model_return",
+            "holding",
+            "hold_released",
+            "analyze_return",
+            "checkpoint_committed",
+            "validate_enter",
+            "checkpoint_committed",
+            "writes_committed",
+            "writes_committed",
+            "checkpoint_committed",
+            "writes_committed",
+            "attempt_exit"
+          ]
+        }
+      },
+      "contender_ran_during_the_hold": {
+        "ok": true,
+        "detail": {
+          "contenders": 1,
+          "hold": "2026-10-31T23:03:51.302+00:00",
+          "release": "2026-10-31T23:05:38.468+00:00"
+        }
+      },
+      "contender_was_contended_by_the_owner": {
+        "ok": true,
+        "detail": [
+          {
+            "status": "contended",
+            "holder": {
+              "owner": "b88b60963be94de48be067883169db46",
+              "owner_executor": "<host>:9803",
+              "epoch": 2,
+              "expires_at_ms": 1793487989013
+            }
+          }
+        ]
+      },
+      "contender_executed_nothing": {
+        "ok": true,
+        "detail": [
+          [
+            "attempt_start",
+            "precondition",
+            "hooks_installed",
+            "attempt_exit"
+          ]
+        ]
+      },
+      "one_inference_total": {
+        "ok": true,
+        "detail": 1
+      },
+      "no_workflow_write_by_the_contender": {
+        "ok": false,
+        "detail": {
+          "before": {
+            "checkpoint_id": null,
+            "lease": null
+          },
+          "after": {
+            "checkpoint_id": null,
+            "lease": null
+          }
+        }
+      },
+      "contender_wrote_no_trace": {
+        "ok": true,
+        "detail": {
+          "7e2a952098fa470b8647666a6007e7c7": false
+        }
+      },
+      "owner_finalized_at_its_epoch": {
+        "ok": true,
+        "detail": {
+          "final": {
+            "kind": "finalized",
+            "trace_id": "b88b60963be94de48be067883169db46",
+            "epoch": 2,
+            "change_type": "suppressed",
+            "recovered": false
+          },
+          "lease": {
+            "epoch": 2,
+            "state": "RELEASED",
+            "owner": "b88b60963be94de48be067883169db46",
+            "expires_at_ms": 1793488029063
+          },
+          "owner_epoch": 2,
+          "owner_trace_event": "resumed_completed"
+        }
+      }
+    },
+    "diagnostics": {}
+  },
+  "code": {
+    "code_revision": "e43c54c30afb2fcfb057668a48f98e070cde3792",
+    "image_digest": null,
+    "git_commit": "e43c54c30afb2fcfb057668a48f98e070cde3792",
+    "git_dirty": false
+  },
+  "complete": true,
+  "passed": false
+}

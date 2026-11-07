@@ -5,6 +5,9 @@ from pathlib import Path
 
 
 TITAN_EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
+# The default of OpenAIEmbeddings() in the locked langchain-openai 1.2.2, pinned so
+# a library upgrade cannot silently change the FAISS vectors.
+OPENAI_EMBED_MODEL_ID = "text-embedding-ada-002"
 SUPPORTED_EMBEDDING_PROVIDERS = ("openai", "bedrock")
 
 
@@ -16,7 +19,7 @@ def build_embeddings(provider: str):
     """
     if provider == "openai":
         from langchain_openai import OpenAIEmbeddings
-        return OpenAIEmbeddings()
+        return OpenAIEmbeddings(model=OPENAI_EMBED_MODEL_ID)
 
     if provider == "bedrock":
         from langchain_aws import BedrockEmbeddings

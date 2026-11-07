@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
 from dotenv import load_dotenv, find_dotenv
 from langchain_aws import ChatBedrockConverse
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from app.ingestion.rss_ingestion import load_headlines_from_rss
@@ -75,7 +76,7 @@ SUPPLIER_ALIASES = {
 class RiskState(TypedDict):
     alert_id: str
     thread_id: Optional[str]  # durable logical workflow; None on the uncheckpointed Phase 2 path
-    trace_id: str  # one execution attempt of that workflow
+    trace_id: str  # the attempt that started the workflow; later attempts pass theirs in config
     headline: str
     candidate_suppliers: List[str]
     context: str
@@ -84,6 +85,10 @@ class RiskState(TypedDict):
     is_valid: Optional[bool]
     trace_steps: List[dict]
     retriever_metadata: Optional[dict]  # set by retrieve; None when retrieval is skipped
+    # Set by assess (governed checkpointed graph only), before act: the business
+    # change the alert represents and whether it is eligible for an action.
+    # Checkpoints parked at act before assess existed have none (legacy).
+    assessment: Optional[dict]
     action_result: Optional[dict]  # set by act (governed checkpointed graph only)
 
 
@@ -295,27 +300,36 @@ def headline_mentions(text: str, term: str) -> bool:
 
 # change_type values returned by compare_and_update_risk_state after a state.put()
 STATE_WRITE_CHANGE_TYPES = {"new_alert", "escalated", "suppressed", "downgraded"}
+# Business changes that warrant a new review ticket. suppressed (same level as
+# the prior state) and downgraded still update supplier state after the graph
+# completes, but open no ticket.
+ACTION_ELIGIBLE_CHANGE_TYPES = {"new_alert", "escalated"}
 
 
-def compare_and_update_risk_state(alert: dict, headline: str, state) -> tuple[str, str]:
-    """
-    Returns:
-        change_type: new_alert | suppressed | escalated | downgraded
-        change_message: human-friendly explanation
-    """
-
+def risk_state_key(alert: dict) -> tuple[str, str] | None:
+    """(supplier, risk_type) for a comparable alert; None when no state applies."""
     supplier = (alert.get("supplier") or "").strip()
     risk_type = normalize_risk_type(alert.get("risk_type"))
     risk_level = (alert.get("risk_level") or "").strip()
-    status = (alert.get("status") or "").strip()
+    if alert.get("status") != "ok" or not supplier or not risk_type or not risk_level:
+        return None
+    return supplier, risk_type
 
+
+def classify_risk_change(alert: dict, headline: str, prior: dict | None) -> tuple[str, str, dict | None]:
+    """Pure comparison against the prior state row; no I/O.
+
+    Returns (change_type, change_message, row_to_write); row_to_write is None
+    when nothing should be written.
+    """
     if alert.get("status") != "ok":
-        return "inconclusive", "No supplier-specific alert state change could be determined."
+        return "inconclusive", "No supplier-specific alert state change could be determined.", None
 
-    if not supplier or not risk_type or not risk_level:
-        return "inconclusive", "Missing supplier, risk type, or risk level for state comparison."
-
-    prior = state.get(supplier, risk_type)
+    key = risk_state_key(alert)
+    if key is None:
+        return "inconclusive", "Missing supplier, risk type, or risk level for state comparison.", None
+    supplier, risk_type = key
+    risk_level = alert["risk_level"].strip()
     now_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     if prior is None:
@@ -326,8 +340,7 @@ def compare_and_update_risk_state(alert: dict, headline: str, state) -> tuple[st
             "last_headline": headline,
             "last_seen_at": now_ts,
         }
-        state.put(supplier, risk_type, row)
-        return "new_alert", f"New disruption detected for {supplier} ({risk_type}) at {risk_level} risk."
+        return "new_alert", f"New disruption detected for {supplier} ({risk_type}) at {risk_level} risk.", row
 
     old_level = prior.get("current_risk_level")
     old_rank = RISK_RANK.get(old_level, 0)
@@ -341,17 +354,28 @@ def compare_and_update_risk_state(alert: dict, headline: str, state) -> tuple[st
         "last_headline": headline,
         "last_seen_at": now_ts,
     }
-    
+
     if new_rank > old_rank:
-        state.put(supplier, risk_type, updated_row)
-        return "escalated", f"Risk escalation detected for {supplier}: {old_level} → {risk_level} ({risk_type})."
+        return "escalated", f"Risk escalation detected for {supplier}: {old_level} → {risk_level} ({risk_type}).", updated_row
 
     if new_rank == old_rank:
-        state.put(supplier, risk_type, updated_row)
-        return "suppressed", f"Same supplier and risk level as prior alert for {supplier} ({risk_type}); suppressing duplicate."
+        return "suppressed", f"Same supplier and risk level as prior alert for {supplier} ({risk_type}); suppressing duplicate.", updated_row
 
-    state.put(supplier, risk_type, updated_row)
-    return "downgraded", f"Risk level decreased for {supplier}: {old_level} → {risk_level} ({risk_type})."
+    return "downgraded", f"Risk level decreased for {supplier}: {old_level} → {risk_level} ({risk_type}).", updated_row
+
+
+def compare_and_update_risk_state(alert: dict, headline: str, state) -> tuple[str, str]:
+    """
+    Returns:
+        change_type: new_alert | suppressed | escalated | downgraded | inconclusive
+        change_message: human-friendly explanation
+    """
+    key = risk_state_key(alert)
+    prior = state.get(*key) if key else None
+    change_type, change_message, row = classify_risk_change(alert, headline, prior)
+    if row is not None:
+        state.put(key[0], key[1], row)
+    return change_type, change_message
 
 
 def find_suppliers_exposed_to_risk(graph_edges, risk_term: str, headline: str) -> List[str]:
@@ -416,6 +440,49 @@ def get_llm(model_record: ModelRecord):
         )
 
     raise ValueError(f"Unsupported LLM_PROVIDER: '{rt.runtime_provider}'")
+
+
+# ---- Tool-call rejection ----
+# The production triage/analysis calls bind no tools, so any tool call in a
+# response is unexpected (e.g. injected by a gateway) and is rejected rather
+# than flattened into text by model_text(). Shapes covered, per the locked
+# adapters: LangChain-normalized AIMessage.tool_calls / invalid_tool_calls;
+# OpenAI additional_kwargs tool_calls / legacy function_call and
+# finish_reason; content blocks (langchain-aws tool_use, LangChain v1
+# tool_call / invalid_tool_call, OpenAI Responses function_call, raw Converse
+# toolUse); Bedrock Converse stopReason "tool_use".
+TOOL_CALL_BLOCK_TYPES = {"tool_use", "tool_call", "invalid_tool_call", "function_call"}
+TOOL_CALL_FINISH_REASONS = {"tool_calls", "function_call", "tool_use"}
+
+
+def unexpected_tool_call_signals(response) -> list[str]:
+    """Every sign that a model response carries a tool call; empty for plain text."""
+    signals = []
+    for attr in ("tool_calls", "invalid_tool_calls", "tool_call_chunks"):
+        if getattr(response, attr, None):
+            signals.append(attr)
+    additional = getattr(response, "additional_kwargs", None) or {}
+    for key in ("tool_calls", "function_call"):
+        if additional.get(key):
+            signals.append(f"additional_kwargs.{key}")
+    content = getattr(response, "content", None)
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in TOOL_CALL_BLOCK_TYPES:
+                signals.append(f"content_block.{item['type']}")
+            elif "toolUse" in item:
+                signals.append("content_block.toolUse")
+    metadata = getattr(response, "response_metadata", None) or {}
+    for key in ("finish_reason", "stopReason", "stop_reason"):
+        if metadata.get(key) in TOOL_CALL_FINISH_REASONS:
+            signals.append(f"response_metadata.{key}={metadata[key]}")
+    return signals
+
+
+def tool_call_error(signals: list[str]) -> str:
+    return "unexpected tool call in model response: " + ", ".join(signals)
 
 
 def model_text(response) -> str:
@@ -533,8 +600,9 @@ def decide_tool_use(state: RiskState) -> RiskState:
     )
 
     response = _triage_llm.invoke(prompt)
-    raw_text = model_text(response)
-    decision = raw_text.strip().lower()
+    signals = unexpected_tool_call_signals(response)
+    # A tool-call response takes the existing invalid-answer path: skip.
+    decision = "skip" if signals else model_text(response).strip().lower()
 
     if decision not in {"retrieve", "skip"}:
         decision = "skip"
@@ -542,7 +610,10 @@ def decide_tool_use(state: RiskState) -> RiskState:
     return {
         **state,
         "tool_decision": decision,
-        "trace_steps": record_trace_step(state["trace_steps"], "decide", t0, decision=decision),
+        "trace_steps": record_trace_step(
+            state["trace_steps"], "decide", t0, decision=decision,
+            error=tool_call_error(signals) if signals else None,
+        ),
     }
 
 
@@ -588,10 +659,13 @@ def analyze_risk(state: RiskState) -> RiskState:
     )
 
     response = _risk_llm.invoke(prompt)
-    raw_text = model_text(response)
 
     try:
-        alert = parse_alert_response(raw_text)
+        signals = unexpected_tool_call_signals(response)
+        if signals:
+            # Same path as an unparseable response: inconclusive, error traced.
+            raise ValueError(tool_call_error(signals))
+        alert = parse_alert_response(model_text(response))
         print("-" * 50)
 
         # normalize model output before downstream comparison
@@ -630,10 +704,29 @@ def analyze_risk(state: RiskState) -> RiskState:
     }
 
 # ---- Node 5: Validation ----
+def match_candidate_supplier(supplier, candidate_suppliers: list[str]) -> str | None:
+    """The canonical candidate the model's supplier names, or None.
+
+    Exact, case-insensitive match against a candidate's canonical name or one
+    of its SUPPLIER_ALIASES; never a substring, so "TSMC (and Acme)" or a
+    supplier the infer step did not propose does not match.
+    """
+    if not isinstance(supplier, str):
+        return None
+    name = supplier.strip().lower()
+    if not name:
+        return None
+    for candidate in candidate_suppliers or []:
+        if name == candidate.strip().lower() or name in SUPPLIER_ALIASES.get(candidate, []):
+            return candidate
+    return None
+
+
 def validate_alert(state: RiskState) -> RiskState:
     t0 = time.time()
     alert = state.get("alert")
     is_valid = False
+    error = None
 
     if isinstance(alert, dict):
         status = alert.get("status")
@@ -648,13 +741,27 @@ def validate_alert(state: RiskState) -> RiskState:
                 "recommended_action",
                 "relevant_supplier_context"]
             is_valid = all(alert.get(k) for k in required)
+            # The supplier must be one infer proposed: assess, the risk-state
+            # write and act all key on it, and model output alone (steerable
+            # by headline or retrieved text) must not choose it.
+            if is_valid:
+                candidates = state.get("candidate_suppliers") or []
+                canonical = match_candidate_supplier(alert.get("supplier"), candidates)
+                if not candidates:
+                    is_valid, error = False, "status ok with no candidate suppliers"
+                elif canonical is None:
+                    is_valid = False
+                    error = f"supplier {alert.get('supplier')!r} is not a candidate supplier {sorted(candidates)}"
+                else:
+                    alert = {**alert, "supplier": canonical}
 
     return {
         **state,
+        "alert": alert,
         "is_valid": is_valid,
         "trace_steps": record_trace_step(
             state["trace_steps"], "validate", t0,
-            decision="valid" if is_valid else "fallback",
+            decision="valid" if is_valid else "fallback", error=error,
         ),
     }
 
@@ -685,7 +792,48 @@ def route_after_decision(state: RiskState) -> str:
 def route_after_validation(state: RiskState) -> str:
     return "end" if state.get("is_valid") else "fallback"
 
-# ---- Node 7: governed privileged action (checkpointed graph only) ----
+# ---- Node 7: business eligibility (checkpointed graph only) ----
+ASSESSED = "assessed"
+LEGACY_UNASSESSED = "legacy_unassessed"
+
+
+def make_assess_node(risk_reader):
+    """assess: decide from current supplier state whether the alert warrants act.
+
+    Read-only: it classifies against the prior state row and writes nothing,
+    so re-running it has no side effects. Its answer is checkpointed; a later
+    RESUME (e.g. after an act denial) reuses it. Supplier state is still
+    written only after the graph reaches END (finalize_completed_run).
+    """
+    def assess(state: RiskState) -> RiskState:
+        t0 = time.time()
+        alert = state["alert"]
+        key = risk_state_key(alert)
+        prior = risk_reader.get(*key) if key else None
+        change_type, _, _ = classify_risk_change(alert, state["headline"], prior)
+        eligible = change_type in ACTION_ELIGIBLE_CHANGE_TYPES
+        return {
+            **state,
+            "assessment": {
+                "basis": ASSESSED,
+                "eligibility_change_type": change_type,
+                "action_eligible": eligible,
+                "prior_risk_level": (prior or {}).get("current_risk_level"),
+                "prior_last_seen_at": (prior or {}).get("last_seen_at"),
+            },
+            "trace_steps": record_trace_step(
+                state["trace_steps"], "assess", t0, decision="act" if eligible else "no_action",
+            ),
+        }
+
+    return assess
+
+
+def route_after_assess(state: RiskState) -> str:
+    return "act" if state["assessment"]["action_eligible"] else "end"
+
+
+# ---- Node 8: governed privileged action (checkpointed graph only) ----
 REVIEW_TICKET_ACTION = "open_review_ticket"
 REVIEW_TICKET_RISK_SCORE = {"High": 85, "Medium": 60, "Low": 30}
 
@@ -718,18 +866,34 @@ def make_act_node(action_gate):
     Raises AuthorityDenied when authority refuses admission; the node then
     produces no checkpoint, so the workflow stays at act and a later RESUME
     re-runs only this node.
+
+    A checkpoint parked at act before the assess node existed has no
+    assessment. It keeps its original behavior (the action proceeds) and is
+    marked legacy_unassessed.
     """
-    def act(state: RiskState) -> RiskState:
+    def act(state: RiskState, config: RunnableConfig) -> RiskState:
         t0 = time.time()
+        # The current attempt (RESUME passes it in config; state holds START's).
+        trace_id = config["configurable"].get("trace_id") or state["trace_id"]
         alert = state["alert"]
+        assessment = state.get("assessment") or {
+            "basis": LEGACY_UNASSESSED,
+            "eligibility_change_type": None,
+            "action_eligible": None,
+        }
         action_id = review_ticket_action_id(state["thread_id"])
+        configurable = config["configurable"]
+        # The attempt's ownership token: a fenced ledger requires it for admission,
+        # replay and denial.
+        lease = ({"thread_id": state["thread_id"], "owner": configurable["lease_owner"],
+                  "epoch": configurable["lease_epoch"]} if configurable.get("lease_owner") else None)
         result = action_gate.execute(
             action_id,
             scope=AGENT_SCOPE,
             context={
                 "action_type": REVIEW_TICKET_ACTION,
                 "thread_id": state["thread_id"],
-                "trace_id": state["trace_id"],
+                "trace_id": trace_id,
                 "executor_id": get_executor_id(),
                 "subject": {
                     "alert_id": state["alert_id"],
@@ -737,11 +901,13 @@ def make_act_node(action_gate):
                     "risk_type": alert.get("risk_type"),
                     "risk_level": alert.get("risk_level"),
                 },
+                **({"lease": lease} if lease else {}),
             },
             effect=lambda: open_review_ticket(alert, state["headline"], action_id),
         )
         return {
             **state,
+            "assessment": assessment,
             "action_result": result,
             "trace_steps": record_trace_step(
                 state["trace_steps"], "act", t0,
@@ -753,20 +919,23 @@ def make_act_node(action_gate):
 
 
 def route_after_governed_validation(state: RiskState) -> str:
-    """Only a valid supplier-specific alert triggers the privileged action."""
+    """Only a valid supplier-specific alert is assessed for the privileged action."""
     if not state.get("is_valid"):
         return "fallback"
-    return "act" if (state.get("alert") or {}).get("status") == "ok" else "end"
+    return "assess" if (state.get("alert") or {}).get("status") == "ok" else "end"
 
 
 # ---- Graph ----
-def build_app(checkpointer=None, *, action_gate=None):
+def build_app(checkpointer=None, *, action_gate=None, risk_reader=None):
     """Compile the risk graph.
 
     With action_gate (the checkpointed lifecycle), validate routes valid "ok"
-    alerts through the governed act node. Without it (Phase 2 path) the
-    graph has no privileged action.
+    alerts to assess, which reads supplier state through risk_reader; only
+    action-eligible changes reach the governed act node. Without it (Phase 2
+    path) the graph has no privileged action.
     """
+    if action_gate is not None and risk_reader is None:
+        raise ValueError("a governed graph needs risk_reader to assess action eligibility")
     graph = StateGraph(RiskState)
 
     graph.add_node("infer", infer_suppliers)
@@ -798,14 +967,23 @@ def build_app(checkpointer=None, *, action_gate=None):
             },
         )
     else:
+        graph.add_node("assess", make_assess_node(risk_reader))
         graph.add_node("act", make_act_node(action_gate))
         graph.add_conditional_edges(
             "validate",
             route_after_governed_validation,
             {
-                "act": "act",
+                "assess": "assess",
                 "end": END,
                 "fallback": "fallback",
+            },
+        )
+        graph.add_conditional_edges(
+            "assess",
+            route_after_assess,
+            {
+                "act": "act",
+                "end": END,
             },
         )
         graph.add_edge("act", END)
@@ -837,6 +1015,7 @@ def initial_risk_state(alert_id: str, thread_id: str | None, trace_id: str, head
         "is_valid": None,
         "trace_steps": [],
         "retriever_metadata": None,
+        "assessment": None,
         "action_result": None,
     }
 

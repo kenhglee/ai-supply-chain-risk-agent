@@ -10,10 +10,13 @@ same lifecycle as the Lambda handler (app.workflows.risk_workflow):
 start pauses before analyze by default (the Lambda contract); with
 --pause-before validate it pauses once analysis is checkpointed, so RESUME
 runs no retrieval or model inference. start/resume print one JSON outcome
-line to stdout. Exit codes: 0 success,
-2 invalid arguments, 3 unknown thread, 4 authority denied. A missing
-CHECKPOINT_TABLE raises (non-zero). Dependencies are built fresh per run;
-continuity is DynamoDB + thread_id.
+line to stdout. Exit codes: 0 success (paused, completed, already_completed,
+ignored), 2 invalid arguments, 3 unknown thread, 4 authority denied,
+5 contended (another live owner holds the thread; nothing ran), 6 lease lost
+or action in flight, 7 completion unverified (legacy thread without enough
+evidence), 8 attempt failed (write conflict or unresolved outcome). Missing
+configuration raises (non-zero). Dependencies are built fresh per run, with
+same-thread ownership always enabled; continuity is DynamoDB + thread_id.
 
 session is a long-lived executor: one process reads commands from stdin, one
 JSON object per line ({"start": "<headline>"} or {"resume": "thread-..."}),
@@ -26,7 +29,12 @@ import json
 import sys
 
 from app.workflows.risk_workflow import (
+    ACTION_IN_FLIGHT,
+    ATTEMPT_FAILED,
     AUTHORITY_DENIED,
+    COMPLETION_UNVERIFIED,
+    CONTENDED,
+    LEASE_LOST,
     NOT_FOUND,
     OUTCOME_FIELDS,
     START_PAUSE_BEFORE,
@@ -41,6 +49,15 @@ EXIT_OK = 0
 EXIT_INVALID = 2
 EXIT_NOT_FOUND = 3
 EXIT_AUTHORITY_DENIED = 4
+EXIT_CONTENDED = 5
+EXIT_LEASE_LOST = 6
+EXIT_COMPLETION_UNVERIFIED = 7
+EXIT_ATTEMPT_FAILED = 8
+EXIT_CODES = {
+    NOT_FOUND: EXIT_NOT_FOUND, AUTHORITY_DENIED: EXIT_AUTHORITY_DENIED, CONTENDED: EXIT_CONTENDED,
+    LEASE_LOST: EXIT_LEASE_LOST, ACTION_IN_FLIGHT: EXIT_LEASE_LOST,
+    COMPLETION_UNVERIFIED: EXIT_COMPLETION_UNVERIFIED, ATTEMPT_FAILED: EXIT_ATTEMPT_FAILED,
+}
 
 # START pause points: before analysis (default, same as Lambda) or after it.
 PAUSE_BEFORE_CHOICES = ("analyze", "validate")
@@ -119,7 +136,7 @@ def run_session(lines, deps: dict, out=None) -> int:
             result = _run(command, value, deps)
         except Exception as exc:  # keep the executor alive; report and continue
             result = {"action": None, "error": f"{type(exc).__name__}: {exc}", "executor_id": get_executor_id()}
-        print(json.dumps(result), file=out, flush=True)
+        print(json.dumps(result, default=str), file=out, flush=True)
     return EXIT_OK
 
 
@@ -137,12 +154,8 @@ def main(argv: list[str] | None = None) -> int:
         result = _run("start", args.headline, deps, pause_before=[args.pause_before])
     else:
         result = _run("resume", args.thread_id, deps)
-    print(json.dumps(result))
-    if result["status"] == NOT_FOUND:
-        return EXIT_NOT_FOUND
-    if result["status"] == AUTHORITY_DENIED:
-        return EXIT_AUTHORITY_DENIED
-    return EXIT_OK
+    print(json.dumps(result, default=str))
+    return EXIT_CODES.get(result["status"], EXIT_OK)
 
 
 if __name__ == "__main__":

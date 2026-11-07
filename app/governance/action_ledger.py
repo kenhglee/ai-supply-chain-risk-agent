@@ -26,6 +26,13 @@ Statuses:
 An action left IN_FLIGHT (executor died mid-effect) is never re-executed
 here; it needs reconciliation, which is out of scope.
 
+Same-thread ownership (lease_table set; docs/SAME_THREAD_OWNERSHIP_DESIGN.md):
+admission, replay and denial each include a ConditionCheck on the thread's
+lease (owner and epoch from context["lease"]), so a worker that lost the
+thread cannot claim, replay or record a denial; it gets LeaseLost. Completion
+is deliberately not fenced: it records an effect that already ran, even if
+ownership was lost while it ran. Fenced mode refuses a context without a lease.
+
 Table schema:
   PK: action_id (S)
 """
@@ -34,7 +41,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ConnectionError as BotoConnectionError, HTTPClientError
 
 from app.governance.authority import (
     ACTIVE,
@@ -43,6 +50,7 @@ from app.governance.authority import (
     AuthorityStore,
 )
 from app.governance.policy import ALLOW, POLICY_ITEM_KIND, PolicyStore, policy_key_for_scope
+from app.storage.thread_lease import HELD, LEASE_SK, LeaseLost, OwnershipRequired
 
 DENIED = "DENIED"
 IN_FLIGHT = "IN_FLIGHT"
@@ -78,8 +86,9 @@ class ActionLedger:
     """Gate for privileged actions: authority check + claim + completion."""
 
     def __init__(self, table_name: str, authority: AuthorityStore, region: str | None = None,
-                 policies: PolicyStore | None = None) -> None:
+                 policies: PolicyStore | None = None, lease_table: str | None = None) -> None:
         self.table_name = table_name
+        self.lease_table = lease_table  # set: admission, replay and denial are fenced
         self.authority = authority
         # Materialized policy lives in the authority table under policy#...
         self.policies = policies or PolicyStore(authority.table_name, region)
@@ -101,10 +110,55 @@ class ActionLedger:
         ActionInFlight (an earlier claim never completed). A COMPLETED action
         returns its stored result without running effect() again.
         """
+        if self.lease_table and not context.get("lease"):
+            raise OwnershipRequired(f"fenced ledger: {action_id} admission without a lease token")
         admitted = self._admit(action_id, scope=scope, context=context)
         if admitted["status"] == COMPLETED:
             return admitted
         return self._complete(action_id, context["trace_id"], effect())
+
+    # ---- Ownership fence ----
+
+    def _lease_check(self, context: dict) -> list[dict]:
+        if not self.lease_table:
+            return []
+        lease = context["lease"]
+        return [{"ConditionCheck": {
+            "TableName": self.lease_table,
+            "Key": {"thread_id": lease["thread_id"], "sk": LEASE_SK},
+            "ConditionExpression": "#owner = :owner AND epoch = :epoch AND #state = :held",
+            "ExpressionAttributeNames": {"#owner": "owner", "#state": "state"},
+            "ExpressionAttributeValues": {":owner": lease["owner"], ":epoch": int(lease["epoch"]), ":held": HELD},
+        }}]
+
+    def _raise_if_lease_failed(self, exc: ClientError, context: dict, index: int, operation: str) -> None:
+        reasons = [r.get("Code") for r in exc.response.get("CancellationReasons", [])]
+        if self.lease_table and len(reasons) > index and reasons[index] == "ConditionalCheckFailed":
+            lease = context["lease"]
+            raise LeaseLost(lease["thread_id"], lease["owner"], int(lease["epoch"]), operation) from None
+
+    def _replay(self, existing: dict, context: dict) -> dict:
+        """Return a COMPLETED action's stored result; fenced mode records the replay under the lease."""
+        if self.lease_table:
+            lease = context["lease"]
+            try:
+                self._client.transact_write_items(TransactItems=[
+                    *self._lease_check(context),
+                    {"Update": {
+                        "TableName": self.table_name,
+                        "Key": {"action_id": existing["action_id"]},
+                        "UpdateExpression": "SET last_replayed_by = :trace_id, replay_epoch = :epoch",
+                        "ConditionExpression": "#status = :completed",
+                        "ExpressionAttributeNames": {"#status": "status"},
+                        "ExpressionAttributeValues": {":trace_id": context["trace_id"],
+                                                      ":epoch": int(lease["epoch"]), ":completed": COMPLETED},
+                    }},
+                ])
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] == "TransactionCanceledException":
+                    self._raise_if_lease_failed(exc, context, 0, f"replay of {existing['action_id']}")
+                raise
+        return _result(existing, replayed=True)
 
     # ---- Admission ----
 
@@ -114,19 +168,28 @@ class ActionLedger:
             authority = self.authority.get(scope)
             policy = self.policies.get(policy_key)
             if authority["status"] == ACTIVE and policy["effect"] == ALLOW:
+                admitted = {"status": IN_FLIGHT, "authority_version": authority["version"],
+                            "policy_version": policy["policy_version"], "policy_sha256": policy["policy_sha256"]}
                 try:
                     self._transact_claim(action_id, scope=scope, authority=authority,
                                          policy=policy, context=context)
-                    return {"status": IN_FLIGHT, "authority_version": authority["version"],
-                            "policy_version": policy["policy_version"], "policy_sha256": policy["policy_sha256"]}
+                    return admitted
+                except (HTTPClientError, BotoConnectionError):
+                    # Unknown outcome: admitted only if the action now names this attempt.
+                    existing = self.get(action_id)
+                    if existing and existing["status"] == IN_FLIGHT \
+                            and existing.get("claimed_by_trace_id") == context["trace_id"]:
+                        return admitted
+                    raise
                 except ClientError as exc:
                     if exc.response["Error"]["Code"] != "TransactionCanceledException":
                         raise
+                    self._raise_if_lease_failed(exc, context, 3, f"admission of {action_id}")
 
             # Not admitted: work out why from durable state, action first.
             existing = self.get(action_id)
             if existing and existing["status"] == COMPLETED:
-                return _result(existing, replayed=True)
+                return self._replay(existing, context)
             if existing and existing["status"] == IN_FLIGHT:
                 raise ActionInFlight(
                     f"action {action_id} is IN_FLIGHT from trace {existing.get('claimed_by_trace_id')}; "
@@ -189,6 +252,7 @@ class ActionLedger:
                     "claimed_by_trace_id = :trace_id, claimed_by_executor = :executor_id, "
                     "attempt_count = if_not_exists(attempt_count, :zero) + :one, "
                     "subject = :subject, created_at = if_not_exists(created_at, :now), updated_at = :now"
+                    + (", claimed_epoch = :epoch" if self.lease_table else "")
                 ),
                 "ConditionExpression": "attribute_not_exists(action_id) OR #status = :denied",
                 "ExpressionAttributeNames": {"#status": "status", "#scope": "scope"},
@@ -199,13 +263,19 @@ class ActionLedger:
                     ":pv": policy["policy_version"], ":ph": policy["policy_sha256"],
                     ":trace_id": context["trace_id"], ":executor_id": context["executor_id"],
                     ":zero": 0, ":one": 1, ":subject": context.get("subject") or {}, ":now": now,
+                    **({":epoch": int(context["lease"]["epoch"])} if self.lease_table else {}),
                 },
             }},
+            *self._lease_check(context),
         ])
 
     def _record_denied(self, action_id: str, *, scope: str, authority: dict, policy: dict, layer: str,
                        context: dict) -> None:
         now = _now()
+        if self.lease_table:
+            self._record_denied_fenced(action_id, scope=scope, authority=authority, policy=policy,
+                                       layer=layer, context=context, now=now)
+            return
         try:
             self._table.update_item(
                 Key={"action_id": action_id},
@@ -235,6 +305,42 @@ class ActionLedger:
             if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
                 raise
 
+    def _record_denied_fenced(self, action_id: str, *, scope: str, authority: dict, policy: dict, layer: str,
+                              context: dict, now: str) -> None:
+        try:
+            self._client.transact_write_items(TransactItems=[
+                *self._lease_check(context),
+                {"Update": {
+                    "TableName": self.table_name,
+                    "Key": {"action_id": action_id},
+                    "UpdateExpression": (
+                        "SET #status = :denied, action_type = :action_type, thread_id = :thread_id, "
+                        "#scope = :scope, denied_authority_status = :auth_status, "
+                        "denied_authority_version = :auth_version, denied_layer = :layer, "
+                        "denied_policy_status = :pol_status, denied_policy_version = :pol_version, "
+                        "denied_policy_sha256 = :pol_sha, denied_by_trace_id = :trace_id, "
+                        "denied_executor = :executor_id, denied_count = if_not_exists(denied_count, :zero) + :one, "
+                        "subject = :subject, created_at = if_not_exists(created_at, :now), updated_at = :now"
+                    ),
+                    "ConditionExpression": "attribute_not_exists(action_id) OR #status = :denied",
+                    "ExpressionAttributeNames": {"#status": "status", "#scope": "scope"},
+                    "ExpressionAttributeValues": {
+                        ":denied": DENIED, ":action_type": context["action_type"],
+                        ":thread_id": context["thread_id"], ":scope": scope,
+                        ":auth_status": authority["status"], ":auth_version": authority["version"],
+                        ":layer": layer, ":pol_status": policy["status"],
+                        ":pol_version": policy["policy_version"], ":pol_sha": policy["policy_sha256"],
+                        ":trace_id": context["trace_id"], ":executor_id": context["executor_id"],
+                        ":zero": 0, ":one": 1, ":subject": context.get("subject") or {}, ":now": now,
+                    },
+                }},
+            ])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "TransactionCanceledException":
+                raise
+            self._raise_if_lease_failed(exc, context, 0, f"denial of {action_id}")
+            # Otherwise the action is IN_FLIGHT/COMPLETED: never downgrade it.
+
     # ---- Completion ----
 
     def _complete(self, action_id: str, trace_id: str, effect: dict) -> dict:
@@ -263,10 +369,13 @@ class UnconfiguredActionGate:
         raise AuthorityDenied(scope, UNCONFIGURED, None, "AUTHORITY_TABLE/ACTIONS_TABLE not configured", action_id)
 
 
-def action_gate_from_env():
-    """Ledger + authority from AUTHORITY_TABLE / ACTIONS_TABLE; fail closed if either is missing."""
+def action_gate_from_env(*, lease_table: str | None = None):
+    """Ledger + authority from AUTHORITY_TABLE / ACTIONS_TABLE; fail closed if either is missing.
+
+    lease_table fences admission, replay and denial on the thread's lease.
+    """
     authority_table = os.environ.get("AUTHORITY_TABLE")
     actions_table = os.environ.get("ACTIONS_TABLE")
     if not (authority_table and actions_table):
         return UnconfiguredActionGate()
-    return ActionLedger(actions_table, AuthorityStore(authority_table))
+    return ActionLedger(actions_table, AuthorityStore(authority_table), lease_table=lease_table)

@@ -19,6 +19,10 @@ _REQUIRED_FIELDS = [
 ]
 
 
+class ModelConfigError(ValueError):
+    """The environment selects a provider/model combination that cannot be resolved."""
+
+
 @dataclass
 class ModelRecord:
     model_id: str
@@ -51,7 +55,9 @@ def resolve_model_runtime(model_record: ModelRecord) -> ModelRuntime:
 
     - LLM_PROVIDER overrides model_record.provider.
     - OPENAI_MODEL overrides model_name when the effective provider is openai.
-    - BEDROCK_MODEL_ID overrides model_name when the effective provider is bedrock.
+    - BEDROCK_MODEL_ID is required when the effective provider is bedrock: the
+      registry names OpenAI models, so there is no Bedrock fallback. Missing or
+      blank raises ModelConfigError.
     - BIFROST_MODEL_ID overrides model_name when the effective provider is bifrost.
     - runtime_overridden is True when either value differs from the registry.
     """
@@ -60,7 +66,12 @@ def resolve_model_runtime(model_record: ModelRecord) -> ModelRuntime:
     if runtime_provider == "openai":
         env_model = os.getenv("OPENAI_MODEL")
     elif runtime_provider == "bedrock":
-        env_model = os.getenv("BEDROCK_MODEL_ID")
+        env_model = (os.getenv("BEDROCK_MODEL_ID") or "").strip()
+        if not env_model:
+            raise ModelConfigError(
+                "LLM_PROVIDER=bedrock requires BEDROCK_MODEL_ID to be set "
+                "(e.g. us.anthropic.claude-haiku-4-5-20251001-v1:0); it is missing or blank"
+            )
     elif runtime_provider == "bifrost":
         env_model = os.getenv("BIFROST_MODEL_ID")
     else:

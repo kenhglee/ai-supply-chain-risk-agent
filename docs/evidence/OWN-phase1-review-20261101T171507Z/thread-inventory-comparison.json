@@ -1,0 +1,184 @@
+{
+ "legacy_comparison": [
+  {
+   "thread_id": "thread-45522252e46947e8bf532557deeb75f6",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-4fc91cb5fd9447d6b99ab6b5f1d49070",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-55681a500d9c4b9d951221f733de8ce9",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-68cb0fe1351c456192dd2078b2bde4d7",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-6c64dae4e23948e3b2e9f4865fb835f1",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-739b289350dd47d48c54cb32a35f856a",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-789398d481b44d6eafdee4788cc6786c",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-8361be60fab04942b210bdeb148fb75e",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-a5b87fd9b706499f83955f619fcfb013",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-b330797cbede4fddbb0da48f016da38f",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-cb022986fb474edfbb3eb79f43d1c21d",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-ceb4cd45ee2a4a42bcc4146283b2c601",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  },
+  {
+   "thread_id": "thread-fa78851119384563a725219cee7707c4",
+   "present": true,
+   "classification_now": "legacy_recognized",
+   "has_lease": false,
+   "has_final": false,
+   "unchanged": true
+  }
+ ],
+ "new_threads": [
+  {
+   "thread_id": "thread-46450834b0ec4d48b885b27de514d9f5",
+   "classification": "owned",
+   "lease_epoch": 2,
+   "lease_state": "RELEASED",
+   "has_final": true,
+   "next": []
+  },
+  {
+   "thread_id": "thread-4c7fcd82e31c4ea4b14cc639627b1f10",
+   "classification": "owned",
+   "lease_epoch": 3,
+   "lease_state": "RELEASED",
+   "has_final": true,
+   "next": []
+  },
+  {
+   "thread_id": "thread-556d48cfd1a44c488e39f4b685330d88",
+   "classification": "owned",
+   "lease_epoch": 3,
+   "lease_state": "RELEASED",
+   "has_final": true,
+   "next": []
+  },
+  {
+   "thread_id": "thread-587bc251a67540e3bde2724ce920bb49",
+   "classification": "owned",
+   "lease_epoch": 2,
+   "lease_state": "RELEASED",
+   "has_final": true,
+   "next": []
+  },
+  {
+   "thread_id": "thread-69cc83390c314386a9e6a058c77109fe",
+   "classification": "owned",
+   "lease_epoch": 2,
+   "lease_state": "RELEASED",
+   "has_final": true,
+   "next": []
+  },
+  {
+   "thread_id": "thread-b0e7d18753c54a2cb998670614b6bdf8",
+   "classification": "owned",
+   "lease_epoch": 3,
+   "lease_state": "RELEASED",
+   "has_final": true,
+   "next": []
+  },
+  {
+   "thread_id": "thread-c4693a44854641d3b308463ee15f6870",
+   "classification": "owned",
+   "lease_epoch": 2,
+   "lease_state": "RELEASED",
+   "has_final": true,
+   "next": []
+  },
+  {
+   "thread_id": "thread-cb6b4b312467438f976688b7fd59fb42",
+   "classification": "owned",
+   "lease_epoch": 3,
+   "lease_state": "RELEASED",
+   "has_final": true,
+   "next": []
+  },
+  {
+   "thread_id": "thread-ec26e56cb6604e999a044547c8ac0631",
+   "classification": "owned",
+   "lease_epoch": 2,
+   "lease_state": "RELEASED",
+   "has_final": false,
+   "next": [
+    "act"
+   ]
+  }
+ ]
+}

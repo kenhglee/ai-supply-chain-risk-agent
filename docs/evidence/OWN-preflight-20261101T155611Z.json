@@ -1,0 +1,407 @@
+{
+  "identity": {
+    "account": "714781437949",
+    "arn": "arn:aws:sts::714781437949:assumed-role/AWSReservedSSO_AdministratorAccess_05923c424fbe9171/<session>"
+  },
+  "region": "us-west-2",
+  "executor": {
+    "function_name": "ai-supply-chain-risk-agent",
+    "arn": "arn:aws:lambda:us-west-2:714781437949:function:ai-supply-chain-risk-agent",
+    "package_type": "Image",
+    "image_uri": "714781437949.dkr.ecr.us-west-2.amazonaws.com/ai-supply-chain-risk-agent@sha256:a0500bbef2e4f5d1939b2d7815b37d2faa2f0f9ed065cbb2e9d11c8cb0a7b224",
+    "resolved_image_uri": "714781437949.dkr.ecr.us-west-2.amazonaws.com/ai-supply-chain-risk-agent@sha256:a0500bbef2e4f5d1939b2d7815b37d2faa2f0f9ed065cbb2e9d11c8cb0a7b224",
+    "last_modified": "2026-10-11T20:46:55.000+0000",
+    "role": "arn:aws:iam::714781437949:role/RiskAgentLambdaRole",
+    "timeout_s": 123,
+    "memory_mb": 1028,
+    "environment": {
+      "CHECKPOINT_TABLE": "risk_agent_checkpoints",
+      "RISK_STATE_BACKEND": "dynamodb",
+      "TRACE_STORE_BACKEND": "dynamodb",
+      "RUNTIME_DIR": "/tmp",
+      "RISK_TRACES_TABLE": "risk_traces",
+      "EMBEDDING_PROVIDER": "bedrock",
+      "LLM_PROVIDER": "bedrock",
+      "RISK_STATE_TABLE": "supplier_risk_state",
+      "BEDROCK_MODEL_ID": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "LOG_LEVEL": "INFO",
+      "OUTPUT_MODE": "lambda"
+    },
+    "reserved_concurrency": {},
+    "function_url": {
+      "error": "ResourceNotFoundException"
+    },
+    "event_source_mappings": {
+      "EventSourceMappings": []
+    },
+    "resource_policy": {
+      "error": "ResourceNotFoundException"
+    },
+    "async_config": {
+      "error": "ResourceNotFoundException"
+    },
+    "eventbridge_rules": [],
+    "scheduler_schedules": [],
+    "role_inline_policies": {
+      "BedrockInvoke": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Action": [
+              "bedrock:InvokeModel"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:bedrock:us-west-2:714781437949:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+              "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+              "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+              "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+              "arn:aws:bedrock:us-west-2::foundation-model/amazon.titan-embed-text-v2:0"
+            ]
+          }
+        ]
+      },
+      "RiskCheckpointAccess": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Action": [
+              "dynamodb:Query",
+              "dynamodb:PutItem"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:dynamodb:us-west-2:714781437949:table/risk_agent_checkpoints"
+          }
+        ]
+      },
+      "RiskStateAccess": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:dynamodb:us-west-2:714781437949:table/supplier_risk_state"
+          }
+        ]
+      },
+      "RiskTraceAccess": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem",
+              "dynamodb:Scan",
+              "dynamodb:Query"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:dynamodb:us-west-2:714781437949:table/risk_traces",
+              "arn:aws:dynamodb:us-west-2:714781437949:table/risk_traces/index/alert-id-index"
+            ]
+          }
+        ]
+      }
+    },
+    "role_attached_policies": [
+      "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    ]
+  },
+  "threads": [
+    {
+      "thread_id": "thread-45522252e46947e8bf532557deeb75f6",
+      "checkpoints": 8,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "c991f6a93e784f32bea4daa64e0a54ad",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-46450834b0ec4d48b885b27de514d9f5",
+      "checkpoints": 8,
+      "has_lease": true,
+      "has_final": true,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": true,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "classification": "owned",
+      "lease_epoch": 2,
+      "lease_state": "RELEASED"
+    },
+    {
+      "thread_id": "thread-4fc91cb5fd9447d6b99ab6b5f1d49070",
+      "checkpoints": 10,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": "COMPLETED",
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "472983adc70a4e51b13e007d382dd349",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-55681a500d9c4b9d951221f733de8ce9",
+      "checkpoints": 9,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": "COMPLETED",
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "546879beb03a41d48ebe30e0047630d6",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-587bc251a67540e3bde2724ce920bb49",
+      "checkpoints": 8,
+      "has_lease": true,
+      "has_final": true,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": true,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "classification": "owned",
+      "lease_epoch": 2,
+      "lease_state": "RELEASED"
+    },
+    {
+      "thread_id": "thread-68cb0fe1351c456192dd2078b2bde4d7",
+      "checkpoints": 8,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "427cfc746a274c4d976bb579c3948ada",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-69cc83390c314386a9e6a058c77109fe",
+      "checkpoints": 8,
+      "has_lease": true,
+      "has_final": true,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": true,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "classification": "owned",
+      "lease_epoch": 2,
+      "lease_state": "RELEASED"
+    },
+    {
+      "thread_id": "thread-6c64dae4e23948e3b2e9f4865fb835f1",
+      "checkpoints": 9,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": "COMPLETED",
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "55806917e86c48dbb5c5f72b5a02a419",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-739b289350dd47d48c54cb32a35f856a",
+      "checkpoints": 8,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "8e748cfdba3a426ba20db68d1bffd9aa",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-789398d481b44d6eafdee4788cc6786c",
+      "checkpoints": 8,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "86f8ea0c5d884be3ae106188349f906d",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-8361be60fab04942b210bdeb148fb75e",
+      "checkpoints": 9,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": "COMPLETED",
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "6cb1827a5a7c447d9274e4c031eddc3c",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-a5b87fd9b706499f83955f619fcfb013",
+      "checkpoints": 8,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "9e3f47f7842d419fb73b2e48384cf6f7",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-b0e7d18753c54a2cb998670614b6bdf8",
+      "checkpoints": 8,
+      "has_lease": true,
+      "has_final": true,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": true,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "classification": "owned",
+      "lease_epoch": 3,
+      "lease_state": "RELEASED"
+    },
+    {
+      "thread_id": "thread-b330797cbede4fddbb0da48f016da38f",
+      "checkpoints": 9,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": "COMPLETED",
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "9c21716fc38940faac0f1b9592bc7e19",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-cb022986fb474edfbb3eb79f43d1c21d",
+      "checkpoints": 9,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": "COMPLETED",
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "1b0ef633158c4d1b8bba0436e311747b",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-cb6b4b312467438f976688b7fd59fb42",
+      "checkpoints": 8,
+      "has_lease": true,
+      "has_final": true,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": true,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "classification": "owned",
+      "lease_epoch": 3,
+      "lease_state": "RELEASED"
+    },
+    {
+      "thread_id": "thread-ceb4cd45ee2a4a42bcc4146283b2c601",
+      "checkpoints": 8,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "16c482a6f60d40a68ada12e2aa68b5d1",
+      "classification": "legacy_recognized"
+    },
+    {
+      "thread_id": "thread-fa78851119384563a725219cee7707c4",
+      "checkpoints": 8,
+      "has_lease": false,
+      "has_final": false,
+      "next": [],
+      "pending_tasks": [],
+      "final_checkpoint_has_lease_epoch": false,
+      "action_status": null,
+      "supplier": "TSMC",
+      "risk_level": "High",
+      "evidence_reasons": [],
+      "source_trace_id": "b703a840b5454ae296df306526cf6eff",
+      "classification": "legacy_recognized"
+    }
+  ],
+  "summary": {
+    "legacy_recognized": 13,
+    "owned": 5
+  },
+  "aws_operations": [
+    "dynamodb:GetItem",
+    "dynamodb:Query",
+    "dynamodb:Scan",
+    "events:ListRuleNamesByTarget",
+    "iam:GetRolePolicy",
+    "iam:ListAttachedRolePolicies",
+    "iam:ListRolePolicies",
+    "lambda:GetFunction",
+    "lambda:GetFunctionConcurrency",
+    "lambda:GetFunctionEventInvokeConfig",
+    "lambda:GetFunctionUrlConfig",
+    "lambda:GetPolicy",
+    "lambda:ListEventSourceMappings",
+    "scheduler:ListSchedules",
+    "sso:GetRoleCredentials",
+    "sts:GetCallerIdentity"
+  ]
+}

@@ -28,6 +28,7 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
 from app.governance.action_ledger import UnconfiguredActionGate  # noqa: E402
 from app.storage.checkpoint_store import DynamoCheckpointSaver  # noqa: E402
+from app.storage.supplier_risk_state_store import DynamoRiskStateStore  # noqa: E402
 from app.workers import risk_worker  # noqa: E402
 from app.workflows import supplier_risk_agent as agent  # noqa: E402
 from app.workflows.risk_workflow import checkpoint_dependencies_from_env  # noqa: E402
@@ -36,7 +37,9 @@ from tests.test_risk_workflow import (  # noqa: E402,F401  (env is a pytest fixt
     HEADLINE,
     MOTO_AVAILABLE,
     REGION,
+    OK_ALERT,
     SUPPLIER_STATE,
+    _new_executor,
     _trace,
     env,
 )
@@ -80,7 +83,8 @@ def test_revoke_and_restore_authority_against_one_live_executor(env, monkeypatch
         return env.triage.calls, env.retriever.calls, env.risk.calls
 
     def commands():
-        # b. authority ACTIVE (v1): T1 runs through act.
+        # b. authority ACTIVE (v1): T1 (new_alert, Medium) runs through act.
+        env.risk.response = json.dumps({**OK_ALERT, "risk_level": "Medium"})
         yield json.dumps({"start": HEADLINE})
         t1 = last()["thread_id"]
         yield json.dumps({"resume": t1})
@@ -89,14 +93,16 @@ def test_revoke_and_restore_authority_against_one_live_executor(env, monkeypatch
         # c. operator revokes; the session is not told.
         observed["revoked"] = env.authority.revoke(reason="incident: stop ticketing", actor="operator")
 
-        # d/e. same executor: T2 up to act, which is denied.
+        # d/e. same executor: T2 (escalated to High, so action-eligible) up to act, which is denied.
+        env.risk.response = json.dumps(OK_ALERT)
         yield json.dumps({"start": HEADLINE_T2})
         t2 = last()["thread_id"]
         yield json.dumps({"resume": t2})
         observed["t2_denied"] = last()
         observed["after_denial"] = {
             "next": agent.build_app(
-                DynamoCheckpointSaver(CHECKPOINTS, REGION), action_gate=UnconfiguredActionGate()
+                DynamoCheckpointSaver(CHECKPOINTS, REGION), action_gate=UnconfiguredActionGate(),
+                risk_reader=DynamoRiskStateStore(SUPPLIER_STATE, REGION),
             ).get_state({"configurable": {"thread_id": t2}}).next,
             "calls": calls(),
             "tickets": len(tickets),
@@ -149,8 +155,10 @@ def test_revoke_and_restore_authority_against_one_live_executor(env, monkeypatch
     assert (denial_trace["authority_status"], denial_trace["authority_version"]) == ("REVOKED", 2)
     assert denial_trace["action_id"] == action_id
     assert [s["node_name"] for s in denial_trace["trace_steps"]] == [
-        "infer", "decide", "retrieve", "analyze", "validate",
+        "infer", "decide", "retrieve", "analyze", "validate", "assess",
     ]
+    assert (denied["eligibility_change_type"], denied["action_eligible"]) == ("escalated", True)
+    assert denial_trace["eligibility_basis"] == "assessed"
 
     # f/g. restored; only act re-ran.
     assert (observed["restored"]["status"], observed["restored"]["version"]) == ("ACTIVE", 3)
@@ -165,9 +173,10 @@ def test_revoke_and_restore_authority_against_one_live_executor(env, monkeypatch
     completed_trace = _trace(completed["trace_id"])
     assert completed_trace["workflow_event"] == "resumed_completed"
     before, after_steps = _steps(denial_trace), _steps(completed_trace)
-    assert list(after_steps) == ["infer", "decide", "retrieve", "analyze", "validate", "act"]
-    for node in ("infer", "decide", "retrieve", "analyze", "validate"):
-        assert after_steps[node] == before[node]
+    assert list(after_steps) == ["infer", "decide", "retrieve", "analyze", "validate", "assess", "act"]
+    for node in ("infer", "decide", "retrieve", "analyze", "validate", "assess"):
+        assert after_steps[node] == before[node]  # including the saved assessment
+    assert (completed["eligibility_change_type"], completed["change_type"]) == ("escalated", "escalated")
     assert after_steps["act"]["started_at"] >= completed_trace["created_at"]
     assert supplier_item()["last_headline"] == HEADLINE_T2
 
@@ -194,8 +203,7 @@ def test_session_survives_bad_lines(env, monkeypatch):
     out = io.StringIO()
     lines = ["not json", json.dumps({"resume": "thread-123"}), json.dumps({"delete": "x"}), "",
              json.dumps({"resume": "thread-" + "d" * 32})]
-    deps = {"checkpointer": DynamoCheckpointSaver(CHECKPOINTS, REGION), "risk_store": None,
-            "action_gate": UnconfiguredActionGate()}
+    deps = _new_executor()
 
     assert risk_worker.run_session(lines, deps, out=out) == 0
 

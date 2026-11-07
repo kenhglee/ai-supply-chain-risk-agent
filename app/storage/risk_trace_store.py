@@ -8,9 +8,18 @@ from boto3.dynamodb.conditions import Key
 
 _STORE_PATH = Path(__file__).parent / "risk_traces.jsonl"
 
-# Checkpointed attempts that stopped before END. Their alert (if any) is an
-# intermediate analysis result, not a completed outcome.
-INCOMPLETE_WORKFLOW_EVENTS = frozenset({"paused", "authority_denied"})
+# Checkpointed attempts that did not complete the workflow. Their alert (if any)
+# is an intermediate analysis result, not a completed outcome.
+INCOMPLETE_WORKFLOW_EVENTS = frozenset({
+    "paused", "authority_denied", "lease_lost", "action_in_flight", "attempt_failed", "completion_unverified",
+})
+# Fields compared when a write-once trace already exists (same attempt, same result).
+_ONCE_IDENTITY_FIELDS = ("thread_id", "workflow_event", "change_type", "lease_epoch")
+WRITTEN, SAME, CONFLICT = "written", "same", "conflict"
+
+
+def _same_trace(existing: dict, record: dict) -> bool:
+    return all(existing.get(k) == record.get(k) for k in _ONCE_IDENTITY_FIELDS)
 
 
 def trace_display_status(record: dict) -> str:
@@ -33,6 +42,14 @@ class JsonlTraceStore:
         with open(self._path, "a", encoding="utf-8") as f:
             f.write(json.dumps(out) + "\n")
 
+    def append_once(self, record: dict) -> str:
+        """Write unless this trace_id exists (single-process only for JSONL)."""
+        existing = next((r for r in self._load_all() if r.get("trace_id") == record["trace_id"]), None)
+        if existing is None:
+            self.append(record)
+            return WRITTEN
+        return SAME if _same_trace(existing, record) else CONFLICT
+
     def _load_all(self) -> list[dict]:
         if not self._path.exists():
             return []
@@ -46,6 +63,9 @@ class JsonlTraceStore:
 
     def get_all(self) -> list[dict]:
         return sorted(self._load_all(), key=lambda r: r.get("created_at", ""), reverse=True)
+
+    def get_by_trace_id(self, trace_id: str) -> dict | None:
+        return next((r for r in self._load_all() if r.get("trace_id") == trace_id), None)
 
     def get_by_identifier(self, identifier: str) -> dict | None:
         matches = [
@@ -61,12 +81,18 @@ class JsonlTraceStore:
 
 # Optional top-level scalars, stored natively when present. thread_id,
 # workflow_event and executor_id link checkpointed workflow attempts; the
-# action/authority fields record governed-action outcomes (Phase 3D).
+# action/authority fields record governed-action outcomes (Phase 3D); the
+# eligibility fields record the pre-action business assessment, kept separate
+# from the write-time change_type.
 _OPTIONAL_SCALAR_FIELDS = (
     "tool_decision", "final_status", "supplier", "risk_type", "risk_level",
     "thread_id", "workflow_event", "executor_id",
     "action_id", "action_status", "authority_status", "authority_version",
     "denied_layer", "policy_version", "policy_sha256",
+    "eligibility_change_type", "action_eligible", "eligibility_basis",
+    # Same-thread ownership: the attempt's lease epoch and checkpoint lineage.
+    "lease_epoch", "lineage_checkpoint_id", "recovered_by", "recovered_finalization", "trace_recovered",
+    "legacy_recognized", "unverified_reasons", "error_type",
 )
 
 
@@ -110,7 +136,7 @@ class DynamoTraceStore:
         record = dict(item)
         if "run_duration_ms" in record:
             record["run_duration_ms"] = float(record["run_duration_ms"])
-        for field in ("authority_version", "policy_version"):
+        for field in ("authority_version", "policy_version", "lease_epoch"):
             if record.get(field) is not None:
                 record[field] = int(record[field])
         record["trace_steps"] = json.loads(record.get("trace_steps", "[]"))
@@ -137,8 +163,28 @@ class DynamoTraceStore:
     def append(self, record: dict) -> None:
         self._table.put_item(Item=self._to_dynamo_item(record))
 
+    def append_once(self, record: dict) -> str:
+        """Conditional put on trace_id: idempotent for retries and trace recovery."""
+        from botocore.exceptions import ClientError
+
+        try:
+            self._table.put_item(Item=self._to_dynamo_item(record),
+                                 ConditionExpression="attribute_not_exists(trace_id)")
+            return WRITTEN
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+        existing = self._from_dynamo_item(self._table.get_item(
+            Key={"trace_id": record["trace_id"]}, ConsistentRead=True)["Item"])
+        return SAME if _same_trace(existing, record) else CONFLICT
+
     def get_all(self) -> list[dict]:
         return sorted(self._scan_all(), key=lambda r: r.get("created_at", ""), reverse=True)
+
+    def get_by_trace_id(self, trace_id: str) -> dict | None:
+        """Exactly the record with this trace_id (no alert_id fallback)."""
+        item = self._table.get_item(Key={"trace_id": trace_id}, ConsistentRead=True).get("Item")
+        return self._from_dynamo_item(item) if item else None
 
     def get_by_identifier(self, identifier: str) -> dict | None:
         # Try PK lookup first (trace_id)
@@ -195,8 +241,18 @@ def append_risk_trace(record: dict) -> None:
     _get_trace_store().append(record)
 
 
+def append_risk_trace_once(record: dict) -> str:
+    """written | same (already there, identical attempt) | conflict (different record)."""
+    return _get_trace_store().append_once(record)
+
+
 def get_all_traces() -> list[dict]:
     return _get_trace_store().get_all()
+
+
+def get_risk_trace_by_trace_id(trace_id: str) -> dict | None:
+    """Exactly the record with this trace_id; used by recovery and legacy evidence."""
+    return _get_trace_store().get_by_trace_id(trace_id)
 
 
 def get_risk_trace_by_identifier(identifier: str) -> dict | None:

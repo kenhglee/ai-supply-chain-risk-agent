@@ -1,0 +1,1 @@
+arn:aws:sts::714781437949:assumed-role/AWSReservedSSO_AdministratorAccess_05923c424fbe9171/<session>

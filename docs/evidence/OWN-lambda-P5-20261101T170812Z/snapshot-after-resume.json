@@ -1,0 +1,128 @@
+{
+ "aws_operations": [
+  "dynamodb:GetItem",
+  "dynamodb:Query",
+  "dynamodb:Scan",
+  "lambda:GetFunction",
+  "lambda:GetFunctionConcurrency",
+  "sso:GetRoleCredentials"
+ ],
+ "checkpoint_chain": [
+  {
+   "checkpoint_id": "1f1d616e-e9fb-6c47-8006-c96d1307ff32",
+   "lease_epoch": 2,
+   "parent": "1f1d616e-e932-66d8-8005-58041f7c6e17",
+   "step": 6
+  },
+  {
+   "checkpoint_id": "1f1d616e-e932-66d8-8005-58041f7c6e17",
+   "lease_epoch": 2,
+   "parent": "1f1d616e-e89c-6fac-8004-333b6bb92950",
+   "step": 5
+  },
+  {
+   "checkpoint_id": "1f1d616e-e89c-6fac-8004-333b6bb92950",
+   "lease_epoch": 2,
+   "parent": "1f1d616d-2bdf-6832-8003-f631027207f6",
+   "step": 4
+  },
+  {
+   "checkpoint_id": "1f1d616d-2bdf-6832-8003-f631027207f6",
+   "lease_epoch": 1,
+   "parent": "1f1d616d-2a8a-6036-8002-241181a7c471",
+   "step": 3
+  },
+  {
+   "checkpoint_id": "1f1d616d-2a8a-6036-8002-241181a7c471",
+   "lease_epoch": 1,
+   "parent": "1f1d616d-24b8-6809-8001-92fb891e9ed5",
+   "step": 2
+  },
+  {
+   "checkpoint_id": "1f1d616d-24b8-6809-8001-92fb891e9ed5",
+   "lease_epoch": 1,
+   "parent": "1f1d616d-23e9-6ef2-8000-f610586e6412",
+   "step": 1
+  },
+  {
+   "checkpoint_id": "1f1d616d-23e9-6ef2-8000-f610586e6412",
+   "lease_epoch": 1,
+   "parent": "1f1d616d-23c1-60bf-bfff-e869f4472139",
+   "step": 0
+  },
+  {
+   "checkpoint_id": "1f1d616d-23c1-60bf-bfff-e869f4472139",
+   "lease_epoch": 1,
+   "parent": null,
+   "step": -1
+  }
+ ],
+ "final": {
+  "change_type": "suppressed",
+  "eligibility_change_type": "suppressed",
+  "epoch": "2",
+  "final_checkpoint_id": "1f1d616e-e9fb-6c47-8006-c96d1307ff32",
+  "finalized_at": "2026-11-01T17:09:00.670+00:00",
+  "kind": "finalized",
+  "recovered": false,
+  "risk_level": "High",
+  "sk": "final",
+  "thread_id": "thread-4c7fcd82e31c4ea4b14cc639627b1f10",
+  "trace_id": "f5d8d7cd61704296ab7ce9bb2d4f759a",
+  "workflow_event": "resumed_completed"
+ },
+ "fork": false,
+ "label": "after-resume",
+ "lambda": {
+  "governance_env": [],
+  "image": "sha256:7701dd3365cae6e753d2864d051d105bcee31fe3bfa41bb16fe5ea3a250662bd",
+  "reserved_concurrency": "unreserved",
+  "state": "Active"
+ },
+ "latest": {
+  "checkpoint_id": "1f1d616e-e9fb-6c47-8006-c96d1307ff32",
+  "lease_epoch": 2,
+  "next_branches": [],
+  "pending_writes": [],
+  "step": 6
+ },
+ "lease": {
+  "acquired_at_ms": "1793552941947",
+  "epoch": "3",
+  "expires_at_ms": "1793553061947",
+  "owner": "56dcb25013b54e63b121077e277e66e6",
+  "owner_executor": "2026/11/01/[$LATEST]c5f9bce24d664a22a380502422ec3a85",
+  "released_at_ms": "1793552942100",
+  "sk": "lease",
+  "state": "RELEASED",
+  "thread_id": "thread-4c7fcd82e31c4ea4b14cc639627b1f10"
+ },
+ "ledger_item": null,
+ "taken_at": "2026-11-01T17:09:04.596+00:00",
+ "thread_id": "thread-4c7fcd82e31c4ea4b14cc639627b1f10",
+ "traces": [
+  {
+   "change_type": null,
+   "executor_id": "2026/11/01/[$LATEST]6ff4abe01c774a5a8f3cd2a2dc414c3c",
+   "lease_epoch": "1",
+   "trace_id": "d6224d1d06474d31ba5713e32ccea184",
+   "workflow_event": "paused"
+  },
+  {
+   "change_type": "suppressed",
+   "executor_id": "2026/11/01/[$LATEST]6ff4abe01c774a5a8f3cd2a2dc414c3c",
+   "lease_epoch": "2",
+   "trace_id": "f5d8d7cd61704296ab7ce9bb2d4f759a",
+   "workflow_event": "resumed_completed"
+  }
+ ],
+ "tsmc_earthquake_row": {
+  "current_risk_level": "High",
+  "last_headline": "TSMC halts production after earthquake in Taiwan",
+  "last_seen_at": "2026-11-01T17:09:00+00:00",
+  "pk": "TSMC#earthquake",
+  "risk_type": "earthquake",
+  "supplier": "TSMC"
+ },
+ "wr_item_count": 97
+}

@@ -183,7 +183,7 @@ infer → decide ──retrieve──► analyze → validate ──end──►
 | `decide` | LLM call — returns `"retrieve"` or `"skip"` | timing + decision |
 | `retrieve` | Calls the configured retriever backend (FAISS or Bedrock KB) | timing only |
 | `analyze` | LLM call — returns structured JSON alert | timing; error if parse fails |
-| `validate` | Checks required fields; routes to `fallback` on failure | timing + `"valid"` or `"fallback"` |
+| `validate` | Checks required fields and that an `ok` alert's supplier is a candidate (see [LLM tool-call boundary](#llm-tool-call-boundary-and-bifrost)); routes to `fallback` on failure | timing + `"valid"` or `"fallback"`; `error` on a rejected supplier |
 | `fallback` | Replaces alert with a safe `inconclusive` sentinel | timing only |
 
 Each node records its own `started_at`, `ended_at`, `duration_ms`, and optional `decision` / `error` into `state["trace_steps"]` before returning.
@@ -288,7 +288,7 @@ flowchart LR
 | `evaluate_github_event_risk` | Calls the rule-based evaluator and persists the decision to `risk_decisions.jsonl` |
 | `get_recent_risk_decisions` | Returns the N most recent decisions from `risk_decisions.jsonl` (default 20) |
 | `get_decisions_requiring_review` | Returns decisions with `manual_review_required` or `review_recommended` (default 10) |
-| `create_mock_servicenow_ticket` | Creates a mock ServiceNow ticket for a prior decision and persists the result |
+| `create_mock_servicenow_ticket` | Takes only `decision_id`. Opens one governed mock ticket for a stored decision; see below |
 
 **Risk trace tools**
 
@@ -296,6 +296,25 @@ flowchart LR
 |---|---|
 | `get_risk_trace` | Returns the raw trace record for an `alert_id` or `trace_id`; includes `matched_by` field |
 | `explain_risk_trace` | Returns a human-readable explanation: outcome, node sequence, slowest node, decisions, errors |
+
+**Governed ticket action** (`app/workflows/decision_ticket_action.py`). The caller supplies only a decision ID; every ticket field comes from the stored record. In order:
+
+1. The ID must be a 32-hex record ID that exists (`invalid_decision_id`, `decision_not_found`).
+2. The stored decision must be consistent with the stored event: re-running the deterministic evaluator on `normalized_event` must reproduce `decision` / `risk_score` / `reason` (`decision_inconsistent_with_event`). This rejects records whose decision fields were written independently of their event, such as records from the old tool signature or copilot records. It does **not** show a record is genuine: a consistent record (an event plus the evaluator's output for it) passes however it reached the store.
+3. The record must not already carry a ticket (`decision_already_ticketed`).
+4. The decision must be `review_recommended` or `manual_review_required` (`decision_not_eligible`).
+5. The production `ActionLedger` admits it under scope `agent#supplier-risk-agent`, capability `open_review_ticket`: the same emergency authority and materialized policy item as the supplier `act` node, checked with the claim in one transaction. Denial returns `status="denied"` with the layer. Unset `AUTHORITY_TABLE` / `ACTIONS_TABLE` denies every request, so local MCP use creates no tickets until governance tables are configured.
+
+**Trust boundary: decision-store write access.** The decision store (`app/storage/risk_decisions.jsonl`, or `RISK_DECISIONS_TABLE`) is trusted for event content. Whoever can write it decides which events can get a ticket. That includes any MCP client: `evaluate_github_event_risk` persists caller-supplied event fields. Authority and policy decide whether tickets may be opened at all, not for which events.
+
+**Idempotency and failure behavior** (ActionLedger semantics; action ID `action#decision#<decision_id>#open_review_ticket`; failure-injected in `tests/test_decision_ticket_recovery.py`):
+
+- At most one ticket and one ticket record per decision ID. The effect (create the ticket, then append the ticket record) runs only after this call claims the ledger item, and a claimed item is never claimed again.
+- Once `COMPLETED`, every request replays the stored ticket (`status="already_created"`), including after a completion whose acknowledgment was lost.
+- A claim with unknown outcome is resolved by the ledger's re-read: the call proceeds only if the claim names it; otherwise the error propagates and nothing ran.
+- A concurrent request gets `action_in_flight`.
+- **At most once, not exactly once.** A failure after the claim and before completion is recorded (ticket creation, the record write, the completion write, or process death) propagates the error and leaves the item `IN_FLIGHT`. Retries return `action_in_flight` and never re-run the effect. A ticket may then exist with no ticket record, or a ticket record with no completed ledger item. There is no reconciliation; resetting the ledger item would run the effect again.
+- Idempotency is per decision, not per event: evaluating one event twice stores two decisions, and each can get a ticket.
 
 Start with: `uv run python mcp_server.py` (blocks on stdin waiting for an MCP client).  
 Test interactively: `npx @modelcontextprotocol/inspector uv run python mcp_server.py`
@@ -423,7 +442,7 @@ RESUME takes no workflow input, so a completed thread can't be restarted by pass
 - **Empty `next`, completed.** `finalize_completed_run` (shared with `process_alert_row`) updates supplier state and writes a trace with `workflow_event="started_completed"` or `"resumed_completed"`, including the action fields when `act` ran.
 - **`act` refused by authority.** The invoke raises `AuthorityDenied`. No business write happens, the thread stays at `next=["act"]`, and a trace is written with `workflow_event="authority_denied"`.
 
-Outcomes also carry `action_id`, `action_status` and `authority_version` (all `null` when no governed action was reached).
+Outcomes also carry `action_id`, `action_status` and `authority_version` (all `null` when no governed action was reached), and `eligibility_change_type`, `action_eligible` and `eligibility_basis` from the pre-action assessment (see [Action eligibility](#action-eligibility-assess-before-act)).
 
 **Checkpoint table** (`DynamoCheckpointSaver`): PK `thread_id`, SK `sk`.
 - Checkpoint items are `chk#{ns}#{checkpoint_id}` and hold the whole serialized checkpoint.
@@ -433,11 +452,12 @@ Outcomes also carry `action_id`, `action_status` and `authority_version` (all `n
 - Only the sync API is implemented: `get_tuple`, `put`, `put_writes`, thread-scoped `list`, and `delete_thread`.
 
 **Guarantees and limits**
-- **Durable continuation with at-least-once node execution.** A node interrupted mid-run (for example an LLM call) runs again on resume.
+- **Durable continuation with at-least-once node execution.** A node interrupted mid-run (for example an LLM call) runs again on resume. A node whose writes were stored before the process died is not re-run; its stored result is reapplied. Completion is decided from `snapshot.tasks`, not `snapshot.next`.
 - **Not exactly-once between graph completion and business state.** If the process dies after the graph reaches END but before supplier state is written, the checkpoint already shows completion. RESUME then returns `already_completed` and that state write is lost.
-- **No protection against concurrent RESUME of the same thread.** Two executors can both run `analyze` and both apply the supplier state write, and `compare_and_update_risk_state` is not idempotent. (The action ledger does stop the governed action itself from being claimed twice; see Phase 3D.)
+- **Concurrent RESUME of the same thread:** handled by same-thread ownership, which is implemented and tested locally but **not deployed** (`docs/SAME_THREAD_OWNERSHIP_DESIGN.md`). Under ownership, a second executor is `contended`, and a stale one is fenced out of every durable workflow mutation. Until rollout (§16 there), the deployed executors run pre-ownership code, where two executors can both run `analyze` and both write supplier state. Cross-thread business deduplication is separate and unresolved; see [Action eligibility](#action-eligibility-assess-before-act).
+- **RESUME does not rewrite workflow state.** The attempt's `trace_id` travels in config (`configurable.trace_id`) and is recorded in each checkpoint's metadata. State `trace_id` stays the starting attempt's. Earlier versions stamped it with `update_state`, which re-ran the last node's routing under the current graph.
 - **`executor_id` is audit only** (`AWS_LAMBDA_LOG_STREAM_NAME`, or `host:pid` locally). A warm Lambda environment can run several attempts.
-- **Not handled yet:** checkpoint TTL/cleanup, batching checkpoint writes (one run is roughly 80 `PutItem` calls), a concurrency lease, and the audit gap when a resume fails after the new `trace_id` is stamped.
+- **Not handled yet:** checkpoint TTL/cleanup, batching checkpoint writes (one run is roughly 80 `PutItem` calls), and a concurrency lease.
 
 ### Lambda durability experiment (Phase 3A3)
 
@@ -616,7 +636,7 @@ Headline `TSMC halts wafer production after earthquake in Taiwan [C2-cluster-dem
 **What C2 does not show**
 - **EKS:** this was local kind.
 - **Workload identity:** temporary SSO credentials came from a Kubernetes Secret, for plumbing only.
-- **Mid-node crash recovery:** both handoffs happened at a durable pause before `analyze`. A force-kill during a node (C2b) is optional and parked.
+- **Mid-node crash recovery:** both handoffs happened at a durable pause before `analyze`. A force-kill during a node was tested later, in C2b (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b)).
 - **Exactly-once node execution:** execution is at-least-once.
 - **Safe concurrent RESUME.**
 - **SIGTERM / graceful-termination behavior.**
@@ -641,16 +661,17 @@ Each concern has its own durable store. None of them is derived from another, an
 
 #### Governed-action boundary
 
-The checkpointed graph adds one node, `act`, between `validate` and END:
+The checkpointed graph adds `assess` and `act` between `validate` and END. `assess` was added after Phase 3F; see [Action eligibility](#action-eligibility-assess-before-act):
 
 ```
-… → analyze → validate ──ok + valid──► act → END
+… → analyze → validate ──ok + valid──► assess ──new_alert / escalated──► act → END
+                       │                      └──suppressed / downgraded──► END
                        ├──inconclusive──► END
                        └──invalid──► fallback → END
 ```
 
 - **Only `build_app(checkpointer, action_gate=...)` has `act`.** The module-level Phase 2 graph is unchanged and performs no privileged action.
-- **`act` opens a review ticket** for a valid supplier-specific alert. It uses the mock ServiceNow `create_servicenow_ticket`, so there is no external system of record.
+- **`act` opens a review ticket** for a valid supplier-specific alert whose assessed business change is action-eligible. It uses the mock ServiceNow `create_servicenow_ticket`, so there is no external system of record.
 - **The action ID is deterministic:** `action#{thread_id}#open_review_ticket`. A re-run of `act`, after a denial or a crash, maps to the same ledger item. The ticket's `correlation_id` equals the action ID.
 - **A denial produces no checkpoint for `act`.** `act` raises `AuthorityDenied`, so LangGraph saves no output from it, and the latest checkpoint keeps `next=("act",)`. Earlier nodes are not re-run. A later RESUME, by any executor and given only the `thread_id`, runs just `act`.
 - **Supplier state is written only after `act` succeeds and the graph reaches END.** A denied workflow therefore leaves business state untouched.
@@ -1106,9 +1127,172 @@ The same tripwires are covered under moto by `tests/test_risk_workflow.py`: paus
 **Superseded run `DR1-20261030T231953Z`** ([evidence](evidence/DR1-20261030T231953Z.json)). Its workflow executed fully: A paused, B completed, a ticket was created and the state row was written. The no-inference check failed only because its allowlist admitted DynamoDB alone, and B called `sso:GetRoleCredentials`. No tripwire fired and no Bedrock call was made. The check now admits exactly that one credential operation, and the experiment was re-run. That earlier write is why the accepted run reports `suppressed` rather than `new_alert`.
 
 **Not shown:**
-- **Kill during a node.** A exited at a durable pause. A process killed during `analyze` would re-run it on resume (at-least-once; C2b remains parked).
+- **Kill during a node.** A exited at a durable pause. Killing during `analyze` was tested later, in C2b: before its writes were stored, `analyze` re-ran; after, its stored result was reused (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b)).
 - **Least-privilege identity.** `RiskAgentGovernedWorkerRole` cannot reach the checkpoint, state or trace tables, and its ledger access is limited to `action#probe-*`. The IAM-boundary capabilities (`claude_inference`, `titan_embeddings`) therefore did not govern this executor; only the application-level `act` gate did.
 - **CSV business state, concurrent RESUME, `IN_FLIGHT` reconciliation:** out of scope.
+
+### Action eligibility (assess before act)
+
+**Problem.** Until this change, `act` ran for every valid `ok` alert. The business comparison (`compare_and_update_risk_state`) ran only after END, in `finalize_completed_run`. So a duplicate alert opened a ticket and was then labelled `suppressed`. DR1, 3D3 and C2 all recorded `suppressed` together with a completed action.
+
+**Design: decide eligibility before the action, persist business state after END.**
+- `classify_risk_change(alert, headline, prior)` is the pure comparison. `compare_and_update_risk_state` is now `get → classify → put`, with unchanged behavior; the Phase 2 path uses it as before.
+- **`assess`** (governed graph only) reads the prior `(supplier, risk_type)` row and classifies the alert. It writes no state. It records `assessment = {basis, eligibility_change_type, action_eligible, prior_risk_level, prior_last_seen_at}`; the trace step's decision is `act` or `no_action`.
+- **Eligible changes:** `new_alert` and `escalated`. `suppressed` and `downgraded` end without an action, but supplier state is still updated after END (`last_headline`, `last_seen_at`, level).
+- **Strongly consistent reads.** `DynamoRiskStateStore.get` uses `ConsistentRead=True`, for both the assessment and the write-time comparison.
+- **The assessment is checkpointed.** A RESUME after an `act` denial re-runs only `act` and uses the saved assessment. It does not re-assess against state that may have changed since.
+- **Two change types, kept separate.** `eligibility_change_type` is what `assess` decided before the action. `change_type` is what `finalize_completed_run` computed when it wrote state after END. Both appear in outcomes and traces. They can differ, for example `new_alert` at assessment and `suppressed` at write time when another workflow wrote the same row while this one was parked.
+- **Legacy checkpoints.** A thread parked at `act` by the pre-assess graph has no assessment. It keeps its original behavior: the action proceeds with no eligibility gate. Outcomes and traces mark it `eligibility_basis = legacy_unassessed`, with `eligibility_change_type` and `action_eligible` null. This relies on RESUME not rewriting state; see the Phase 3A guarantees above. When resume still stamped `trace_id` with `update_state`, LangGraph re-ran `validate`'s routing under the new graph and sent such threads to `assess` instead.
+
+**Why the state write is not moved before `act`.** Writing supplier state at assessment time would open failure windows in which a needed action is skipped for good:
+- A crash after the write but before `assess`'s checkpoint makes the re-run `assess` read its own write and classify `suppressed`.
+- A denied, then abandoned, thread leaves the row at the new level, so every later alert for that supplier and risk is `suppressed`.
+- It would also break the Phase 3D rule that a denied workflow leaves business state untouched.
+
+The remaining window fails toward a duplicate ticket instead: if the process dies after `act` but before the END write, the row is not updated and a later thread can assess `new_alert` again.
+
+**What repeating `assess` does and does not guarantee.** Re-running `assess`, for example after a crash before its checkpoint, has no write side effects. Its answer is not fixed, though: if another workflow updates the same supplier-state row in between, the repeated assessment can classify differently. A checkpointed assessment is reused, not recomputed.
+
+**Unresolved, and separate from each other:**
+- **Cross-thread business deduplication.** The ledger deduplicates per `thread_id` (`action#{thread_id}#open_review_ticket`), not per `(supplier, risk_type, level)`. Two different threads for the same business change, running at the same time, can both assess `new_alert` before either writes state, and both open a ticket.
+- **Same-thread concurrent RESUME.** Two executors resuming one thread can both run nodes and both apply the supplier-state write (see the Phase 3A guarantees). The ledger stops the action itself being claimed twice for that thread.
+
+**DR1 harness.** `scripts/durable_resume_proof.py` now reports two check groups:
+- `resume`: durable completion without repeated retrieval or inference.
+- `action`: the assessment matches the supplier state B resumed against, and the action happened if and only if that change is eligible.
+
+A suppressed run passes only if it created no ledger item. `--expect-action required|skipped` pins the expected case. The DR1 evidence files above predate this change and use the earlier flat check list.
+
+**Manual AWS verification: suppressed branch only.** This was run manually against the development tables. No evidence file is stored in `docs/evidence/`; the facts below are the recorded outcome.
+
+| Field | Value |
+|---|---|
+| `thread_id` | `thread-68cb0fe1351c456192dd2078b2bde4d7` |
+| Processes | START PID `58151`, RESUME PID `58939` (separate processes) |
+| START | Paused before `validate` |
+| RESUME | `completed` |
+| Assessment | `eligibility_change_type=suppressed`, `action_eligible=false` |
+| Action | No `action_id`, no `action_status` |
+| Business state | `state_written=true` |
+| Resume tripwires | `hits=[]`; AWS services called: DynamoDB and SSO |
+
+This verifies only the `suppressed` (no-action) route on AWS. **Live verification of a `new_alert` or `escalated` run, where `act` executes after `assess`, is still pending.**
+
+### Mid-node kill experiment (C2b)
+
+**Driver.** `scripts/c2b_analysis_kill.py` runs separately from normal execution. It installs hooks in its own process only, then calls the unmodified lifecycle; normal execution has no hooks and no delays.
+- **Process roles.** START pauses before `analyze`. A held attempt is killed with `kill -9`. A fresh process then resumes.
+- **Tripwires.** Triage, retrieval, embeddings and any model other than risk inference are blocked.
+- **Event log.** Events are fsynced JSONL: attempts, `analyze` entry and return, model return (request ID and token usage only), the hold point, and stored writes and checkpoints. No prompts, response bodies or credentials are recorded. A killed attempt has no completion trace; the event log is its record.
+
+**Local tests** (`tests/test_c2b_driver.py`). Each attempt is a separate Python process (`tests/c2b_local_child.py`) killed with SIGKILL. Only fsynced files carry state between processes: a test-only `FileCheckpointSaver`, CSV supplier state and JSONL traces. These tests do not exercise `DynamoCheckpointSaver`; the AWS runs below do.
+
+- **c1: hold after the risk model returns, inside `analyze`. Passes locally.**
+  - The durable checkpoint is unchanged by the killed attempt.
+  - The resume runs `analyze` again, with a second inference (a distinct request ID).
+  - Retrieval is not repeated.
+  - This proves at-least-once re-execution with duplicate inference after the client received a full response. It is not an in-flight kill: the provider had finished.
+- **c3 negative control: hold after `analyze`'s pending writes are stored, before the next checkpoint.**
+  - The hold sits in the checkpoint `put`, which the main thread waits on. A hold in the background writer does not stop the graph: in a probe, `validate`, `assess` and later checkpoints ran during it.
+  - Nothing downstream ran during the hold.
+  - LangGraph itself reuses the stored writes. A direct `invoke(None)` diagnostic continued without running `analyze` or calling the model.
+  - **The lifecycle did not, and this is now fixed.** `get_state()` reports `next=()` while the `analyze` task still holds its result. `resume_workflow` treated an empty `next` as completed and returned `already_completed`, so `validate`, `assess` and the supplier-state write never ran.
+  - **The fix.** `risk_workflow._has_pending_tasks` decides completion from `snapshot.tasks`, both in `resume_workflow` and in `_settle`'s paused-versus-completed branch. In LangGraph 1.2.x, `tasks` holds every task scheduled from the latest checkpoint. `next` omits tasks whose writes are already stored; error and interrupt writes don't count as stored, so a denied `act` stays in `next`.
+  - **Behavior now.** A thread killed after a node's writes are stored resumes without re-running that node. The same holds for `act`: the stored action result is reused, and the action does not run again.
+  - **Regression tests.** `tests/test_risk_workflow.py` simulates the crash with a checkpoint `put` that fails after the target node's writes are stored, for both `analyze` and `act`. The c3 subprocess test now passes.
+
+**Verdict.** `verdict` reports two groups. `acceptance` decides `passed`. `diagnostics` holds the optional `--direct-invoke` check, which bypasses the lifecycle and never stands in for a lifecycle recovery.
+
+c3 acceptance establishes reuse from the normal lifecycle evidence:
+- analyze's writes were durable before recovery;
+- the resume, with hooks installed, did not enter `analyze` or invoke the model;
+- the final `analyze` step is the persisted original;
+- downstream execution and finalization completed.
+
+`--offline` reads no durable state; the checks that need it are reported `not_evaluated`, and the verdict cannot pass.
+
+#### AWS runs (manual, two terminals)
+
+Both runs were operated manually with `ken-ai-dev` credentials in us-west-2, using the TSMC earthquake headline. Each resume assessed `suppressed`, so neither reached `act`; action execution was verified separately. By timestamp, both runs started after the completion fix (`a91e845`) was committed. The event log does not record the commit that ran.
+
+The evidence is in `docs/evidence/`, redacted: host names are replaced with `<host>`. No credentials, prompts or response bodies were recorded.
+
+**c1 (`C2B-c1-20261031T023933Z`): passed.** Evidence: [`events.jsonl`](evidence/C2B-c1-20261031T023933Z/events.jsonl), [`verdict.json`](evidence/C2B-c1-20261031T023933Z/verdict.json).
+
+| | |
+|---|---|
+| Thread | `thread-a5b87fd9b706499f83955f619fcfb013` |
+| Processes | START `76619`; killed attempt `77661`; resume `79554` |
+| Killed attempt | Entered `analyze`. Bedrock Converse returned (request `eb72a7ba-…`, 223 output tokens). It held at `after-inference` on the main thread and was killed. Its log ends at `holding`; there is no exit event and no completion trace |
+| Durable state across the kill | Unchanged: checkpoint `1f1d4d45-0b36-…`, step 3, next `analyze`, no stored analyze writes |
+| Resume | Entered `analyze` again with a **second inference** (request `6b4feae2-…`, 240 output tokens). It completed `suppressed`, with state written. Final checkpoint: step 6, no pending tasks |
+| Retrieval | Not repeated. The final trace's `retrieve` step (`02:39:36.743Z`) is START's. No tripwire hits |
+
+The verdict predates the acceptance/diagnostics structure (`ed3f486`) and uses the earlier flat check list. All 8 checks passed.
+
+**c3 (`C2B-c3-20261031T024953Z`): passed on regeneration.** Evidence: [`events.jsonl`](evidence/C2B-c3-20261031T024953Z/events.jsonl), the original [`verdict.json`](evidence/C2B-c3-20261031T024953Z/verdict.json) (superseded), [`verdict.regenerated-offline.json`](evidence/C2B-c3-20261031T024953Z/verdict.regenerated-offline.json) and [`verdict.regenerated.json`](evidence/C2B-c3-20261031T024953Z/verdict.regenerated.json).
+
+| | |
+|---|---|
+| Thread | `thread-739b289350dd47d48c54cb32a35f856a` |
+| Processes | START `82460`; killed attempt `83470`; resume `84680` |
+| Killed attempt | Entered `analyze`. Bedrock Converse returned (request `5a080a1f-…`), and analyze returned. analyze's writes were committed to DynamoDB (task `062531a3-…`, 14 writes). The step-4 checkpoint put was then blocked and the attempt held and was killed. Nothing downstream ran |
+| Durable state across the kill | Checkpoint unchanged (`1f1d4d5c-1aa6-…`, step 3). `next=()`, and the `analyze` task holds its result: the state the old completion check misread |
+| Resume | Hooks were installed. No `analyze` entry and no model call; one inference in total. `validate` and `assess` ran and their writes were committed. It completed `suppressed`, with state written. Final checkpoint: step 6, no pending tasks, trace `resumed_completed` |
+
+- **Original verdict:** failed one check, `langgraph_reuses_stored_writes`, because the `--direct-invoke` diagnostic had not been run. That requirement was stale: the diagnostic existed only because the lifecycle could not continue such a thread before the fix.
+- **Regenerated from the same event file** with `ed3f486`, without executing the workflow again:
+  - **Offline:** 6 checks passed and 3 were not evaluated; `complete: false`.
+  - **Full** (read-only DynamoDB reads): all 9 acceptance checks passed; `complete: true`. The diagnostic was `not_run`.
+
+**Limitation: fallback basis for the persisted analysis step.** This c3 run's after-kill snapshot predates step capture, so it holds no copy of the stored `analyze` step. `final_analysis_step_is_persisted_original` therefore used the fallback basis. The final trace's `analyze` step (`02:51:04.958Z` → `02:51:06.992Z`) lies within the killed attempt's logged `analyze` window (`02:51:04.957Z` → `02:51:06.992Z`). It ended before the resume started, and its alert status matches.
+
+That is consistent with the persisted original, but weaker than an exact comparison:
+- It shows the step was produced during the killed attempt's analysis and not by the resume.
+- It does not compare the stored step with the final one field by field.
+
+Snapshots taken now record the stored step (`pending_analyze_step`), and the verdict then requires an exact match. A new c3 run is needed for that stronger evidence.
+
+Transport-level holds and in-flight termination are deferred.
+
+### Concurrent resume reproduction (local)
+
+`tests/test_concurrent_resume.py` runs each worker as a separate process (`tests/race_harness.py`) against one persistent SQLite database. Gate files force each interleaving, and each scenario first checks from the event log and the database that the interleaving happened. The gates are bounded waits, and child processes are always killed at the end of a test.
+
+**SQLite stand-ins and how they differ from DynamoDB.** The stand-ins copy the production write rules:
+- checkpoints are written unconditionally, and the latest is the highest uuid6 ID;
+- regular pending writes are first-write-wins; special writes (error, interrupt) overwrite;
+- supplier state is read, then put unconditionally;
+- the action claim follows `ActionLedger` (absent or `DENIED` → `IN_FLIGHT`; `COMPLETED` replays; `IN_FLIGHT` raises `ActionInFlight`).
+
+What they don't reproduce:
+- SQLite serializes writers with one lock; DynamoDB evaluates conditions per item. These tests show only the interleavings the gates force, not storage-level timing.
+- The claim is one SQLite transaction, not `TransactWriteItems`, and authority and policy aren't modelled.
+- Every read is consistent. There is no throttling, retrying or partial transaction failure.
+
+**Observed today.** These tests pass by asserting the unsafe behavior:
+
+| Scenario | Interleaving | Observed |
+|---|---|---|
+| R1 double analysis | Both workers inside `analyze`, executing from the same checkpoint | Two inferences. B's pending writes were dropped by first-write-wins, but B continued with its own alert. The checkpoint history forked at step 4. A opened the ticket on High; B then assessed its Medium alert as `downgraded` and wrote the row as Medium |
+| R2 action in flight | B reaches `act` while A is inside the effect | One effect. B ended with an unhandled `ActionInFlight` (exit 1, no trace), and its `__error__` write sits on its own fork |
+| R3 divergent replay | Both assessed `new_alert` before either acted; A acts and finalizes first | B "completed" by replaying A's High action, then finalized its own Medium analysis (`downgraded`). The ticket says High; the business row says Medium |
+| R4 double finalization | Identical analyses; ordered finalization | One effect, two finalizations (`new_alert`, then `suppressed`), two `resumed_completed` traces, a forked history |
+| X1 cross-thread | Two threads for the same risk, both assessed before either acted | Two action IDs, two tickets. The histories are linear: this is not a same-thread race |
+
+Strict xfails record the future requirements, kept separate from the observations:
+- a single execution per thread under concurrent resume, and no checkpoint fork;
+- action contention reported as an outcome;
+- the action and the business state come from one analysis;
+- a single finalization per thread;
+- separately from per-thread ownership, one ticket per business change across threads.
+
+**Also found while building it.** When a worker crossed its resumability check but loaded the checkpoint after the other worker had progressed, the result depended on timing:
+- the late worker reapplied the other's stored `analyze` writes;
+- in one ordering it then ran no further nodes;
+- `_settle` reported the other worker's newest checkpoint as its own outcome (`paused`, next `act`).
+
+The harness now places its barrier inside `analyze`, so the scenarios are deterministic. That late-load behavior is recorded, but not yet explained or covered by a test.
 
 ### Phase 3 status
 
@@ -1121,7 +1305,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] C1: local Docker runtime portability (Lambda START → Docker RESUME, same image digest)
   - [x] C2a: Kubernetes executor replacement (Pod A START → delete → Pod B RESUME → Pod C no-op)
   - [x] C2+: whole-cluster destruction/recreation (`risk-c2` deleted → `risk-c2-resume` completes the workflow)
-  - [ ] C2b (optional, parked): force-kill mid-node / at-least-once behavior; not required to close Phase C
+  - [x] C2b: force-kill mid-node (see [Mid-node kill experiment](#mid-node-kill-experiment-c2b)). Local driver: c1 and c3 pass; the c3 control exposed a lifecycle completion defect, now fixed. AWS: c1 passed (`C2B-c1-20261031T023933Z`); c3 passed on regeneration (`C2B-c3-20261031T024953Z`), with the persisted-step check on the fallback window basis. Exact persisted-step comparison and in-flight termination are still pending
   - [x] Same external state model preserved across Lambda, Docker and Kubernetes executors
 - [ ] Workload identity for the worker (least privilege, no developer credentials)
 - [x] 3D1: authority store, transactional action ledger, governed `act` node, fail-closed configuration, `session` worker (proven under moto)
@@ -1145,6 +1329,24 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
   - [x] F2d: Phase 3F documentation
 - [ ] Separation of duties and IAM-level enforcement of authority (operator vs agent principals)
 - [x] DR1: two-process resume after checkpointed analysis; no retrieval, embedding or model call on resume (`DR1-20261030T232053Z`)
+- [x] Same-thread ownership: lease with monotonic epochs, fenced checkpoints, pending writes, actions and finalization, once-only `final` marker, recovery and legacy rules, lineage-bound outcomes; R1–R4 protected across processes (local only; **not deployed**; X1 and `IN_FLIGHT` reconciliation open)
+  - [x] AWS read-only preflight and `terraform plan` (1 policy to add, not applied); 13 legacy threads, all recognizable ([rollout plan §9](OWNERSHIP_ROLLOUT_PLAN.md#9-results))
+  - [x] AWS experiment A, owned contention, accepted (`OWN-contention-20261031T231350Z`, local owned code against dev DynamoDB)
+  - [x] AWS experiment B, kill, expiry and takeover, accepted (`OWN-takeover-20261101T153802Z`, commit `974c21e`): verdict complete and passed, 11 of 11 checks
+  - [x] Post-kill, pre-expiry contention: a contender after the recorded owner exit met the dead owner's valid epoch-2 lease; takeover at epoch 3 after expiry
+  - Earlier run `OWN-takeover-20261031T233348Z` showed recovery at epoch 3 but is incomplete: it recorded no owner exit, so post-kill contention is unverified there
+  - [x] AWS experiment C, DR1 on the owned lifecycle, accepted (`DR1-owned-20261101T155104Z`, git commit `68af710`, clean tree; its `CODE_REVISION` was stale at `974c21e`): 20 of 20 checks. START paused before `validate` at epoch 1; RESUME in a new process at epoch 2 with no retrieval, embedding or model call; finalized `suppressed`, lease released at epoch 2
+  - A, B and C ran as local workers against dev AWS with developer credentials (`ken-ai-dev`), not on a deployed executor
+  - [x] IAM apply: `RiskCheckpointOwnership` on `RiskAgentLambdaRole` (2026-11-01, via the deployment role after a one-statement concurrency bootstrap)
+  - [x] Deployment of an ownership image: `sha256:7701dd33…` from `a117c8c` (Python 3.13, hashed lock), under a reserved-concurrency hold that has since been released
+  - [x] Verification on the deployed Lambda, P2–P4 ([deployment review §11](OWNERSHIP_DEPLOYMENT_REVIEW.md#11-phase-1-rollout-record-2026-11-01-dev-account-714781437949)): START paused at epoch 1; RESUME finalized `suppressed` at epoch 2 under the Lambda role; a repeat RESUME returned `already_completed`, with only the lease advancing to epoch 3
+  - [x] P6: a local owner held epoch 2, and one synchronous Lambda RESUME returned `contended` (409) with that holder, wrote nothing and made no model call; the owner then finalized at epoch 2 (`OWN-lambda-P6-20261101T165151Z`)
+  - [x] P7: an eligible `new_alert` (Murata, flood) fails closed on the unconfigured Lambda. The trace records `authority_status: UNCONFIGURED`. The thread is parked at `act` with its assessment saved; the lease is released at epoch 2; there is no final marker, ledger item or business row (`OWN-lambda-P7-20261101T170122Z`)
+  - [ ] P5, parallel RESUMEs: run once (`OWN-lambda-P5-20261101T170812Z`), **inconclusive**. B cold-started and acquired after A finalized, returning `already_completed`. There was one finalization, one analysis and no fork, but simultaneous acquisition is not verified
+  - [x] P8, final Phase 1 review (`OWN-phase1-review-20261101T171507Z`): 9 requests, all planned; no AccessDenied, transaction, throttling or exception lines; 13 legacy threads unadopted; P7 thread parked at `act`; no `IN_FLIGHT`; Terraform `No changes`. **Phase 1 complete**, with P5 inconclusive. Open: the P2 init timeout and the trace/outcome field inconsistencies ([conclusion](OWNERSHIP_DEPLOYMENT_REVIEW.md#phase-1-conclusion))
+  - Open observations: a cold-start init timeout in P2 (cause undetermined; P6's cold start took 4,111.74 ms without timing out), and `state_written` null in the completion trace
+  - [ ] Simultaneous-contender and transaction-conflict evidence on real DynamoDB
+- [x] Action eligibility: read-only `assess` before `act` (`new_alert` / `escalated` only), legacy `act` checkpoints preserved, RESUME without state rewrite (local, moto); AWS: suppressed route verified manually (`thread-68cb0fe1…`), action-eligible route pending
 
 ## Data Models and Storage
 
@@ -1154,7 +1356,7 @@ Thesis: the workflow is stateful, the execution environment is disposable, and a
 class RiskState(TypedDict):
     alert_id: str
     thread_id: Optional[str]  # durable logical workflow; None on the Phase 2 path
-    trace_id: str             # one execution attempt
+    trace_id: str             # the starting attempt; later attempts pass theirs in config
     headline: str
     candidate_suppliers: List[str]
     context: str
@@ -1163,6 +1365,7 @@ class RiskState(TypedDict):
     is_valid: Optional[bool]
     trace_steps: List[dict]
     retriever_metadata: Optional[dict]  # set by retrieve; None when skipped
+    assessment: Optional[dict]          # set by assess before act (governed graph); None on legacy threads
     action_result: Optional[dict]       # set by act (governed checkpointed graph only)
 ```
 
@@ -1201,6 +1404,9 @@ One JSON object per line, appended by `append_risk_trace`:
   "risk_type": "earthquake" | null,
   "risk_level": "High" | null,
   "change_type": "new_alert" | "escalated" | "suppressed" | "downgraded" | "inconclusive" | "ignored",
+  "eligibility_change_type": "new_alert" | "escalated" | "suppressed" | "downgraded" | null,
+  "action_eligible": true | false | null,
+  "eligibility_basis": "assessed" | "legacy_unassessed" | null,
   "trace_steps": [
     {
       "node_name": "infer",
@@ -1279,14 +1485,29 @@ Written by `app/storage/risk_state_store.py` (JSONL locally, or the `RISK_DECISI
 
 ---
 
+## LLM tool-call boundary and Bifrost
+
+The production LLM calls (`decide_tool_use`, `analyze_risk` in `supplier_risk_agent.py`) send a single user prompt with **no tool definitions**. The OpenAI-compatible path (OpenAI and Bifrost) sends `messages, model, stream, temperature`; Bedrock Converse sends no `toolConfig`. The workflow, not the model, selects the only privileged action (`act` → `open_review_ticket`, behind the action ledger).
+
+**App-side controls**
+
+- **Tool-call responses are rejected.** `unexpected_tool_call_signals()` flags normalized `tool_calls` / `invalid_tool_calls` / `tool_call_chunks`, OpenAI `additional_kwargs.tool_calls` / `function_call`, content blocks (`tool_use`, `tool_call`, `invalid_tool_call`, `function_call`, raw Converse `toolUse`), and finish metadata (`finish_reason` `tool_calls` / `function_call`, `stopReason` `tool_use`). Such a response takes the existing invalid path: triage → `skip`, analysis → `inconclusive`, with the trace step's `error` set to `unexpected tool call in model response: …`. No tool call is ever executed by the app.
+- **The supplier must be a candidate.** For `status="ok"`, `validate` requires the model's `supplier` to equal a `candidate_suppliers` entry or one of its `SUPPLIER_ALIASES` (case-insensitive, exact, never a substring). It is rewritten to the canonical candidate. An empty candidate set, or no match, routes to `fallback` before `assess`, the risk-state write or `act`. This limits what an injected headline or retrieved profile can steer.
+
+**Bifrost requirement (not enforceable in the app)**
+
+When `LLM_PROVIDER=bifrost`, the gateway at `BIFROST_BASE_URL` must have **tool injection** (attaching MCP or other tools to requests) and **gateway-side tool execution** (running tool calls before returning a response) **disabled for this application**. Rejecting tool-call responses in the app is detection after the fact: a gateway that executes tools internally can act, and return only the resulting text, before the app sees anything. The app cannot observe or prevent that.
+
+**Status: unverified.** No Bifrost configuration is in this repository and none was inspected; the effective gateway configuration is unknown. Bifrost is local/dev only: Terraform and `docker/worker.env` use `LLM_PROVIDER=bedrock`.
+
 ## Environment Variables
 
 | Variable | Default | Notes |
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required when `RETRIEVER_PROVIDER=faiss` or `LLM_PROVIDER=openai`; not required on the Bedrock KB path |
 | `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID for Bedrock provider |
+| `OPENAI_MODEL` | registry (`gpt-4o-mini-2024-07-18`) | Overrides the registry `model_name` when set and non-blank. The snapshot is deprecated by OpenAI; shutdown 2027-01-14 |
+| `BEDROCK_MODEL_ID` | — (required when `LLM_PROVIDER=bedrock`) | Missing or blank raises `ModelConfigError` during model resolution (at import of `supplier_risk_agent.py`). Terraform and `docker/worker.env` set `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 | `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway when `LLM_PROVIDER=bifrost` (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`) |
 | `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
 | `BIFROST_API_KEY` | `dummy-key` | Placeholder key; Bifrost does not validate it |
@@ -1317,7 +1538,7 @@ Written by `app/storage/risk_state_store.py` (JSONL locally, or the `RISK_DECISI
 ## Current Limitations
 
 - **Hard-coded supplier set**: the knowledge base covers only TSMC, Murata, and Foxconn. Adding suppliers requires editing `supplier_graph.json`, `supplier_profiles.json`, and `SUPPLIER_ALIASES` in `supplier_risk_agent.py`.
-- **OPENAI_API_KEY required on FAISS path**: `supplier_risk_agent.py` calls `OpenAIEmbeddings()` at import time when `RETRIEVER_PROVIDER=faiss` (the default). Set `RETRIEVER_PROVIDER=bedrock_kb` to eliminate this dependency.
+- **OPENAI_API_KEY required on FAISS path**: `supplier_risk_agent.py` calls `OpenAIEmbeddings(model="text-embedding-ada-002")` at import time when `RETRIEVER_PROVIDER=faiss` (the default). Set `RETRIEVER_PROVIDER=bedrock_kb` to eliminate this dependency.
 - **Module-level side effects**: the graph JSON, FAISS index, and LLM client are constructed at import time, making the module slow to load and difficult to test in isolation.
 - **Local file storage only**: `risk_decisions.jsonl`, `risk_traces.jsonl`, and `enriched_alerts.csv` are local files. They are not shared across Lambda instances and are lost on cold-start container recycling.
 - **`seen_headlines.json` grows unbounded**: no TTL or pruning.

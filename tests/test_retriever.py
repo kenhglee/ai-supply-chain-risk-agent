@@ -10,6 +10,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from app.retrieval.retriever import (
+    OPENAI_EMBED_MODEL_ID,
     TITAN_EMBED_MODEL_ID,
     FaissRetriever,
     RetrieverResult,
@@ -111,7 +112,15 @@ def test_build_embeddings_openai(monkeypatch, no_network):
     embeddings = build_embeddings("openai")
 
     assert isinstance(embeddings, _RecordingEmbeddings)
-    assert embeddings.kwargs == {}
+    assert embeddings.kwargs == {"model": "text-embedding-ada-002"}
+    assert OPENAI_EMBED_MODEL_ID == "text-embedding-ada-002"
+
+
+def test_build_embeddings_openai_real_class_uses_pinned_model_offline(monkeypatch, no_network):
+    """The OpenAI SDK wrapper accepts the explicit model pin offline."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    assert build_embeddings("openai").model == "text-embedding-ada-002"
 
 
 def test_build_embeddings_bedrock_uses_titan_v2(monkeypatch, no_network):

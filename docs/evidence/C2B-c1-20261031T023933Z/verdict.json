@@ -1,0 +1,138 @@
+{
+  "experiment": "C2b c1",
+  "thread_id": "thread-a5b87fd9b706499f83955f619fcfb013",
+  "final_durable_state": {
+    "exists": true,
+    "checkpoint_id": "1f1d4d4d-3530-6078-8006-ee6967f21915",
+    "step": 6,
+    "next": [],
+    "tasks": [],
+    "nodes": [
+      "infer",
+      "decide",
+      "retrieve",
+      "analyze",
+      "validate",
+      "assess"
+    ],
+    "analyze_writes_stored": false,
+    "pending_write_task_count": 0
+  },
+  "final_outcome": {
+    "status": "completed",
+    "trace_id": "9e3f47f7842d419fb73b2e48384cf6f7",
+    "change_type": "suppressed",
+    "eligibility_change_type": "suppressed",
+    "action_eligible": false,
+    "action_status": null
+  },
+  "checks": {
+    "killed_attempt_reached_hold": {
+      "ok": true,
+      "detail": {
+        "hold": "after-inference",
+        "events": [
+          "attempt_start",
+          "precondition",
+          "hooks_installed",
+          "analyze_enter",
+          "model_invoke_start",
+          "aws_call",
+          "model_return",
+          "holding"
+        ]
+      }
+    },
+    "killed_attempt_entered_analyze_and_got_response": {
+      "ok": true,
+      "detail": {
+        "request_ids": [
+          "eb72a7ba-f4e7-4d3d-9329-fcad189b2ac5"
+        ]
+      }
+    },
+    "nothing_downstream_before_kill": {
+      "ok": true,
+      "detail": {
+        "after_hold": []
+      }
+    },
+    "no_tripwire_hits": {
+      "ok": true,
+      "detail": []
+    },
+    "retrieval_reused_from_start": {
+      "ok": true,
+      "detail": {
+        "retrieve_started_at": "2026-10-31T02:39:36.743+00:00",
+        "start_retrieve_started_at": "2026-10-31T02:39:36.743+00:00"
+      }
+    },
+    "durable_state_unchanged_by_killed_attempt": {
+      "ok": true,
+      "detail": {
+        "before": {
+          "checkpoint_id": "1f1d4d45-0b36-67f2-8003-d2a57dd1aae5",
+          "step": 3,
+          "next": [
+            "analyze"
+          ]
+        },
+        "after_kill": {
+          "checkpoint_id": "1f1d4d45-0b36-67f2-8003-d2a57dd1aae5",
+          "step": 3,
+          "next": [
+            "analyze"
+          ],
+          "analyze_writes_stored": false
+        }
+      }
+    },
+    "resume_completed": {
+      "ok": true,
+      "detail": {
+        "ts": "2026-10-31T02:43:17.969+00:00",
+        "pid": 79554,
+        "attempt": "resume-none-79554",
+        "seq": 16,
+        "event": "attempt_exit",
+        "aws_calls": {
+          "dynamodb:Query": 8,
+          "bedrock-runtime:Converse": 1,
+          "dynamodb:PutItem": 46,
+          "dynamodb:GetItem": 3
+        },
+        "status": "completed",
+        "thread_id": "thread-a5b87fd9b706499f83955f619fcfb013",
+        "trace_id": "9e3f47f7842d419fb73b2e48384cf6f7",
+        "next": [],
+        "change_type": "suppressed",
+        "state_written": true,
+        "final_status": "ok",
+        "eligibility_change_type": "suppressed",
+        "action_eligible": false,
+        "eligibility_basis": "assessed",
+        "action_id": null,
+        "action_status": null
+      }
+    },
+    "resume_reran_analyze_and_inference": {
+      "ok": true,
+      "detail": {
+        "model_returns": [
+          {
+            "attempt": "resume-after-inference-77661",
+            "request_id": "eb72a7ba-f4e7-4d3d-9329-fcad189b2ac5",
+            "output_tokens": 223
+          },
+          {
+            "attempt": "resume-none-79554",
+            "request_id": "6b4feae2-af38-4c65-ac7d-cb0ef75bef0e",
+            "output_tokens": 240
+          }
+        ]
+      }
+    }
+  },
+  "passed": true
+}

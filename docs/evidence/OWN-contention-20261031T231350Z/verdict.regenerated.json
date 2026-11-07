@@ -1,0 +1,189 @@
+{
+  "experiment": "owned contention",
+  "thread_id": "thread-46450834b0ec4d48b885b27de514d9f5",
+  "durable_state_read": true,
+  "final_durable_state": {
+    "exists": true,
+    "checkpoint_id": "1f1d5818-5c1e-6024-8006-1249f68c318a",
+    "step": 6,
+    "next": [],
+    "tasks": [],
+    "nodes": [
+      "infer",
+      "decide",
+      "retrieve",
+      "analyze",
+      "validate",
+      "assess"
+    ],
+    "analyze_writes_stored": false,
+    "pending_analyze_step": null,
+    "pending_analyze_alert_status": null,
+    "pending_write_task_count": 0,
+    "lease": {
+      "epoch": 2,
+      "state": "RELEASED",
+      "owner": "722b5f5b0a1047a49b76581d7c6b4f47",
+      "expires_at_ms": 1793488869874
+    },
+    "final": {
+      "kind": "finalized",
+      "trace_id": "722b5f5b0a1047a49b76581d7c6b4f47",
+      "epoch": 2,
+      "change_type": "suppressed",
+      "recovered": false
+    }
+  },
+  "checks": {
+    "acceptance": {
+      "owner_held_then_released": {
+        "ok": true,
+        "detail": {
+          "owner_events": [
+            "attempt_start",
+            "precondition",
+            "hooks_installed",
+            "analyze_enter",
+            "model_invoke_start",
+            "aws_call",
+            "model_return",
+            "holding",
+            "hold_released",
+            "analyze_return",
+            "checkpoint_committed",
+            "validate_enter",
+            "writes_committed",
+            "checkpoint_committed",
+            "writes_committed",
+            "writes_committed",
+            "checkpoint_committed",
+            "attempt_exit"
+          ]
+        }
+      },
+      "contender_ran_during_the_hold": {
+        "ok": true,
+        "detail": {
+          "contenders": 1,
+          "hold": "2026-10-31T23:17:51.749+00:00",
+          "release": "2026-10-31T23:19:29.261+00:00"
+        }
+      },
+      "contender_was_contended_by_the_owner": {
+        "ok": true,
+        "detail": [
+          {
+            "status": "contended",
+            "holder": {
+              "owner": "722b5f5b0a1047a49b76581d7c6b4f47",
+              "owner_executor": "<host>:16668",
+              "epoch": 2,
+              "expires_at_ms": 1793488829807
+            }
+          }
+        ]
+      },
+      "contender_executed_nothing": {
+        "ok": true,
+        "detail": [
+          [
+            "attempt_start",
+            "precondition",
+            "hooks_installed",
+            "attempt_exit"
+          ]
+        ]
+      },
+      "one_inference_total": {
+        "ok": true,
+        "detail": 1
+      },
+      "no_workflow_write_by_the_contender": {
+        "ok": true,
+        "detail": {
+          "changed_fields": [],
+          "lease_held_throughout": true,
+          "lease_expiry_change_ms": 40162,
+          "compared": {
+            "checkpoint_id": "1f1d580b-daee-608c-8003-a007970bc57f",
+            "step": 3,
+            "next": [
+              "analyze"
+            ],
+            "tasks": [
+              {
+                "name": "analyze",
+                "has_result": false,
+                "error": false
+              }
+            ],
+            "analyze_writes_stored": false,
+            "pending_write_task_count": 0,
+            "final": null,
+            "lease.owner": "722b5f5b0a1047a49b76581d7c6b4f47",
+            "lease.epoch": 2,
+            "lease.state": "HELD"
+          },
+          "scope": "durable state unchanged around the contender; does not identify a writer"
+        }
+      },
+      "contender_write_calls_limited_to_the_lease_attempt": {
+        "ok": true,
+        "detail": [
+          {
+            "aws_calls": {
+              "dynamodb:Query": 3,
+              "dynamodb:UpdateItem": 1
+            },
+            "write_calls": {
+              "dynamodb:UpdateItem": 1
+            }
+          }
+        ]
+      },
+      "contender_wrote_no_trace": {
+        "ok": true,
+        "detail": {
+          "fa44b691c4624c388971cd5aa0215500": false
+        }
+      },
+      "owner_finalized_at_its_epoch": {
+        "ok": true,
+        "detail": {
+          "final": {
+            "kind": "finalized",
+            "trace_id": "722b5f5b0a1047a49b76581d7c6b4f47",
+            "epoch": 2,
+            "change_type": "suppressed",
+            "recovered": false
+          },
+          "lease": {
+            "epoch": 2,
+            "state": "RELEASED",
+            "owner": "722b5f5b0a1047a49b76581d7c6b4f47",
+            "expires_at_ms": 1793488869874
+          },
+          "owner_epoch": 2,
+          "owner_trace_event": "resumed_completed"
+        }
+      }
+    },
+    "diagnostics": {
+      "lease_expiry_during_contender": {
+        "ok": true,
+        "detail": {
+          "lease_expiry_change_ms": 40162,
+          "meaning": "owner heartbeat renewal (expected); not a workflow write"
+        }
+      }
+    }
+  },
+  "code": {
+    "code_revision": "e699705315b2687c26eef5aea1bd52d0890a24de",
+    "image_digest": null,
+    "git_commit": "e699705315b2687c26eef5aea1bd52d0890a24de",
+    "git_dirty": false
+  },
+  "complete": true,
+  "passed": true
+}
