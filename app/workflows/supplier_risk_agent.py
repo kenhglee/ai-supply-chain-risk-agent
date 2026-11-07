@@ -442,6 +442,49 @@ def get_llm(model_record: ModelRecord):
     raise ValueError(f"Unsupported LLM_PROVIDER: '{rt.runtime_provider}'")
 
 
+# ---- Tool-call rejection ----
+# The production triage/analysis calls bind no tools, so any tool call in a
+# response is unexpected (e.g. injected by a gateway) and is rejected rather
+# than flattened into text by model_text(). Shapes covered, per the locked
+# adapters: LangChain-normalized AIMessage.tool_calls / invalid_tool_calls;
+# OpenAI additional_kwargs tool_calls / legacy function_call and
+# finish_reason; content blocks (langchain-aws tool_use, LangChain v1
+# tool_call / invalid_tool_call, OpenAI Responses function_call, raw Converse
+# toolUse); Bedrock Converse stopReason "tool_use".
+TOOL_CALL_BLOCK_TYPES = {"tool_use", "tool_call", "invalid_tool_call", "function_call"}
+TOOL_CALL_FINISH_REASONS = {"tool_calls", "function_call", "tool_use"}
+
+
+def unexpected_tool_call_signals(response) -> list[str]:
+    """Every sign that a model response carries a tool call; empty for plain text."""
+    signals = []
+    for attr in ("tool_calls", "invalid_tool_calls", "tool_call_chunks"):
+        if getattr(response, attr, None):
+            signals.append(attr)
+    additional = getattr(response, "additional_kwargs", None) or {}
+    for key in ("tool_calls", "function_call"):
+        if additional.get(key):
+            signals.append(f"additional_kwargs.{key}")
+    content = getattr(response, "content", None)
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in TOOL_CALL_BLOCK_TYPES:
+                signals.append(f"content_block.{item['type']}")
+            elif "toolUse" in item:
+                signals.append("content_block.toolUse")
+    metadata = getattr(response, "response_metadata", None) or {}
+    for key in ("finish_reason", "stopReason", "stop_reason"):
+        if metadata.get(key) in TOOL_CALL_FINISH_REASONS:
+            signals.append(f"response_metadata.{key}={metadata[key]}")
+    return signals
+
+
+def tool_call_error(signals: list[str]) -> str:
+    return "unexpected tool call in model response: " + ", ".join(signals)
+
+
 def model_text(response) -> str:
     content = getattr(response, "content", response)
 
@@ -557,8 +600,9 @@ def decide_tool_use(state: RiskState) -> RiskState:
     )
 
     response = _triage_llm.invoke(prompt)
-    raw_text = model_text(response)
-    decision = raw_text.strip().lower()
+    signals = unexpected_tool_call_signals(response)
+    # A tool-call response takes the existing invalid-answer path: skip.
+    decision = "skip" if signals else model_text(response).strip().lower()
 
     if decision not in {"retrieve", "skip"}:
         decision = "skip"
@@ -566,7 +610,10 @@ def decide_tool_use(state: RiskState) -> RiskState:
     return {
         **state,
         "tool_decision": decision,
-        "trace_steps": record_trace_step(state["trace_steps"], "decide", t0, decision=decision),
+        "trace_steps": record_trace_step(
+            state["trace_steps"], "decide", t0, decision=decision,
+            error=tool_call_error(signals) if signals else None,
+        ),
     }
 
 
@@ -612,10 +659,13 @@ def analyze_risk(state: RiskState) -> RiskState:
     )
 
     response = _risk_llm.invoke(prompt)
-    raw_text = model_text(response)
 
     try:
-        alert = parse_alert_response(raw_text)
+        signals = unexpected_tool_call_signals(response)
+        if signals:
+            # Same path as an unparseable response: inconclusive, error traced.
+            raise ValueError(tool_call_error(signals))
+        alert = parse_alert_response(model_text(response))
         print("-" * 50)
 
         # normalize model output before downstream comparison
@@ -654,10 +704,29 @@ def analyze_risk(state: RiskState) -> RiskState:
     }
 
 # ---- Node 5: Validation ----
+def match_candidate_supplier(supplier, candidate_suppliers: list[str]) -> str | None:
+    """The canonical candidate the model's supplier names, or None.
+
+    Exact, case-insensitive match against a candidate's canonical name or one
+    of its SUPPLIER_ALIASES; never a substring, so "TSMC (and Acme)" or a
+    supplier the infer step did not propose does not match.
+    """
+    if not isinstance(supplier, str):
+        return None
+    name = supplier.strip().lower()
+    if not name:
+        return None
+    for candidate in candidate_suppliers or []:
+        if name == candidate.strip().lower() or name in SUPPLIER_ALIASES.get(candidate, []):
+            return candidate
+    return None
+
+
 def validate_alert(state: RiskState) -> RiskState:
     t0 = time.time()
     alert = state.get("alert")
     is_valid = False
+    error = None
 
     if isinstance(alert, dict):
         status = alert.get("status")
@@ -672,13 +741,27 @@ def validate_alert(state: RiskState) -> RiskState:
                 "recommended_action",
                 "relevant_supplier_context"]
             is_valid = all(alert.get(k) for k in required)
+            # The supplier must be one infer proposed: assess, the risk-state
+            # write and act all key on it, and model output alone (steerable
+            # by headline or retrieved text) must not choose it.
+            if is_valid:
+                candidates = state.get("candidate_suppliers") or []
+                canonical = match_candidate_supplier(alert.get("supplier"), candidates)
+                if not candidates:
+                    is_valid, error = False, "status ok with no candidate suppliers"
+                elif canonical is None:
+                    is_valid = False
+                    error = f"supplier {alert.get('supplier')!r} is not a candidate supplier {sorted(candidates)}"
+                else:
+                    alert = {**alert, "supplier": canonical}
 
     return {
         **state,
+        "alert": alert,
         "is_valid": is_valid,
         "trace_steps": record_trace_step(
             state["trace_steps"], "validate", t0,
-            decision="valid" if is_valid else "fallback",
+            decision="valid" if is_valid else "fallback", error=error,
         ),
     }
 

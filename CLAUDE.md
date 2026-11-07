@@ -35,7 +35,7 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 | `OPENAI_MODEL` | registry (`gpt-4o-mini-2024-07-18`) | Overrides the registry `model_name` when set and non-blank. The snapshot is deprecated by OpenAI; shutdown 2027-01-14 |
 | `BEDROCK_MODEL_ID` | — (required when `LLM_PROVIDER=bedrock`) | Missing or blank raises `ModelConfigError` during model resolution (at import of `supplier_risk_agent.py`). Terraform and `docker/worker.env` set `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 | `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`); used when `LLM_PROVIDER=bifrost` |
-| `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
+| `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint. **Requirement (unverified):** the gateway must have MCP/tool injection and gateway-side tool execution disabled for this application; see "LLM tool-call boundary and Bifrost" in `docs/Architecture.md` |
 | `BIFROST_API_KEY` | `dummy-key` | Bifrost does not validate this; any placeholder value works |
 | `RISK_STATE_BACKEND` | `csv` | `csv` or `dynamodb` |
 | `RISK_STATE_FILE` | `risk_state.csv` | Used when backend is `csv` |
@@ -74,7 +74,8 @@ infer → decide → [retrieve] → analyze → validate → [fallback] → END
 - **decide**: LLM call — returns `retrieve` or `skip` to gate context retrieval
 - **retrieve**: FAISS similarity search over `app/storage/supplier_profiles.json`
 - **analyze**: LLM call — returns structured JSON alert with supplier, risk_type, risk_level, impact
-- **validate**: checks required fields; routes to fallback on failure
+- **validate**: checks required fields and, for `status="ok"`, that `supplier` exactly matches a `candidate_suppliers` entry or one of its `SUPPLIER_ALIASES` (canonicalized to the candidate; no substring match; no candidates → reject); routes to fallback on failure with the reason in the trace step's `error`
+- **Tool-call rejection**: decide/analyze bind no tools. A response carrying any tool call (`unexpected_tool_call_signals`) takes the existing invalid path (decide → `skip`, analyze → `inconclusive`) with a trace `error`
 - **assess** (checkpointed lifecycle only, `build_app(checkpointer, action_gate=..., risk_reader=...)`): read-only, strongly consistent read of the prior supplier-state row; classifies the alert (`classify_risk_change`) and routes only `new_alert` / `escalated` to `act`. `suppressed` / `downgraded` end without an action, but supplier state is still written after END. The checkpointed assessment (`eligibility_change_type`) is reused on RESUME and reported separately from the write-time `change_type`. Threads parked at `act` by the pre-assess graph proceed as before (`eligibility_basis=legacy_unassessed`). RESUME never rewrites state: the attempt `trace_id` is passed in `configurable`
 - **act** (checkpointed lifecycle only): governed privileged action (mock review ticket) for an action-eligible alert, admitted only if the durable emergency authority item `agent#supplier-risk-agent` is `ACTIVE` **and** the materialized policy item `policy#supplier-risk-agent#open_review_ticket` allows it (Phase 3F). Both checks and the action-ledger claim are one DynamoDB transaction. With no materialized policy, `act` is denied (`POLICY_MISSING`); the materializer CLI is `python -m app.governance.policy_cli`. On denial the thread stays at `next=["act"]` and a later RESUME re-runs only `act`. The Phase 2 graph has no `act` node. See "Runtime authority and governed actions (Phase 3D)" in `docs/Architecture.md`; operator CLI: `python -m app.governance.authority_cli show|revoke|restore`
 
@@ -97,8 +98,8 @@ Wraps the GitHub pipeline as three MCP tools via FastMCP (`supply-chain-risk` se
     → stateless evaluation + persists decision
 - `get_recent_risk_decisions` 
     → read-only query over decision history
-- `create_mock_servicenow_ticket` 
-    → workflow action tied to a prior decision
+- `create_mock_servicenow_ticket(decision_id)` 
+    → governed action for a stored decision (`app/workflows/decision_ticket_action.py`). Fields come only from the stored record, which must be consistent with its stored event (re-evaluates to the same decision; this does not prove the record genuine) and be `review_recommended` / `manual_review_required`. Decision-store write access is the event trust boundary. Admitted through the production `ActionLedger` under the `open_review_ticket` capability (same emergency authority + policy item as the supplier `act` node; unset `AUTHORITY_TABLE`/`ACTIONS_TABLE` → denied). Action ID `action#decision#<id>#open_review_ticket`: at most one ticket per decision; repeats return `already_created`; a failure between claim and completion leaves it `IN_FLIGHT` (`action_in_flight` on retry, no reconciliation)
 
 GitHub risk decisions are stored in `app/storage/risk_decisions.jsonl` (appended, newest-first on read).
 

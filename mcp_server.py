@@ -1,6 +1,5 @@
 from mcp.server.fastmcp import FastMCP
 
-from app.integrations.servicenow_mock import create_servicenow_ticket as _create_ticket
 from app.storage.risk_state_store import (
     get_decisions_requiring_review as _get_requiring_review,
     get_recent_risk_decisions as _get_recent,
@@ -8,6 +7,7 @@ from app.storage.risk_state_store import (
 )
 from app.storage.risk_trace_store import get_risk_trace_by_identifier as _get_risk_trace
 from app.storage.risk_trace_store import trace_display_status
+from app.workflows.decision_ticket_action import open_ticket_for_decision as _open_ticket_for_decision
 from app.workflows.github_risk_evaluator import evaluate_github_event_risk as _evaluate_risk
 
 mcp = FastMCP("supply-chain-risk")
@@ -69,35 +69,22 @@ def get_recent_risk_decisions(limit: int = 20) -> list[dict]:
 
 
 @mcp.tool()
-def create_mock_servicenow_ticket(
-    event_type: str,
-    repository: str,
-    decision: str,
-    risk_score: int,
-    reason: str,
-    ref: str = "",
-    base_ref: str = "",
-    pr_number: int = 0,
-    pr_title: str = "",
-) -> dict:
-    """Create a mock ServiceNow CHANGE ticket for a risk decision and persist the result.
+def create_mock_servicenow_ticket(decision_id: str) -> dict:
+    """Open a mock ServiceNow CHANGE ticket for a stored risk decision.
+
+    All ticket fields come from the stored decision. The decision must have
+    been produced by evaluate_github_event_risk and require review
+    (review_recommended or manual_review_required). The ticket opens only if
+    runtime authority and policy allow it. Repeat calls for the same decision
+    return the original ticket (status "already_created") instead of creating
+    another. Unknown, ineligible or denied requests return status "rejected"
+    or "denied" with a reason, and create nothing.
 
     Args:
-        event_type: "push" or "pull_request"
-        repository: full repo name, e.g. "org/repo"
-        decision: risk decision string, e.g. "manual_review_required"
-        risk_score: integer risk score 0-100
-        reason: human-readable reason for the decision
-        ref: branch ref for push events
-        base_ref: target branch for pull_request events
-        pr_number: pull request number (pull_request events only)
-        pr_title: pull request title (pull_request events only)
+        decision_id: the record_id returned by evaluate_github_event_risk
+            (the "id" field of get_recent_risk_decisions results)
     """
-    normalized = _build_normalized_event(event_type, repository, ref, base_ref, pr_number, pr_title)
-    decision_dict = {"decision": decision, "risk_score": risk_score, "reason": reason}
-    ticket = _create_ticket(normalized, decision_dict)
-    save_risk_decision(normalized, decision_dict, ticket)
-    return ticket
+    return _open_ticket_for_decision(decision_id)
 
 
 @mcp.tool()

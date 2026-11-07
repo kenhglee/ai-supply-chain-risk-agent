@@ -48,6 +48,10 @@ class JsonlDecisionStore:
                     records.append(json.loads(line))
         return records
 
+    def get(self, record_id: str) -> dict | None:
+        """The record with this id; None if absent. Ids are unique (uuid4)."""
+        return next((r for r in self._load_all() if r.get("id") == record_id), None)
+
     def get_recent(self, limit: int = 20) -> list[dict]:
         return sorted(self._load_all(), key=lambda r: r["timestamp"], reverse=True)[:limit]
 
@@ -133,6 +137,10 @@ class DynamoDecisionStore:
         self._table.put_item(Item=item)
         return record_id
 
+    def get(self, record_id: str) -> dict | None:
+        item = self._table.get_item(Key={"id": record_id}, ConsistentRead=True).get("Item")
+        return self._from_dynamo_item(item) if item else None
+
     def get_recent(self, limit: int = 20) -> list[dict]:
         records = self._scan_all()
         return sorted(records, key=lambda r: r["timestamp"], reverse=True)[:limit]
@@ -175,6 +183,10 @@ def save_risk_decision(
     ticket: dict | None = None,
 ) -> str:
     return _get_decision_store().save(normalized_event, decision, ticket)
+
+
+def get_risk_decision(record_id: str) -> dict | None:
+    return _get_decision_store().get(record_id)
 
 
 def get_recent_risk_decisions(limit: int = 20) -> list[dict]:

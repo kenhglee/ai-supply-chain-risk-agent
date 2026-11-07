@@ -183,7 +183,7 @@ infer → decide ──retrieve──► analyze → validate ──end──►
 | `decide` | LLM call — returns `"retrieve"` or `"skip"` | timing + decision |
 | `retrieve` | Calls the configured retriever backend (FAISS or Bedrock KB) | timing only |
 | `analyze` | LLM call — returns structured JSON alert | timing; error if parse fails |
-| `validate` | Checks required fields; routes to `fallback` on failure | timing + `"valid"` or `"fallback"` |
+| `validate` | Checks required fields and that an `ok` alert's supplier is a candidate (see [LLM tool-call boundary](#llm-tool-call-boundary-and-bifrost)); routes to `fallback` on failure | timing + `"valid"` or `"fallback"`; `error` on a rejected supplier |
 | `fallback` | Replaces alert with a safe `inconclusive` sentinel | timing only |
 
 Each node records its own `started_at`, `ended_at`, `duration_ms`, and optional `decision` / `error` into `state["trace_steps"]` before returning.
@@ -288,7 +288,7 @@ flowchart LR
 | `evaluate_github_event_risk` | Calls the rule-based evaluator and persists the decision to `risk_decisions.jsonl` |
 | `get_recent_risk_decisions` | Returns the N most recent decisions from `risk_decisions.jsonl` (default 20) |
 | `get_decisions_requiring_review` | Returns decisions with `manual_review_required` or `review_recommended` (default 10) |
-| `create_mock_servicenow_ticket` | Creates a mock ServiceNow ticket for a prior decision and persists the result |
+| `create_mock_servicenow_ticket` | Takes only `decision_id`. Opens one governed mock ticket for a stored decision; see below |
 
 **Risk trace tools**
 
@@ -296,6 +296,25 @@ flowchart LR
 |---|---|
 | `get_risk_trace` | Returns the raw trace record for an `alert_id` or `trace_id`; includes `matched_by` field |
 | `explain_risk_trace` | Returns a human-readable explanation: outcome, node sequence, slowest node, decisions, errors |
+
+**Governed ticket action** (`app/workflows/decision_ticket_action.py`). The caller supplies only a decision ID; every ticket field comes from the stored record. In order:
+
+1. The ID must be a 32-hex record ID that exists (`invalid_decision_id`, `decision_not_found`).
+2. The stored decision must be consistent with the stored event: re-running the deterministic evaluator on `normalized_event` must reproduce `decision` / `risk_score` / `reason` (`decision_inconsistent_with_event`). This rejects records whose decision fields were written independently of their event, such as records from the old tool signature or copilot records. It does **not** show a record is genuine: a consistent record (an event plus the evaluator's output for it) passes however it reached the store.
+3. The record must not already carry a ticket (`decision_already_ticketed`).
+4. The decision must be `review_recommended` or `manual_review_required` (`decision_not_eligible`).
+5. The production `ActionLedger` admits it under scope `agent#supplier-risk-agent`, capability `open_review_ticket`: the same emergency authority and materialized policy item as the supplier `act` node, checked with the claim in one transaction. Denial returns `status="denied"` with the layer. Unset `AUTHORITY_TABLE` / `ACTIONS_TABLE` denies every request, so local MCP use creates no tickets until governance tables are configured.
+
+**Trust boundary: decision-store write access.** The decision store (`app/storage/risk_decisions.jsonl`, or `RISK_DECISIONS_TABLE`) is trusted for event content. Whoever can write it decides which events can get a ticket. That includes any MCP client: `evaluate_github_event_risk` persists caller-supplied event fields. Authority and policy decide whether tickets may be opened at all, not for which events.
+
+**Idempotency and failure behavior** (ActionLedger semantics; action ID `action#decision#<decision_id>#open_review_ticket`; failure-injected in `tests/test_decision_ticket_recovery.py`):
+
+- At most one ticket and one ticket record per decision ID. The effect (create the ticket, then append the ticket record) runs only after this call claims the ledger item, and a claimed item is never claimed again.
+- Once `COMPLETED`, every request replays the stored ticket (`status="already_created"`), including after a completion whose acknowledgment was lost.
+- A claim with unknown outcome is resolved by the ledger's re-read: the call proceeds only if the claim names it; otherwise the error propagates and nothing ran.
+- A concurrent request gets `action_in_flight`.
+- **At most once, not exactly once.** A failure after the claim and before completion is recorded (ticket creation, the record write, the completion write, or process death) propagates the error and leaves the item `IN_FLIGHT`. Retries return `action_in_flight` and never re-run the effect. A ticket may then exist with no ticket record, or a ticket record with no completed ledger item. There is no reconciliation; resetting the ledger item would run the effect again.
+- Idempotency is per decision, not per event: evaluating one event twice stores two decisions, and each can get a ticket.
 
 Start with: `uv run python mcp_server.py` (blocks on stdin waiting for an MCP client).  
 Test interactively: `npx @modelcontextprotocol/inspector uv run python mcp_server.py`
@@ -1465,6 +1484,21 @@ Written by `app/storage/risk_state_store.py` (JSONL locally, or the `RISK_DECISI
 - `supplier_profiles.json` — free-text profiles for each supplier; loaded into FAISS at startup.
 
 ---
+
+## LLM tool-call boundary and Bifrost
+
+The production LLM calls (`decide_tool_use`, `analyze_risk` in `supplier_risk_agent.py`) send a single user prompt with **no tool definitions**. The OpenAI-compatible path (OpenAI and Bifrost) sends `messages, model, stream, temperature`; Bedrock Converse sends no `toolConfig`. The workflow, not the model, selects the only privileged action (`act` → `open_review_ticket`, behind the action ledger).
+
+**App-side controls**
+
+- **Tool-call responses are rejected.** `unexpected_tool_call_signals()` flags normalized `tool_calls` / `invalid_tool_calls` / `tool_call_chunks`, OpenAI `additional_kwargs.tool_calls` / `function_call`, content blocks (`tool_use`, `tool_call`, `invalid_tool_call`, `function_call`, raw Converse `toolUse`), and finish metadata (`finish_reason` `tool_calls` / `function_call`, `stopReason` `tool_use`). Such a response takes the existing invalid path: triage → `skip`, analysis → `inconclusive`, with the trace step's `error` set to `unexpected tool call in model response: …`. No tool call is ever executed by the app.
+- **The supplier must be a candidate.** For `status="ok"`, `validate` requires the model's `supplier` to equal a `candidate_suppliers` entry or one of its `SUPPLIER_ALIASES` (case-insensitive, exact, never a substring). It is rewritten to the canonical candidate. An empty candidate set, or no match, routes to `fallback` before `assess`, the risk-state write or `act`. This limits what an injected headline or retrieved profile can steer.
+
+**Bifrost requirement (not enforceable in the app)**
+
+When `LLM_PROVIDER=bifrost`, the gateway at `BIFROST_BASE_URL` must have **tool injection** (attaching MCP or other tools to requests) and **gateway-side tool execution** (running tool calls before returning a response) **disabled for this application**. Rejecting tool-call responses in the app is detection after the fact: a gateway that executes tools internally can act, and return only the resulting text, before the app sees anything. The app cannot observe or prevent that.
+
+**Status: unverified.** No Bifrost configuration is in this repository and none was inspected; the effective gateway configuration is unknown. Bifrost is local/dev only: Terraform and `docker/worker.env` use `LLM_PROVIDER=bedrock`.
 
 ## Environment Variables
 
