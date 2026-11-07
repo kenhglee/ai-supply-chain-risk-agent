@@ -32,8 +32,8 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required for local RSS pipeline when `LLM_PROVIDER=openai` or `EMBEDDING_PROVIDER=openai` (FAISS default) |
 | `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
-| `OPENAI_MODEL` | `gpt-4o-mini` | |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | |
+| `OPENAI_MODEL` | registry (`gpt-4o-mini-2024-07-18`) | Overrides the registry `model_name` when set and non-blank. The snapshot is deprecated by OpenAI; shutdown 2027-01-14 |
+| `BEDROCK_MODEL_ID` | — (required when `LLM_PROVIDER=bedrock`) | Missing or blank raises `ModelConfigError` during model resolution (at import of `supplier_risk_agent.py`). Terraform and `docker/worker.env` set `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 | `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`); used when `LLM_PROVIDER=bifrost` |
 | `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
 | `BIFROST_API_KEY` | `dummy-key` | Bifrost does not validate this; any placeholder value works |
@@ -51,7 +51,7 @@ docker buildx build --platform linux/amd64 --provenance=false -t supplier-risk-a
 | `RETRIEVER_PROVIDER` | `faiss` | `faiss` (default) or `bedrock_kb` |
 | `BEDROCK_KB_ID` | — | Required when `RETRIEVER_PROVIDER=bedrock_kb` |
 | `BEDROCK_KB_TOP_K` | `4` | Number of KB results to request (bedrock_kb only) |
-| `EMBEDDING_PROVIDER` | `openai` | FAISS embeddings: `openai` (`OpenAIEmbeddings`) or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`, default AWS credential chain). Lambda sets `bedrock` |
+| `EMBEDDING_PROVIDER` | `openai` | FAISS embeddings: `openai` (`OpenAIEmbeddings`, pinned to `text-embedding-ada-002`) or `bedrock` (Titan Text Embeddings V2, `amazon.titan-embed-text-v2:0`, default AWS credential chain). Lambda sets `bedrock` |
 | `CHECKPOINT_TABLE` | — | DynamoDB table for LangGraph checkpoints (`risk_agent_checkpoints`). Required only for Lambda `checkpoint_start` / `checkpoint_resume` actions; the scheduled RSS path is not checkpointed |
 | `AUTHORITY_TABLE` | — | Runtime authority table (`risk_agent_authority`). If this or `ACTIONS_TABLE` is unset, the checkpointed lifecycle denies every governed action (fail closed) |
 | `ACTIONS_TABLE` | — | Action ledger table (`risk_agent_actions`) |
@@ -78,7 +78,7 @@ infer → decide → [retrieve] → analyze → validate → [fallback] → END
 - **assess** (checkpointed lifecycle only, `build_app(checkpointer, action_gate=..., risk_reader=...)`): read-only, strongly consistent read of the prior supplier-state row; classifies the alert (`classify_risk_change`) and routes only `new_alert` / `escalated` to `act`. `suppressed` / `downgraded` end without an action, but supplier state is still written after END. The checkpointed assessment (`eligibility_change_type`) is reused on RESUME and reported separately from the write-time `change_type`. Threads parked at `act` by the pre-assess graph proceed as before (`eligibility_basis=legacy_unassessed`). RESUME never rewrites state: the attempt `trace_id` is passed in `configurable`
 - **act** (checkpointed lifecycle only): governed privileged action (mock review ticket) for an action-eligible alert, admitted only if the durable emergency authority item `agent#supplier-risk-agent` is `ACTIVE` **and** the materialized policy item `policy#supplier-risk-agent#open_review_ticket` allows it (Phase 3F). Both checks and the action-ledger claim are one DynamoDB transaction. With no materialized policy, `act` is denied (`POLICY_MISSING`); the materializer CLI is `python -m app.governance.policy_cli`. On denial the thread stays at `next=["act"]` and a later RESUME re-runs only `act`. The Phase 2 graph has no `act` node. See "Runtime authority and governed actions (Phase 3D)" in `docs/Architecture.md`; operator CLI: `python -m app.governance.authority_cli show|revoke|restore`
 
-**Important**: `supplier_risk_agent.py` has module-level initialization that runs at import time — it loads the graph JSON, builds the FAISS index (calling `OpenAIEmbeddings()`), and instantiates the LLM. `OPENAI_API_KEY` must be set even when using Bedrock as the LLM provider.
+**Important**: `supplier_risk_agent.py` has module-level initialization that runs at import time — it loads the graph JSON, builds the FAISS index (calling `OpenAIEmbeddings(model="text-embedding-ada-002")`), and instantiates the LLM. `OPENAI_API_KEY` must be set even when using Bedrock as the LLM provider.
 
 Supplier risk state is persisted across runs to detect escalations/suppressions. State change types: `new_alert`, `escalated`, `suppressed`, `downgraded`, `inconclusive`.
 

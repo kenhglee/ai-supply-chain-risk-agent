@@ -1472,8 +1472,8 @@ Written by `app/storage/risk_state_store.py` (JSONL locally, or the `RISK_DECISI
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required when `RETRIEVER_PROVIDER=faiss` or `LLM_PROVIDER=openai`; not required on the Bedrock KB path |
 | `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID for Bedrock provider |
+| `OPENAI_MODEL` | registry (`gpt-4o-mini-2024-07-18`) | Overrides the registry `model_name` when set and non-blank. The snapshot is deprecated by OpenAI; shutdown 2027-01-14 |
+| `BEDROCK_MODEL_ID` | — (required when `LLM_PROVIDER=bedrock`) | Missing or blank raises `ModelConfigError` during model resolution (at import of `supplier_risk_agent.py`). Terraform and `docker/worker.env` set `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 | `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway when `LLM_PROVIDER=bifrost` (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`) |
 | `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
 | `BIFROST_API_KEY` | `dummy-key` | Placeholder key; Bifrost does not validate it |
@@ -1504,7 +1504,7 @@ Written by `app/storage/risk_state_store.py` (JSONL locally, or the `RISK_DECISI
 ## Current Limitations
 
 - **Hard-coded supplier set**: the knowledge base covers only TSMC, Murata, and Foxconn. Adding suppliers requires editing `supplier_graph.json`, `supplier_profiles.json`, and `SUPPLIER_ALIASES` in `supplier_risk_agent.py`.
-- **OPENAI_API_KEY required on FAISS path**: `supplier_risk_agent.py` calls `OpenAIEmbeddings()` at import time when `RETRIEVER_PROVIDER=faiss` (the default). Set `RETRIEVER_PROVIDER=bedrock_kb` to eliminate this dependency.
+- **OPENAI_API_KEY required on FAISS path**: `supplier_risk_agent.py` calls `OpenAIEmbeddings(model="text-embedding-ada-002")` at import time when `RETRIEVER_PROVIDER=faiss` (the default). Set `RETRIEVER_PROVIDER=bedrock_kb` to eliminate this dependency.
 - **Module-level side effects**: the graph JSON, FAISS index, and LLM client are constructed at import time, making the module slow to load and difficult to test in isolation.
 - **Local file storage only**: `risk_decisions.jsonl`, `risk_traces.jsonl`, and `enriched_alerts.csv` are local files. They are not shared across Lambda instances and are lost on cold-start container recycling.
 - **`seen_headlines.json` grows unbounded**: no TTL or pruning.

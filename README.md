@@ -382,8 +382,8 @@ uv run python -m app.workflows.supplier_risk_agent
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required when `RETRIEVER_PROVIDER=faiss` or `LLM_PROVIDER=openai` |
 | `LLM_PROVIDER` | `openai` | `openai`, `bedrock`, or `bifrost` |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID for Bedrock provider |
+| `OPENAI_MODEL` | registry (`gpt-4o-mini-2024-07-18`) | Overrides the registry `model_name` when set and non-blank. The snapshot is deprecated by OpenAI; shutdown 2027-01-14 |
+| `BEDROCK_MODEL_ID` | — (required when `LLM_PROVIDER=bedrock`) | Missing or blank raises `ModelConfigError` during model resolution (at import of `supplier_risk_agent.py`). Terraform and `docker/worker.env` set `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 | `BIFROST_MODEL_ID` | — | Model name passed through the Bifrost gateway when `LLM_PROVIDER=bifrost` (e.g. `bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0`) |
 | `BIFROST_BASE_URL` | `http://localhost:8080/langchain` | Bifrost LangChain-compatible gateway endpoint |
 | `BIFROST_API_KEY` | `dummy-key` | Placeholder key; Bifrost does not validate it |
@@ -765,7 +765,7 @@ Registry
   model_id:           risk_analysis_primary
   model_version:      v1
   runtime_provider:   openai
-  runtime_model_name: gpt-4o-mini
+  runtime_model_name: gpt-4o-mini-2024-07-18
 ```
 
 ### How this supports prompt / model promotion governance
@@ -804,7 +804,7 @@ Each file follows this schema:
   "created_at": "2026-06-18",
   "description": "Primary model for supply chain risk classification.",
   "provider": "openai",
-  "model_name": "gpt-4o-mini",
+  "model_name": "gpt-4o-mini-2024-07-18",
   "use_case": "risk_classification"
 }
 ```
@@ -849,7 +849,7 @@ Each risk trace in `app/storage/risk_traces.jsonl` includes a `model_metadata` f
     "model_version": "v1",
     "model_status": "approved",
     "model_provider": "openai",
-    "model_name": "gpt-4o-mini",
+    "model_name": "gpt-4o-mini-2024-07-18",
     "model_description": "Primary model for triage decisions..."
   },
   {
@@ -857,7 +857,7 @@ Each risk trace in `app/storage/risk_traces.jsonl` includes a `model_metadata` f
     "model_version": "v1",
     "model_status": "approved",
     "model_provider": "openai",
-    "model_name": "gpt-4o-mini",
+    "model_name": "gpt-4o-mini-2024-07-18",
     "model_description": "Primary model for supply chain risk classification..."
   }
 ]
